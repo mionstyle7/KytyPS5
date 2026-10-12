@@ -963,6 +963,9 @@ set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 if(KYTY_CLANG_CL)
 	target_link_options(kyty_emulator PRIVATE
 		"/DYNAMICBASE:NO"
+		# 16 MiB default stack reserve (Windows defaults to 1 MiB) for every host thread created
+		# without an explicit size: the main thread, std::thread workers and winpthread threads.
+		"/STACK:16777216"
 		"/DEBUG:FULL"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
 		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"
@@ -1003,4 +1006,8 @@ if(KYTY_BUILD_LAUNCHER)
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
+	# Symbols next to the exe: fatal errors print a symbolised host stack, and a crash's fault
+	# offset can be looked up in the map.
+	install(FILES "${KYTY_EMULATOR_PDB_LINK_PATH}" "${KYTY_EMULATOR_MAP_LINK_PATH}" DESTINATION .
+		OPTIONAL)
 endif()
