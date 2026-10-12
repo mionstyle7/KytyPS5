@@ -15,6 +15,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1306,6 +1307,15 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
+	// With the per-dispatch host barriers off (KYTY_DISPATCH_BARRIERS=0), the guest's own cache
+	// acquire is what orders a dispatch after the writes before it.
+	static const bool acquire_barrier = [] {
+		const char* value = std::getenv("KYTY_DISPATCH_BARRIERS");
+		return value != nullptr && value[0] == '0';
+	}();
+	if (acquire_barrier) {
+		cp.EmitGlobalBarrier();
+	}
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
