@@ -3,7 +3,7 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master, wolverine ]
+    branches: [ main, master, wolverine, 'claude/**' ]
   pull_request:
 
 concurrency:
@@ -109,7 +109,15 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
+      # mionstyle7's fork: the emulator and launcher only, no tests, for quick test builds.
+      - name: Build (emulator only)
+        if: github.repository_owner == 'mionstyle7'
+        shell: cmd
+        run: |
+          cmake --build _Build/windows --target launcher --parallel
+
       - name: Build
+        if: github.repository_owner != 'mionstyle7'
         shell: cmd
         run: |
           cmake --build _Build/windows --target launcher ^
@@ -119,6 +127,7 @@ jobs:
             resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
 
       - name: Test
+        if: github.repository_owner != 'mionstyle7'
         shell: cmd
         run: |
           ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
@@ -138,6 +147,7 @@ jobs:
   macos:
     name: Build KytyPS5 (macOS)
     needs: metadata
+    if: github.repository_owner != 'mionstyle7'
     runs-on: macos-15
 
     steps:
@@ -292,6 +302,7 @@ jobs:
   linux:
     name: Build KytyPS5 (Linux)
     needs: metadata
+    if: github.repository_owner != 'mionstyle7'
     runs-on: ubuntu-24.04
 
     steps:
