@@ -1507,10 +1507,12 @@ struct PipelineCache::ProgramCache {
 			disk = ShaderDiskCache::Store::Open(std::move(disk_directory));
 		}
 		if (g_async_translation) {
-			// KYTY_TRANSLATION_THREADS=<n> (default 2).
+			// KYTY_TRANSLATION_THREADS=<n> (default: a quarter of the hardware threads, 2 to 4).
 			const char* value   = std::getenv("KYTY_TRANSLATION_THREADS");
 			const auto  threads = std::max<uint32_t>(
-			    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2u, 1u);
+			    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+			                     : std::clamp(std::thread::hardware_concurrency() / 4u, 2u, 4u),
+			    1u);
 			translators = std::make_unique<TranslationWorkers>(threads);
 			PipelineCacheLog("Shader translation: graphics shaders of 3D draws on {} worker threads",
 			                 threads);
@@ -1968,7 +1970,13 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	if (g_async_pipelines) {
-		const auto threads = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
+		// KYTY_PIPELINE_THREADS=<n> (default: a third of the hardware threads, 1 to 6). The driver's
+		// pipeline compile is the longest step of a new shader; 16-thread CPUs had only 4 workers.
+		const char* value   = std::getenv("KYTY_PIPELINE_THREADS");
+		const auto  threads = std::max<uint32_t>(
+		    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+		                     : std::clamp(std::thread::hardware_concurrency() / 3u, 1u, 6u),
+		    1u);
 		m_compiler         = std::make_unique<PipelineCompiler>(threads);
 		PipelineCacheLog("Vulkan pipelines: compiled on {} worker threads (wait {} ms)", threads,
 		                 g_pipeline_wait.count());
