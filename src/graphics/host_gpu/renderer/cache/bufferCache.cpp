@@ -342,6 +342,15 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::InvalidateMemoryNoDownload(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// InvalidateRegion changes no state for a chunk with GPU-modified bytes and calls the flush
+	// instead; an empty flush leaves that chunk protected and tracked as it was.
+	m_memory_tracker.InvalidateRegion(vaddr, size, [] {});
+}
+
 bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid() ||
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {

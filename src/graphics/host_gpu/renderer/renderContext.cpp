@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
@@ -97,6 +98,26 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+// KYTY_WRITE_FAULT_WINDOW_KB=<n> (default 0 = off, a power of two of at least 8): a guest write
+// fault on a tracked page also marks the other pages of its aligned n KB window CPU-modified in
+// the buffer cache, so a guest loop filling a buffer page by page takes one fault per window
+// instead of one per 4 KB page. Pages with GPU-written bytes are never touched (no download);
+// texture and bindless watchers keep their own protection. The cost is uploading window pages
+// the guest did not write.
+static uint64_t WriteFaultWindow() {
+	static const uint64_t window = []() -> uint64_t {
+		const char*    value = std::getenv("KYTY_WRITE_FAULT_WINDOW_KB");
+		const uint64_t kb    = value != nullptr ? std::strtoull(value, nullptr, 10) : 0u;
+		const uint64_t bytes = kb * 1024u;
+		if (bytes <= TRACKER_PAGE_SIZE || (bytes & (bytes - 1u)) != 0) {
+			return uint64_t {0};
+		}
+		LOGF("Write fault window: %" PRIu64 " KB\n", kb);
+		return bytes;
+	}();
+	return window;
+}
+
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
@@ -108,6 +129,12 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
+		if (const auto window = WriteFaultWindow(); window != 0) {
+			const auto begin = fault_vaddr & ~(window - 1u);
+			if (IsMapped(begin, window)) {
+				m_buffer_cache.InvalidateMemoryNoDownload(begin, window);
+			}
+		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
