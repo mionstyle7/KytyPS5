@@ -926,9 +926,6 @@ private:
 					MakeSource(*handle, width, sampler,
 					           sampler && (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0,
 					           base, source, flags.pc);
-					// The shader reads this descriptor itself (KYTY_GPU_DESCRIPTORS): its words'
-					// loads stay GPU reads instead of flat slots the host fills.
-					if (GpuDescriptorHandle(*handle)) continue;
 					for (uint32_t word = 0; word < width; ++word)
 						CollectScalarRead(source.dwords[word], flags.pc);
 				}
@@ -967,9 +964,7 @@ private:
 			for (auto* block: m_program.blocks) {
 				for (auto& inst: *block) {
 					uint32_t index = 0;
-					// Loads of descriptors the shader evaluates itself stay GPU reads.
 					if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && !written(inst) &&
-					    !m_gpu_descriptor_reads.contains(&inst) &&
 					    ScalarReadMemory(inst, index) != nullptr &&
 					    inst.Arg(1).Resolve().IsImmediate() &&
 					    ValidateRuntimeValue(m_program, Value(&inst)))
@@ -2947,22 +2942,20 @@ private:
 					reject = "a phi feeds the descriptor";
 					return false;
 				}
+				// A flat SRT slot: the descriptor's loads were snapshotted (PlanScalarReads). The
+				// slot's bytes are filled before the dispatch, by the GPU when it wrote them
+				// (SrtGpuFill), so the shader sees the memory as of the dispatch's start, as the
+				// guest's scalar loads (through the scalar cache) do, and not this dispatch's own
+				// stores: one title shader overwrites the counts its descriptors are built from.
+				if (op == ValueOpcode::ReadConst) {
+					reads_memory = true;
+					continue;
+				}
+				// A live memory read would see this dispatch's own stores.
 				if (BufferAccessOf(op) != BufferAccess::None ||
 				    AddressOpcodeInfoOf(op).access != AddressAccess::None) {
-					const auto index = inst->Flags<MemoryFlags>().index;
-					if (index >= m_program.memory_info.size()) return false;
-					const auto kind = m_program.memory_info[index].kind;
-					if (!(op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer) &&
-					    !(op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress))
-						return false;
-					descriptor_reads.push_back(inst);
-					reads_memory = true;
-					// The load runs on the GPU too: its own handle's words, and its offsets.
-					for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
-						if (const auto* next = inst->Arg(arg).Resolve().TryInstruction())
-							pending.push_back(next);
-					}
-					continue;
+					reject = "a live memory read feeds the descriptor";
+					return false;
 				}
 				if (ImageOpcodeInfoOf(op).access != ImageAccess::None) return false;
 				for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
@@ -2971,12 +2964,11 @@ private:
 			}
 			return reads_memory;
 		}();
-		if (eligible) m_gpu_descriptor_reads.insert(descriptor_reads.begin(), descriptor_reads.end());
 		m_gpu_descriptor_handles.emplace(&handle, eligible);
 		if (eligible) {
 			LOGF("shader resource tracking: hash=0x%016" PRIx64 " GPU descriptor: a buffer reads "
-			     "its descriptor on the GPU (%zu uses, %zu descriptor loads)\n",
-			     m_program.shader_hash, handle.Uses().size(), descriptor_reads.size());
+			     "its descriptor on the GPU (%zu uses, from flat SRT slots)\n",
+			     m_program.shader_hash, handle.Uses().size());
 		} else if (reject != nullptr) {
 			LOGF("shader resource tracking: hash=0x%016" PRIx64 " GPU descriptor rejected: %s\n",
 			     m_program.shader_hash, reject);
@@ -3298,8 +3290,7 @@ private:
 				m_info.uses_dma                         = true;
 				return;
 			}
-			if (indirect == nullptr && handle != nullptr && GpuDescriptorHandle(*handle) &&
-			    GpuDescriptorReadsLive(*handle)) {
+			if (indirect == nullptr && handle != nullptr && GpuDescriptorHandle(*handle)) {
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
 				m_info.indirect_buffer_writes |= buffer != BufferAccess::Read;
