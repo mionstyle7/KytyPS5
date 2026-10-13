@@ -1288,6 +1288,13 @@ void WindowContext::CreateVulkan() {
 		if (graphic_ctx.queue_family < families.size() &&
 		    families[graphic_ctx.queue_family].queueCount > 1 && (value == nullptr || value[0] != '0')) {
 			graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.side_queue);
+			LOGF("Vulkan: queue family %u has %u queues (%s)\n", graphic_ctx.queue_family,
+			     families[graphic_ctx.queue_family].queueCount,
+			     vk::to_string(families[graphic_ctx.queue_family].queueFlags).c_str());
+			for (uint32_t family = 0; family < family_count; family++) {
+				LOGF("Vulkan: family %u: %u queues, %s\n", family, families[family].queueCount,
+				     vk::to_string(families[family].queueFlags).c_str());
+			}
 			LOGF("Vulkan: side queue for readbacks: %s\n",
 			     graphic_ctx.side_queue != nullptr ? "on" : "off");
 		}

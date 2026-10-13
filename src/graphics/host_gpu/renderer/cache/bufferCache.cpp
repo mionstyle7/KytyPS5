@@ -638,7 +638,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// completed on the GPU). A readback of old, completed writes only waits for the queue behind.
 	struct ReadbackSite {
 		uint64_t count = 0, wait_us = 0, age = 0, completed = 0, unknown = 0;
+		uint64_t gpu_thread_us = 0, copy_us = 0, sides = 0;
 	};
+	uint64_t gpu_thread_us = 0, copy_us = 0, sides = 0;
 	static std::mutex                                       stats_mutex;
 	static std::unordered_map<uint64_t, ReadbackSite>       sites;
 	static uint64_t                                         total = 0;
@@ -662,6 +664,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		auto& site = sites[vaddr >> 12u];
 		site.count++;
 		site.wait_us += static_cast<uint64_t>(wait_timer.GetTimeS() * 1e6);
+		site.gpu_thread_us += gpu_thread_us;
+		site.copy_us += copy_us;
+		site.sides += sides;
 		if (write_tick == 0) {
 			site.unknown++;
 		} else {
@@ -679,9 +684,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); i++) {
 				const auto& [page, s] = sorted[i];
 				const auto known      = s.count - s.unknown;
-				LOGF("  page 0x%" PRIx64 "000: %" PRIu64 " reads, wait %.1f ms (avg %.2f), write age "
-				     "%.1f ticks, write already done %" PRIu64 "/%" PRIu64 "\n",
+				LOGF("  page 0x%" PRIx64 "000: %" PRIu64 " reads, wait %.1f ms (avg %.2f: GPU thread "
+				     "%.2f, side copy %.2f, %" PRIu64 " side), write age %.1f ticks, write already done "
+				     "%" PRIu64 "/%" PRIu64 "\n",
 				     page, s.count, s.wait_us / 1000.0, s.wait_us / 1000.0 / s.count,
+				     s.gpu_thread_us / 1000.0 / s.count, s.copy_us / 1000.0 / s.count, s.sides,
 				     known != 0 ? static_cast<double>(s.age) / known : 0.0, s.completed, known);
 			}
 			sites.clear();
@@ -689,8 +696,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	};
 	for (;;) {
 		uint64_t   wait_tick = 0;
-		SideTicket ticket;
-		bool       side = false;
+		SideTicket    ticket;
+		bool          side = false;
+		Common::Timer step_timer;
+		step_timer.Start();
 		m_scheduler.Context().GetGpu().SendCommandSync(
 		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &ticket, &side] {
 			    side = !is_write && !from_gpu_thread && TrySideReadback(vaddr, size, ticket);
@@ -698,9 +707,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
 			    }
 		    });
+		gpu_thread_us += static_cast<uint64_t>(step_timer.GetTimeS() * 1e6);
 		if (side) {
 			// Published here; the next step lifts the protection of the now clean pages.
+			Common::Timer copy_timer;
+			copy_timer.Start();
 			FinishSideReadback(ticket);
+			copy_us += static_cast<uint64_t>(copy_timer.GetTimeS() * 1e6);
+			sides++;
 			continue;
 		}
 		if (wait_tick == SideRetry) {
