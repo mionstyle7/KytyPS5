@@ -209,7 +209,113 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 // Diagnostics: the shader whose resources are being evaluated, and how often its SRT reads
 // hit memory the GPU owns (each such read drains the GPU).
 thread_local uint64_t t_srt_shader_hash = 0;
+thread_local bool     t_srt_gpu_owned_read = false;
+
+// Diagnostics: why each flat SRT slot of a plan is or is not left to the GPU (SrtGpuFill), the
+// first time one of its refreshes downloads GPU-written bytes. Host uses: D descriptor dwords,
+// K indirect-table keys, C branch conditions, U uniform fills, W buffer write bounds, A another
+// read's address. M: the slot's own address depends on memory.
+void ReportGpuFillSlots(const ShaderRecompiler::IR::ResourcePlan& plan) {
+	using namespace ShaderRecompiler::IR;
+	static std::unordered_set<uint64_t> reported;
+	if (!reported.insert(plan.shader_hash).second) {
+		return;
+	}
+	const auto count = plan.srt_reads.size();
+	std::vector<uint8_t> uses(count, 0u);
+	const auto mark = [&](Value root, uint8_t bit) {
+		std::vector<Value>              pending {root};
+		std::unordered_set<const Inst*> visited;
+		while (!pending.empty()) {
+			const auto  value = pending.back().Resolve();
+			pending.pop_back();
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) {
+				continue;
+			}
+			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = inst->Arg(1).Resolve();
+				if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < count) {
+					uses[slot.U32()] |= bit;
+					pending.push_back(plan.srt_reads[slot.U32()].value);
+				}
+				continue;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				pending.push_back(inst->Arg(arg));
+			}
+		}
+	};
+	for (const auto& source: plan.descriptor_sources) {
+		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
+			mark(source.dwords[dword], 1u);
+		}
+		if (source.indirect_descriptor.has_value()) {
+			mark(source.indirect_descriptor->key_count, 2u);
+			mark(source.indirect_descriptor->selector_first, 2u);
+			mark(source.indirect_descriptor->selector_mask, 2u);
+		}
+	}
+	for (const auto& block: plan.control_flow) {
+		mark(block.condition, 4u);
+	}
+	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
+		mark(plan.uniform_fill.values[i], 8u);
+	}
+	for (const auto& write: plan.buffer_writes) {
+		mark(write.index, 16u);
+		mark(write.offset, 16u);
+		mark(write.soffset, 16u);
+		mark(write.predicate, 16u);
+	}
+	for (const auto& read: plan.srt_reads) {
+		if (const auto* inst = read.value.Resolve().TryInstruction(); inst != nullptr) {
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				mark(inst->Arg(arg), 32u);
+			}
+		}
+	}
+	LOGF("GpuFillSlots: hash=0x%016" PRIx64 " slots=%zu blocks=%zu sources=%zu\n", plan.shader_hash,
+	     count, plan.control_flow.size(), plan.descriptor_sources.size());
+	for (size_t slot = 0; slot < count; slot++) {
+		const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
+		bool        memory_address = false;
+		if (inst != nullptr) {
+			std::vector<Value>              pending;
+			std::unordered_set<const Inst*> visited;
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				pending.push_back(inst->Arg(arg));
+			}
+			while (!pending.empty() && !memory_address) {
+				const auto* next = pending.back().Resolve().TryInstruction();
+				pending.pop_back();
+				if (next == nullptr || !visited.insert(next).second) {
+					continue;
+				}
+				const auto op = next->GetOpcode();
+				if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+				    op == ValueOpcode::ReadConst) {
+					memory_address = true;
+					break;
+				}
+				for (size_t arg = 0; arg < next->NumArgs(); arg++) {
+					pending.push_back(next->Arg(arg));
+				}
+			}
+		}
+		const auto u = uses[slot];
+		LOGF("\t slot %zu flat=%u op=%u fill=%u clean=%u uses=%s%s%s%s%s%s%s\n", slot,
+		     plan.srt_reads[slot].flat_offset,
+		     inst != nullptr ? static_cast<uint32_t>(inst->GetOpcode()) : 0u,
+		     slot < plan.gpu_fill_slots.size() ? plan.gpu_fill_slots[slot] : 0u,
+		     slot < plan.clean_flat_slots.size() ? plan.clean_flat_slots[slot] : 0u,
+		     (u & 1u) ? "D" : "", (u & 2u) ? "K" : "", (u & 4u) ? "C" : "", (u & 8u) ? "U" : "",
+		     (u & 16u) ? "W" : "", (u & 32u) ? "A" : "", memory_address ? " M" : "");
+	}
+}
+
 void CountGpuOwnedSrtRead(uint64_t address, uint32_t bytes) {
+	t_srt_gpu_owned_read = true;
 	struct Entry {
 		uint64_t count   = 0;
 		uint64_t address = 0;
@@ -1206,6 +1312,10 @@ struct PipelineCache::ProgramCache {
 					    entry->second.specialization);
 				}
 				t_srt_shader_hash = 0;
+				if (t_srt_gpu_owned_read) {
+					t_srt_gpu_owned_read = false;
+					ReportGpuFillSlots(entry->second.resource_plan);
+				}
 				runtime.gpu_written = nullptr;
 				runtime.gpu_fills   = nullptr;
 				if (ShaderRecompiler::IR::SrtNativeStats stats;
