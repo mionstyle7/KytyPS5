@@ -235,6 +235,8 @@ void CountGpuOwnedSrtRead(uint64_t address, uint32_t bytes) {
 	}
 }
 
+bool SrtBytesGpuWritten(uint64_t address, uint64_t size);
+
 // Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
 // whatever address a descriptor chain produced, including 0 on a path the shader never takes.
@@ -245,6 +247,11 @@ bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32
 	if (auto* cache = static_cast<GuestPageReadCache*>(userdata);
 	    cache != nullptr && cache->Read(address, values)) {
 		return true;
+	}
+	// TryReadBufferBacking downloads GPU-written bytes first (a GPU drain on the GPU thread).
+	if (t_srt_shader_hash != 0 && Libs::Graphics::GuestGpu::IsGpuThread() &&
+	    SrtBytesGpuWritten(address, values.size_bytes())) {
+		CountGpuOwnedSrtRead(address, static_cast<uint32_t>(values.size_bytes()));
 	}
 	// Bytes the GPU has not written are current in the backing store. Reading them there skips
 	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
