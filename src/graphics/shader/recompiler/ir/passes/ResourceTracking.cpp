@@ -2905,6 +2905,7 @@ private:
 		    found != m_gpu_descriptor_handles.end())
 			return found->second;
 		std::vector<const Inst*> descriptor_reads;
+		const char*              reject = nullptr;
 		const auto eligible = [&] {
 			if (!GpuDescriptors(m_program.shader_hash) ||
 			    handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
@@ -2940,7 +2941,12 @@ private:
 				if (!visited.insert(inst).second) continue;
 				if (visited.size() > 4096u) return false;
 				const auto op = inst->GetOpcode();
-				if (op == ValueOpcode::Phi) return false;
+				// The host resolves a descriptor phi through the native CFG (NativeDescriptorSource);
+				// the shader's own phi can be imprecise, so such a descriptor stays on the host.
+				if (op == ValueOpcode::Phi) {
+					reject = "a phi feeds the descriptor";
+					return false;
+				}
 				if (BufferAccessOf(op) != BufferAccess::None ||
 				    AddressOpcodeInfoOf(op).access != AddressAccess::None) {
 					const auto index = inst->Flags<MemoryFlags>().index;
@@ -2951,8 +2957,8 @@ private:
 						return false;
 					descriptor_reads.push_back(inst);
 					reads_memory = true;
-					// The load's own handle is evaluated on the host, as before.
-					for (size_t arg = 1; arg < inst->NumArgs(); arg++) {
+					// The load runs on the GPU too: its own handle's words, and its offsets.
+					for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
 						if (const auto* next = inst->Arg(arg).Resolve().TryInstruction())
 							pending.push_back(next);
 					}
@@ -2969,8 +2975,11 @@ private:
 		m_gpu_descriptor_handles.emplace(&handle, eligible);
 		if (eligible) {
 			LOGF("shader resource tracking: hash=0x%016" PRIx64 " GPU descriptor: a buffer reads "
-			     "its descriptor on the GPU (%zu uses)\n",
-			     m_program.shader_hash, handle.Uses().size());
+			     "its descriptor on the GPU (%zu uses, %zu descriptor loads)\n",
+			     m_program.shader_hash, handle.Uses().size(), descriptor_reads.size());
+		} else if (reject != nullptr) {
+			LOGF("shader resource tracking: hash=0x%016" PRIx64 " GPU descriptor rejected: %s\n",
+			     m_program.shader_hash, reject);
 		}
 		return eligible;
 	}
@@ -2991,7 +3000,6 @@ private:
 				const auto index = inst->Flags<MemoryFlags>().index;
 				if (index >= m_program.memory_info.size() || m_program.memory_info[index].planning_only)
 					return false;
-				continue;
 			}
 			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
 				if (const auto* next = inst->Arg(arg).Resolve().TryInstruction()) pending.push_back(next);
