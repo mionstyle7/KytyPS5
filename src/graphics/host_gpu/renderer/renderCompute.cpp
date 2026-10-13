@@ -56,8 +56,9 @@ namespace {
 // the barrier that makes their GPU-written arguments visible.
 bool DispatchBarriersEnabled() {
 	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_DISPATCH_BARRIERS");
-		return value == nullptr || value[0] != '0';
+		const char* value   = std::getenv("KYTY_DISPATCH_BARRIERS");
+		const char* overlap = std::getenv("KYTY_COMPUTE_OVERLAP");
+		return (value == nullptr || value[0] != '0') && (overlap == nullptr || overlap[0] != '1');
 	}();
 	return enabled;
 }

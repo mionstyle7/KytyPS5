@@ -1670,8 +1670,19 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
 	switch (event_type) {
-		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
-		case 0x00000007:
+		// CsPartialFlush. KYTY_COMPUTE_OVERLAP=1 (measurement only) leaves compute work unordered:
+		// consecutive dispatches may overlap on the host GPU, results may be wrong.
+		case 0x00000007: {
+			static const bool overlap = [] {
+				const char* value = std::getenv("KYTY_COMPUTE_OVERLAP");
+				return value != nullptr && value[0] == '1';
+			}();
+			if (!overlap) {
+				EmitGlobalBarrier();
+			}
+			break;
+		}
+		// GsPartialFlush, PsPartialFlush.
 		case 0x0000000f:
 		case 0x00000010: EmitGlobalBarrier(); break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate.
