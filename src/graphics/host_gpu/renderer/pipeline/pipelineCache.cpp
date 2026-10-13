@@ -382,7 +382,13 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	static const std::string requested = [] {
+		const char* value = std::getenv("KYTY_DUMP_SPIRV_HASHES");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	if (!Config::GraphicsDebugDumpEnabled() &&
+	    (requested.empty() ||
+	     requested.find(fmt::format("{:016x}", shader_hash)) == std::string::npos)) {
 		return;
 	}
 	EXIT_IF(code.empty());
