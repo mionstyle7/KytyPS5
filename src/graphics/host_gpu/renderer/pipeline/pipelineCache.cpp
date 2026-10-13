@@ -48,6 +48,7 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -346,6 +347,74 @@ bool SrtBytesGpuWritten(uint64_t address, uint64_t size);
 // Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
 // whatever address a descriptor chain produced, including 0 on a path the shader never takes.
+// KYTY_SRT_SPECULATE=<n> (default 0 = off): a raw SRT read of bytes the GPU wrote, which drains
+// the GPU to download them, reuses the value it read last time instead, once two reads in a row
+// gave the same value, and reads for real every n-th use to check it. Engines that compute
+// descriptors on the GPU usually write the same ones every frame (one title menu drained the GPU
+// ~23 ms a frame for a single dword). A changed value stops speculation for that address after
+// the second mismatch. Risk: between two checks a changed value is used stale.
+uint32_t SrtSpeculateInterval() {
+	static const uint32_t interval = [] {
+		const char* value = std::getenv("KYTY_SRT_SPECULATE");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	return interval;
+}
+
+struct SrtSpeculation {
+	std::array<uint32_t, 4> value {};
+	uint32_t                words       = 0;
+	uint32_t                same        = 0; // consecutive real reads that gave `value`
+	uint32_t                since_check = 0;
+	uint32_t                mismatches  = 0;
+	bool                    disabled    = false;
+};
+
+bool ReadShaderGuestMemoryRawExact(std::span<uint32_t> values, uint64_t address);
+
+// GPU thread only. True when `values` was served (speculated or read for real and recorded).
+bool ReadSpeculated(uint64_t address, std::span<uint32_t> values) {
+	const auto interval = SrtSpeculateInterval();
+	if (interval == 0 || values.size() > 4u) {
+		return false;
+	}
+	static std::unordered_map<uint64_t, SrtSpeculation> states;
+	static uint64_t                                     speculated = 0;
+	auto& state = states[address];
+	if (state.disabled) {
+		return false;
+	}
+	const auto words = static_cast<uint32_t>(values.size());
+	if (state.words == words && state.same >= 2u && state.since_check + 1u < interval) {
+		state.since_check++;
+		std::copy_n(state.value.begin(), words, values.begin());
+		if ((++speculated & 1023u) == 1u) {
+			LOGF("SRT speculation: %" PRIu64 " reads served, last addr=0x%016" PRIx64 "\n",
+			     speculated, address);
+		}
+		return true;
+	}
+	if (!ReadShaderGuestMemoryRawExact(values, address)) {
+		return false;
+	}
+	const bool equal = state.words == words &&
+	                   std::equal(values.begin(), values.end(), state.value.begin());
+	if (state.words != 0u && !equal) {
+		state.mismatches++;
+		LOGF("SRT speculation: value changed at 0x%016" PRIx64 " (shader 0x%016" PRIx64
+		     ", mismatch %u)\n",
+		     address, t_srt_shader_hash, state.mismatches);
+		if (state.mismatches >= 2u) {
+			state.disabled = true;
+		}
+	}
+	state.same        = equal ? state.same + 1u : 1u;
+	state.words       = words;
+	state.since_check = 0;
+	std::copy_n(values.begin(), words, state.value.begin());
+	return true;
+}
+
 bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) {
 		return false;
@@ -358,7 +427,14 @@ bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32
 	if (t_srt_shader_hash != 0 && Libs::Graphics::GuestGpu::IsGpuThread() &&
 	    SrtBytesGpuWritten(address, values.size_bytes())) {
 		CountGpuOwnedSrtRead(address, static_cast<uint32_t>(values.size_bytes()));
+		if (ReadSpeculated(address, values)) {
+			return true;
+		}
 	}
+	return ReadShaderGuestMemoryRawExact(values, address);
+}
+
+bool ReadShaderGuestMemoryRawExact(std::span<uint32_t> values, uint64_t address) {
 	// Bytes the GPU has not written are current in the backing store. Reading them there skips
 	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
 	// wrote: constants that share a page with GPU-written arguments cost a drain per dispatch.
