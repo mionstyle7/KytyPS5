@@ -580,6 +580,16 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	}
 
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
+	if (from_gpu_thread) {
+		// A download on the GPU thread drains the whole GPU before the thread goes on: name the
+		// host path of the first ones (symbolise with the linker map next to the exe).
+		static uint32_t traced = 0;
+		if (traced < 24) {
+			traced++;
+			LOGF("GPU-thread download: vaddr=0x%016" PRIx64 " size=0x%" PRIx64 " write=%d\n%s",
+			     vaddr, size, is_write ? 1 : 0, Common::HostBacktrace().c_str());
+		}
+	}
 	if (async) {
 		// The download publishes when its tick completes; the page stays protected until the
 		// caller's next step finds its bytes downloaded and lifts it.
