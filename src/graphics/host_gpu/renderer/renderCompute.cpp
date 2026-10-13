@@ -148,6 +148,24 @@ DispatchRecoveryPolicy& RecoveryPolicy() {
 // A missing BDA page returns zero during the first attempt. Preserve every
 // externally writable buffer, including atomic destinations, so that attempt
 // can be rolled back before any dependent dispatch observes its results.
+// KYTY_WATCH_DISPATCH=<hash>[,<hash>...] (hex): logs the first 64 direct dispatches of those
+// shaders as the graphics debug dump does (groups, local size, buffers and textures).
+bool WatchDispatch(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		const char*           value = std::getenv("KYTY_WATCH_DISPATCH");
+		while (value != nullptr && *value != '\0') {
+			char* end = nullptr;
+			result.push_back(std::strtoull(value, &end, 16));
+			value = end != nullptr && *end == ',' ? end + 1 : nullptr;
+		}
+		return result;
+	}();
+	if (std::ranges::find(hashes, shader_hash) == hashes.end()) return false;
+	static std::unordered_map<uint64_t, uint32_t> counts;
+	return counts[shader_hash]++ < 64u;
+}
+
 class DispatchBufferRecovery {
 public:
 	DispatchBufferRecovery(RenderContext& context, const PreparedBindings& bindings,
@@ -628,7 +646,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
-	if (Config::GraphicsDebugDumpEnabled()) {
+	if (Config::GraphicsDebugDumpEnabled() || WatchDispatch(program.shader_hash)) {
 		const auto sampled_images = std::count_if(
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
