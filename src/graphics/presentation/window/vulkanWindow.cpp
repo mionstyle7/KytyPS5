@@ -437,11 +437,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	const float               queue_priorities[2] = {1.0f, 1.0f};
+	uint32_t                  family_count        = 0;
+	physical_device.getQueueFamilyProperties(&family_count, nullptr);
+	std::vector<vk::QueueFamilyProperties> families(family_count);
+	physical_device.getQueueFamilyProperties(&family_count, families.data());
+	const bool side_queue = queue_family < families.size() && families[queue_family].queueCount > 1 &&
+	                        []() {
+		                        const char* value = std::getenv("KYTY_SIDE_QUEUE");
+		                        return value == nullptr || value[0] != '0';
+	                        }();
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount       = side_queue ? 2u : 1u;
+	queue_create_info.pQueuePriorities = queue_priorities;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -1270,6 +1279,19 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	{
+		uint32_t family_count = 0;
+		graphic_ctx.physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		graphic_ctx.physical_device.getQueueFamilyProperties(&family_count, families.data());
+		const char* value = std::getenv("KYTY_SIDE_QUEUE");
+		if (graphic_ctx.queue_family < families.size() &&
+		    families[graphic_ctx.queue_family].queueCount > 1 && (value == nullptr || value[0] != '0')) {
+			graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.side_queue);
+			LOGF("Vulkan: side queue for readbacks: %s\n",
+			     graphic_ctx.side_queue != nullptr ? "on" : "off");
+		}
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

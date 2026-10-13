@@ -142,7 +142,25 @@ public:
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
 
+	// A game thread's read of GPU-written bytes whose writers were already submitted: a copy on
+	// the side queue that waits only for those writers (BufferCache::TrySideReadback).
+	struct SideTicket {
+		uint32_t                                   slot  = 0;
+		uint64_t                                   value = 0;
+		uint64_t                                   begin = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	};
+
 private:
+	struct SideState;
+	static constexpr uint64_t SideRetry = UINT64_MAX;
+	bool TrySideReadback(uint64_t vaddr, uint64_t size, SideTicket& ticket);
+	void FinishSideReadback(const SideTicket& ticket);
+	void WaitSideRanges(uint64_t vaddr, uint64_t size);
+	std::unique_ptr<SideState> m_side;
+	// Bytes a side readback copies and has not published yet (guarded by m_dirty_ranges_mutex):
+	// their pages must stay protected until then.
+	RangeSet                   m_side_ranges;
 	friend struct BufferCacheTestAccess;
 
 	void ReleaseBuffer(BufferId id);

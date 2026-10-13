@@ -84,6 +84,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// A second queue of the same family (null when the family has one): side readbacks
+	// (BufferCache) run there, beside the work queued on `queue`.
+	Common::Mutex                      side_queue_mutex;
+	vk::Queue                          side_queue   = nullptr;
 	// Frames presented so far: the clock the caches age their entries by.
 	std::atomic<uint64_t>              presented_frames {0};
 
