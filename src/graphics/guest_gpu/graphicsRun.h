@@ -35,6 +35,13 @@ public:
 	// Like SendCommand, but false instead of exiting once the GPU no longer accepts commands.
 	bool               TrySendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// A game thread's readback step: runs on the GPU thread like SendCommandSync, and also while
+	// the GPU thread waits for the GPU (CommandScheduler::Wait), not only between PM4 packets.
+	void               SendReadbackSync(Common::UniqueFunction<void>&& command);
+	// GPU thread: runs the queued readback steps (InGpuWait() is true for the ones run inside a
+	// wait for the GPU).
+	void               ProcessReadbackCommands(bool in_wait);
+	[[nodiscard]] static bool InGpuWait() noexcept;
 
 	// End-of-pipe labels (RELEASE_MEM without an interrupt) become visible to the CPU once the
 	// host GPU has executed the work recorded before them, as on hardware, instead of when the
@@ -100,6 +107,9 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	Common::Mutex                                  m_readback_mutex;
+	std::deque<Common::UniqueFunction<void>>       m_readback_commands;
+	std::atomic_uint32_t                           m_pending_readbacks {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

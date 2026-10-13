@@ -111,4 +111,32 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	Refresh();
 }
 
+bool MasterSemaphore::WaitFor(uint64_t tick, uint64_t timeout_us) {
+	if (IsFree(tick)) {
+		return true;
+	}
+	Refresh();
+	if (IsFree(tick)) {
+		return true;
+	}
+	KYTY_PROFILER_BLOCK("MasterSemaphore::Wait (blocked on GPU)");
+	vk::SemaphoreWaitInfo wait_info {};
+	wait_info.semaphoreCount = 1;
+	wait_info.pSemaphores    = &m_semaphore;
+	wait_info.pValues        = &tick;
+	const auto result = m_graphics.device.waitSemaphores(&wait_info, timeout_us * 1000u);
+	if (result == vk::Result::eTimeout) {
+		return false;
+	}
+	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			DumpDeviceLossDiagnostics(m_graphics);
+		}
+		EXIT("MasterSemaphore: wait for tick %" PRIu64 " failed: %s (gpu tick %" PRIu64 ")\n", tick,
+		     vk::to_string(result).c_str(), m_gpu_tick.load(std::memory_order_acquire));
+	}
+	Refresh();
+	return true;
+}
+
 } // namespace Libs::Graphics

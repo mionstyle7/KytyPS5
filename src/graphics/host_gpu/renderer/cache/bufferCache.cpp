@@ -811,13 +811,29 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		bool          side = false;
 		Common::Timer step_timer;
 		step_timer.Start();
-		m_scheduler.Context().GetGpu().SendCommandSync(
-		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &ticket, &side] {
-			    side = !is_write && !from_gpu_thread && TrySideReadback(vaddr, size, ticket);
-			    if (!side) {
-				    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
-			    }
-		    });
+		const auto step = [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &ticket,
+		                   &side] {
+			if (GuestGpu::InGpuWait()) {
+				// Inside a wait of the GPU thread for the GPU: the waiting code may hold buffer
+				// references, so this step must not create or merge buffers; otherwise it is
+				// retried between packets.
+				const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+				if (owner == nullptr || !*owner || IsBufferInvalid(*owner) ||
+				    !m_slot_buffers[*owner].IsInBounds(vaddr, std::max<uint64_t>(size, 1))) {
+					wait_tick = SideRetry;
+					return;
+				}
+			}
+			side = !is_write && !from_gpu_thread && TrySideReadback(vaddr, size, ticket);
+			if (!side) {
+				wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
+			}
+		};
+		if (from_gpu_thread || !async) {
+			m_scheduler.Context().GetGpu().SendCommandSync(step);
+		} else {
+			m_scheduler.Context().GetGpu().SendReadbackSync(step);
+		}
 		gpu_thread_us += static_cast<uint64_t>(step_timer.GetTimeS() * 1e6);
 		if (side) {
 			// Published here; the next step lifts the protection of the now clean pages.

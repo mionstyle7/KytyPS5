@@ -293,6 +293,54 @@ void GuestGpu::ProcessCommands() {
 	}
 }
 
+namespace {
+thread_local bool t_in_gpu_wait = false;
+} // namespace
+
+bool GuestGpu::InGpuWait() noexcept {
+	return t_in_gpu_wait;
+}
+
+void GuestGpu::SendReadbackSync(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return;
+	}
+	std::binary_semaphore done {0};
+	{
+		Common::LockGuard lock(m_readback_mutex);
+		m_readback_commands.push_back([operation = std::move(command), &done]() mutable {
+			operation();
+			done.release();
+		});
+		m_pending_readbacks.fetch_add(1, std::memory_order_release);
+	}
+	// Also through the normal queue, so an idle or busy GPU thread takes it between packets.
+	SendCommand([this] { ProcessReadbackCommands(false); });
+	done.acquire();
+}
+
+void GuestGpu::ProcessReadbackCommands(bool in_wait) {
+	EXIT_IF(!IsGpuThread());
+	while (m_pending_readbacks.load(std::memory_order_acquire) != 0) {
+		Common::UniqueFunction<void> command;
+		{
+			Common::LockGuard lock(m_readback_mutex);
+			if (m_readback_commands.empty()) {
+				return;
+			}
+			command = std::move(m_readback_commands.front());
+			m_readback_commands.pop_front();
+			m_pending_readbacks.fetch_sub(1, std::memory_order_acq_rel);
+		}
+		const bool previous = t_in_gpu_wait;
+		t_in_gpu_wait       = in_wait;
+		command();
+		t_in_gpu_wait = previous;
+	}
+}
+
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {

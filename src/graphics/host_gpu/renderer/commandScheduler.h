@@ -204,6 +204,8 @@ private:
 
 	void BeginNext();
 	void QueueSubmit(SubmitJob& job);
+	static bool ReadbacksDuringWait();
+	void        WaitServingReadbacks(uint64_t tick);
 	Common::UniqueFunction<void> m_pre_submit;
 	bool                         m_in_pre_submit = false;
 	void SubmitThread(std::stop_token stop);

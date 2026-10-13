@@ -287,6 +287,27 @@ void RecordWait(double seconds, bool drained) {
 }
 } // namespace
 
+// KYTY_READBACK_DURING_WAIT=0: the GPU thread serves game threads' readbacks only between PM4
+// packets, as before, not while it waits for the GPU.
+bool CommandScheduler::ReadbacksDuringWait() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_DURING_WAIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+void CommandScheduler::WaitServingReadbacks(uint64_t tick) {
+	auto& gpu = m_context.GetGpu();
+	for (;;) {
+		gpu.ProcessReadbackCommands(true);
+		if (m_master.WaitFor(tick, 200)) {
+			break;
+		}
+	}
+	gpu.ProcessReadbackCommands(true);
+}
+
 void CommandScheduler::Wait(uint64_t tick) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(tick > CurrentTick());
@@ -302,9 +323,15 @@ void CommandScheduler::Wait(uint64_t tick) {
 			const auto submitted_tick = Submit();
 			EXIT_IF(submitted_tick != tick);
 			Timeline::Mark("drain-begin", tick);
-			m_master.Wait(tick);
+			if (ReadbacksDuringWait() && GuestGpu::IsGpuThread()) {
+				// Game threads' readbacks are served while the GPU works, from a fresh recording.
+				BeginNext();
+				WaitServingReadbacks(tick);
+			} else {
+				m_master.Wait(tick);
+				BeginNext();
+			}
 			Timeline::Mark("drain-end", tick);
-			BeginNext();
 		}
 		RecordWait(timer.GetTimeS(), true);
 	} else {
