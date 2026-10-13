@@ -79,6 +79,12 @@ struct MemoryInfo {
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
 
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !typed && !formatted && data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
+	}
+
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		return !typed && data_bits == 32u &&
 		       (formatted ? opcode == ValueOpcode::LoadBufferU32
@@ -506,6 +512,9 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// Stores through buffers whose descriptor the shader reads from GPU memory itself
+	// (KYTY_GPU_DESCRIPTORS): the host does not know their addresses.
+	bool                             indirect_buffer_writes = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

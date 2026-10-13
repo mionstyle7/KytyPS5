@@ -56,6 +56,30 @@ bool GpuResources(uint64_t shader_hash) {
 	return list.first || list.second.contains(shader_hash);
 }
 
+// KYTY_GPU_DESCRIPTORS=<hash>[,<hash>...] (hex), "all" or "off": in the listed shaders, a raw
+// DWORD buffer whose descriptor words the shader loads from memory reads that descriptor on the
+// GPU and accesses the buffer through it (BDA), stores included. The host otherwise evaluates
+// the descriptor itself, and when the GPU wrote those words, reading them drains the GPU: one
+// compute shader at a title menu did that every frame (~23 ms). Default: that shader.
+bool GpuDescriptors(uint64_t shader_hash) {
+	static const auto list = [] {
+		std::pair<bool, std::unordered_set<uint64_t>> result {false, {0xfb5ee753d43f3f0bull}};
+		const char* value = std::getenv("KYTY_GPU_DESCRIPTORS");
+		if (value == nullptr) return result;
+		const std::string_view text(value);
+		result.second.clear();
+		if (text == "off" || text == "0" || text == "none") return result;
+		result.first = text == "all";
+		for (size_t begin = 0; !result.first && begin < text.size();) {
+			const auto end = std::min(text.find(',', begin), text.size());
+			if (end > begin) result.second.insert(std::strtoull(std::string(text.substr(begin, end - begin)).c_str(), nullptr, 16));
+			begin = end + 1;
+		}
+		return result;
+	}();
+	return list.first || list.second.contains(shader_hash);
+}
+
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
@@ -385,6 +409,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_info.indirect_buffer_writes = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -901,6 +926,9 @@ private:
 					MakeSource(*handle, width, sampler,
 					           sampler && (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0,
 					           base, source, flags.pc);
+					// The shader reads this descriptor itself (KYTY_GPU_DESCRIPTORS): its words'
+					// loads stay GPU reads instead of flat slots the host fills.
+					if (GpuDescriptorHandle(*handle)) continue;
 					for (uint32_t word = 0; word < width; ++word)
 						CollectScalarRead(source.dwords[word], flags.pc);
 				}
@@ -2867,6 +2895,102 @@ private:
 		}
 	}
 
+	// A buffer handle the shader evaluates on the GPU (KYTY_GPU_DESCRIPTORS): every use is a raw
+	// DWORD load or store on a vector buffer, and a memory load feeds its descriptor words.
+	// Decided once per handle, before PlanScalarReads turns any of those loads into flat slots.
+	bool GpuDescriptorHandle(const Inst& handle) {
+		if (const auto found = m_gpu_descriptor_handles.find(&handle);
+		    found != m_gpu_descriptor_handles.end())
+			return found->second;
+		const auto eligible = [&] {
+			if (!GpuDescriptors(m_program.shader_hash) ||
+			    handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
+			    handle.Uses().empty())
+				return false;
+			for (const auto& use: handle.Uses()) {
+				const auto op    = use.user->GetOpcode();
+				const auto index = use.user->Flags<MemoryFlags>().index;
+				if (index >= m_program.memory_info.size() || use.user->NumArgs() == 0 ||
+				    use.user->Arg(0).Resolve().TryInstruction() != &handle)
+					return false;
+				const auto& memory = m_program.memory_info[index];
+				const bool  load   = BufferAccessOf(op) == BufferAccess::Read && !memory.formatted &&
+				                  op != ValueOpcode::ReadConstBuffer &&
+				                  memory.SupportsIndirectBufferLoad(op);
+				if (memory.kind != ResourceKind::Buffer || memory.planning_only ||
+				    (!load && !memory.SupportsIndirectBufferStore(op)))
+					return false;
+			}
+			// The descriptor must come from memory (otherwise a binding is cheaper), and only
+			// through loads that stay GPU reads.
+			bool                            reads_memory = false;
+			std::vector<const Inst*>        pending;
+			std::unordered_set<const Inst*> visited;
+			for (size_t arg = 0; arg < handle.NumArgs(); arg++) {
+				if (const auto* inst = handle.Arg(arg).Resolve().TryInstruction()) pending.push_back(inst);
+			}
+			while (!pending.empty()) {
+				const auto* inst = pending.back();
+				pending.pop_back();
+				if (!visited.insert(inst).second) continue;
+				if (visited.size() > 4096u) return false;
+				const auto op = inst->GetOpcode();
+				if (op == ValueOpcode::Phi) return false;
+				if (BufferAccessOf(op) != BufferAccess::None ||
+				    AddressOpcodeInfoOf(op).access != AddressAccess::None) {
+					if (op != ValueOpcode::ReadConstBuffer) return false;
+					const auto index = inst->Flags<MemoryFlags>().index;
+					if (index >= m_program.memory_info.size() ||
+					    m_program.memory_info[index].kind != ResourceKind::ScalarBuffer)
+						return false;
+					reads_memory = true;
+					// The load's own handle is evaluated on the host, as before.
+					for (size_t arg = 1; arg < inst->NumArgs(); arg++) {
+						if (const auto* next = inst->Arg(arg).Resolve().TryInstruction())
+							pending.push_back(next);
+					}
+					continue;
+				}
+				if (ImageOpcodeInfoOf(op).access != ImageAccess::None) return false;
+				for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+					if (const auto* next = inst->Arg(arg).Resolve().TryInstruction()) pending.push_back(next);
+				}
+			}
+			return reads_memory;
+		}();
+		m_gpu_descriptor_handles.emplace(&handle, eligible);
+		if (eligible) {
+			LOGF("shader resource tracking: hash=0x%016" PRIx64 " GPU descriptor: a buffer reads "
+			     "its descriptor on the GPU (%zu uses)\n",
+			     m_program.shader_hash, handle.Uses().size());
+		}
+		return eligible;
+	}
+
+	// The handle's descriptor loads must still be live GPU reads when Collect runs.
+	bool GpuDescriptorReadsLive(const Inst& handle) const {
+		std::vector<const Inst*>        pending;
+		std::unordered_set<const Inst*> visited;
+		for (size_t arg = 0; arg < handle.NumArgs(); arg++) {
+			if (const auto* inst = handle.Arg(arg).Resolve().TryInstruction()) pending.push_back(inst);
+		}
+		while (!pending.empty()) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (!visited.insert(inst).second) continue;
+			if (inst->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+				const auto index = inst->Flags<MemoryFlags>().index;
+				if (index >= m_program.memory_info.size() || m_program.memory_info[index].planning_only)
+					return false;
+				continue;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				if (const auto* next = inst->Arg(arg).Resolve().TryInstruction()) pending.push_back(next);
+			}
+		}
+		return true;
+	}
+
 	// True when a value the load returns reaches a resource handle (a descriptor kept in that
 	// buffer): the host evaluates such descriptors from the loaded bytes, so the load must stay
 	// a host-visible binding (KYTY_GPU_RESOURCES). The instructions that feed any handle are
@@ -3157,6 +3281,13 @@ private:
 				m_info.uses_dma                         = true;
 				return;
 			}
+			if (indirect == nullptr && handle != nullptr && GpuDescriptorHandle(*handle) &&
+			    GpuDescriptorReadsLive(*handle)) {
+				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+				m_info.uses_dma                         = true;
+				m_info.indirect_buffer_writes |= buffer != BufferAccess::Read;
+				return;
+			}
 			if (indirect != nullptr) {
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
@@ -3295,6 +3426,7 @@ private:
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::optional<std::unordered_set<const Inst*>> m_handle_feeders;
+	std::unordered_map<const Inst*, bool>          m_gpu_descriptor_handles;
 	std::unordered_set<const Inst*>            m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;

@@ -180,6 +180,7 @@ void Visit(Io& io, T& v) {
 	io(v.instance_offset_sgpr);
 	io(v.has_bitwise_xor);
 	io(v.uses_dma);
+	io(v.indirect_buffer_writes);
 }
 
 template <typename Io, typename T>

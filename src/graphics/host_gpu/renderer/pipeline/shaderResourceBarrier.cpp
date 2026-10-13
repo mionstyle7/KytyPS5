@@ -93,6 +93,10 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	const auto& program   = *runtime.program;
 	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
+	// Stores through descriptors the shader reads on the GPU: addresses the host does not know.
+	if (program.info.indirect_buffer_writes) {
+		return true;
+	}
 	bool has_writes = false;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		if (!program.info.buffers[i].written) {
