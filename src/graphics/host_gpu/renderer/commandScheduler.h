@@ -60,6 +60,9 @@ public:
 	void           CompleteDraw();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	// Called on the GPU thread at the start of every Submit, before the recording ends: the
+	// buffer cache records its eager readback copies there (BufferCache::IssueEagerReadbacks).
+	void           SetPreSubmit(Common::UniqueFunction<void>&& hook) { m_pre_submit = std::move(hook); }
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -201,6 +204,8 @@ private:
 
 	void BeginNext();
 	void QueueSubmit(SubmitJob& job);
+	Common::UniqueFunction<void> m_pre_submit;
+	bool                         m_in_pre_submit = false;
 	void SubmitThread(std::stop_token stop);
 	void StopSubmitThread();
 	void PriorityOperationsThread(std::stop_token stop);

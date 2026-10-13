@@ -280,7 +280,7 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 static bool SideReadbackEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SIDE_READBACK");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1'; // measured slower (2 fps), default off
 	}();
 	return enabled;
 }
@@ -343,6 +343,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	m_scheduler.SetPreSubmit([this] { IssueEagerReadbacks(); });
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -555,7 +556,123 @@ void BufferCache::WaitSideRanges(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+// A game thread's fault on GPU-written memory no longer makes the GPU thread wait for the GPU.
+// The GPU thread records the download, submits it and goes on; the faulting thread waits for
+// that download's publication itself, then asks again (the window's pages then have no
+// GPU-written bytes left and their protection is lifted). KYTY_ASYNC_READBACK=0 waits on the GPU
+// thread as before.
+static const bool g_async_readback = [] {
+	const char* value = std::getenv("KYTY_ASYNC_READBACK");
+	return value == nullptr || value[0] != '0';
+}();
+
+static bool EagerReadbackEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_EAGER");
+		return g_async_readback && (value == nullptr || value[0] != '0');
+	}();
+	return enabled;
+}
+
+// Game threads: the page of a read fault becomes hot (at most 64, the least recently read
+// leaves first).
+void BufferCache::NoteHotRead(uint64_t vaddr) {
+	if (!EagerReadbackEnabled()) {
+		return;
+	}
+	constexpr size_t MaxPages = 64;
+	const auto       page     = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto       frame    = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	std::lock_guard  lock(m_eager_mutex);
+	auto             found = m_eager_pages.find(page);
+	if (found == m_eager_pages.end()) {
+		if (m_eager_pages.size() >= MaxPages) {
+			auto oldest = m_eager_pages.begin();
+			for (auto it = m_eager_pages.begin(); it != m_eager_pages.end(); ++it) {
+				if (it->second.last_read_frame < oldest->second.last_read_frame) oldest = it;
+			}
+			m_eager_pages.erase(oldest);
+		}
+		found = m_eager_pages.emplace(page, EagerPage {}).first;
+	}
+	found->second.last_read_frame = frame;
+	m_eager_any.store(true, std::memory_order_relaxed);
+}
+
+// GPU thread, before each submission: the hot pages this recording wrote are downloaded at its
+// end (at most four times a page and frame); at completion the bytes are published and the GPU
+// thread lifts the page's protection when no newer writer owns it again.
+void BufferCache::IssueEagerReadbacks() {
+	if (!EagerReadbackEnabled() || !m_eager_any.load(std::memory_order_relaxed)) {
+		return;
+	}
+	constexpr uint64_t IdleFrames  = 600;
+	constexpr uint32_t FrameBudget = 4;
+	const auto         frame       = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	std::vector<uint64_t> pages;
+	{
+		std::lock_guard lock(m_eager_mutex);
+		std::erase_if(m_eager_pages, [&](const auto& entry) {
+			return entry.second.last_read_frame + IdleFrames < frame;
+		});
+		for (const auto page: m_eager_written) {
+			auto found = m_eager_pages.find(page);
+			if (found == m_eager_pages.end()) continue;
+			auto& hot = found->second;
+			if (hot.copy_frame != frame) {
+				hot.copy_frame = frame;
+				hot.copies     = 0;
+			}
+			if (hot.copies >= FrameBudget) continue;
+			hot.copies++;
+			pages.push_back(page);
+		}
+		m_eager_written.clear();
+	}
+	for (const auto page: pages) {
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) continue;
+		auto&      buffer = m_slot_buffers[*owner];
+		const auto begin  = std::max(page, buffer.CpuAddress());
+		const auto end    = std::min(page + TRACKER_PAGE_SIZE, buffer.CpuAddress() + buffer.Size());
+		if (begin >= end) continue;
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			if (!m_gpu_modified_ranges.Intersects(begin, end - begin) ||
+			    !m_side_ranges.Empty() && m_side_ranges.Intersects(begin, end - begin)) {
+				continue;
+			}
+		}
+		const auto tick = m_scheduler.CurrentTick();
+		if (!DownloadBufferMemory<true>(buffer, begin, end - begin)) continue;
+		m_last_async_download_tick = std::max(m_last_async_download_tick, tick);
+		m_eager_issued++;
+		if ((m_eager_issued & 0x3ffu) == 1u) {
+			LOGF("BufferCache: eager readbacks issued: %" PRIu64 " (%zu hot pages)\n", m_eager_issued,
+			     m_eager_pages.size());
+		}
+		// After the publication (same tick, queued later): lift the protection on the GPU thread,
+		// unless a newer writer or download owns bytes of the page again.
+		m_scheduler.DeferPriorityOperation([this, page = Common::AlignDown(begin, TRACKER_PAGE_SIZE)] {
+			(void)m_scheduler.Context().GetGpu().TrySendCommand([this, page] {
+				{
+					std::shared_lock lock(m_dirty_ranges_mutex);
+					if (m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) ||
+					    m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE) ||
+					    (!m_side_ranges.Empty() && m_side_ranges.Intersects(page, TRACKER_PAGE_SIZE))) {
+						return;
+					}
+				}
+				if (m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+				}
+			});
+		});
+	}
+}
+
 BufferCache::~BufferCache() {
+	m_scheduler.SetPreSubmit({});
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -614,15 +731,6 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	return true;
 }
 
-// A game thread's fault on GPU-written memory no longer makes the GPU thread wait for the GPU.
-// The GPU thread records the download, submits it and goes on; the faulting thread waits for
-// that download's publication itself, then asks again (the window's pages then have no
-// GPU-written bytes left and their protection is lifted). KYTY_ASYNC_READBACK=0 waits on the GPU
-// thread as before.
-static const bool g_async_readback = [] {
-	const char* value = std::getenv("KYTY_ASYNC_READBACK");
-	return value == nullptr || value[0] != '0';
-}();
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_FUNCTION();
@@ -633,6 +741,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	const bool from_gpu_thread = GuestGpu::IsGpuThread();
 	const bool async           = g_async_readback && !from_gpu_thread;
+	if (!from_gpu_thread && !is_write) {
+		NoteHotRead(vaddr);
+	}
 	// Diagnostics: how long game threads wait in readbacks, and how old the bytes they read are
 	// (ticks between the last GPU write of the page and the fault; whether that write had already
 	// completed on the GPU). A readback of old, completed writes only waits for the queue behind.
@@ -1500,6 +1611,16 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			m_bitmap_tracked.Subtract(first, last - first);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		if (m_eager_any.load(std::memory_order_relaxed)) {
+			std::lock_guard eager_lock(m_eager_mutex);
+			for (const auto& [page, hot]: m_eager_pages) {
+				(void)hot;
+				if (page < vaddr + size && vaddr < page + TRACKER_PAGE_SIZE &&
+				    std::ranges::find(m_eager_written, page) == m_eager_written.end()) {
+					m_eager_written.push_back(page);
+				}
+			}
+		}
 		const auto tick = m_scheduler.CurrentTick();
 		if (m_write_ticks.size() > (1u << 20u)) m_write_ticks.clear();
 		if (size <= 0x10000) {

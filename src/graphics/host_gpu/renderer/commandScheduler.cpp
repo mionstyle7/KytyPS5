@@ -473,6 +473,12 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_command.IsInvalid());
+	if (m_pre_submit && !m_in_pre_submit) {
+		m_in_pre_submit = true;
+		m_pre_submit();
+		m_in_pre_submit = false;
+		EXIT_IF(m_command.IsInvalid());
+	}
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 

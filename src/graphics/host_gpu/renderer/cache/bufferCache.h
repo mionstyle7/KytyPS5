@@ -154,6 +154,22 @@ public:
 private:
 	struct SideState;
 	static constexpr uint64_t SideRetry = UINT64_MAX;
+	// Eager readback (KYTY_READBACK_EAGER, default on): pages game threads read back are
+	// "hot"; a recording that writes one ends with an asynchronous download of its GPU-written
+	// bytes, published at completion, and the GPU thread then lifts the page's protection, so the
+	// next read finds the bytes in guest memory without a fault.
+	struct EagerPage {
+		uint64_t last_read_frame = 0;
+		uint64_t copy_frame      = 0;
+		uint32_t copies          = 0;
+	};
+	void NoteHotRead(uint64_t vaddr);
+	void IssueEagerReadbacks();
+	std::mutex                              m_eager_mutex;
+	std::unordered_map<uint64_t, EagerPage> m_eager_pages;   // guarded by m_eager_mutex
+	std::vector<uint64_t>                   m_eager_written; // GPU thread: hot pages written this recording
+	std::atomic<bool>                       m_eager_any {false};
+	uint64_t                                m_eager_issued = 0;
 	bool TrySideReadback(uint64_t vaddr, uint64_t size, SideTicket& ticket);
 	void FinishSideReadback(const SideTicket& ticket);
 	void WaitSideRanges(uint64_t vaddr, uint64_t size);
