@@ -278,6 +278,26 @@ void ReportGpuFillSlots(const ShaderRecompiler::IR::ResourcePlan& plan) {
 	}
 	LOGF("GpuFillSlots: hash=0x%016" PRIx64 " slots=%zu blocks=%zu sources=%zu\n", plan.shader_hash,
 	     count, plan.control_flow.size(), plan.descriptor_sources.size());
+	for (size_t i = 0; i < plan.info.buffers.size(); i++) {
+		const auto& b = plan.info.buffers[i];
+		LOGF("\t buffer %zu source=%u read=%d written=%d atomic=%d scalar=%d formatted=%d "
+		     "extent=%u indirect_root=%u\n",
+		     i, b.source, b.read ? 1 : 0, b.written ? 1 : 0, b.atomic ? 1 : 0, b.scalar ? 1 : 0,
+		     b.formatted ? 1 : 0, b.max_byte_extent, b.indirect_root);
+	}
+	for (size_t i = 0; i < plan.info.images.size(); i++) {
+		const auto& image = plan.info.images[i];
+		LOGF("\t image %zu source=%u written=%d class=%u\n", i, image.source,
+		     image.written ? 1 : 0, static_cast<uint32_t>(image.resource_class));
+	}
+	for (size_t i = 0; i < plan.descriptor_sources.size(); i++) {
+		LOGF("\t source %zu dwords=%u indirect=%d\n", i, plan.descriptor_sources[i].dword_count,
+		     plan.descriptor_sources[i].indirect_descriptor.has_value() ? 1 : 0);
+	}
+	for (size_t i = 0; i < plan.memory_info.size(); i++) {
+		LOGF("\t memory %zu kind=%u resource=%u\n", i,
+		     static_cast<uint32_t>(plan.memory_info[i].kind), plan.memory_info[i].resource);
+	}
 	for (size_t slot = 0; slot < count; slot++) {
 		const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
 		bool        memory_address = false;
