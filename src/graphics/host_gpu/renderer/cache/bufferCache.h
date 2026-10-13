@@ -228,6 +228,9 @@ private:
 	// Guards changes to both range sets (GPU thread and download completions) against
 	// IsCleanForConcurrentRead; the GPU thread reads them without it.
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;
+	// Diagnostics (readback stats): the recording tick of the last GPU write, by 4 KiB page for
+	// small writes and by 4 MiB region (key | 1 << 63) for large ones. Guarded as above.
+	std::unordered_map<uint64_t, uint64_t>             m_write_ticks;
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;
 	// Guest reads UploadCopies leaves to the recording thread: staging destination, guest

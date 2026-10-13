@@ -398,6 +398,60 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	const bool from_gpu_thread = GuestGpu::IsGpuThread();
 	const bool async           = g_async_readback && !from_gpu_thread;
+	// Diagnostics: how long game threads wait in readbacks, and how old the bytes they read are
+	// (ticks between the last GPU write of the page and the fault; whether that write had already
+	// completed on the GPU). A readback of old, completed writes only waits for the queue behind.
+	struct ReadbackSite {
+		uint64_t count = 0, wait_us = 0, age = 0, completed = 0, unknown = 0;
+	};
+	static std::mutex                                       stats_mutex;
+	static std::unordered_map<uint64_t, ReadbackSite>       sites;
+	static uint64_t                                         total = 0;
+	Common::Timer                                           wait_timer;
+	uint64_t                                                write_tick = 0;
+	const auto                                              fault_tick = m_scheduler.CurrentTick();
+	const auto known_tick = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	if (!from_gpu_thread) {
+		wait_timer.Start();
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (const auto found = m_write_ticks.find(vaddr >> 12u); found != m_write_ticks.end()) {
+			write_tick = found->second;
+		} else if (const auto region = m_write_ticks.find((vaddr >> 22u) | (uint64_t {1} << 63u));
+		           region != m_write_ticks.end()) {
+			write_tick = region->second;
+		}
+	}
+	const auto record = [&] {
+		if (from_gpu_thread) return;
+		std::lock_guard lock(stats_mutex);
+		auto& site = sites[vaddr >> 12u];
+		site.count++;
+		site.wait_us += static_cast<uint64_t>(wait_timer.GetTimeS() * 1e6);
+		if (write_tick == 0) {
+			site.unknown++;
+		} else {
+			site.age += fault_tick - std::min(fault_tick, write_tick);
+			site.completed += write_tick <= known_tick ? 1u : 0u;
+		}
+		if (++total % 512u == 0u) {
+			std::vector<std::pair<uint64_t, ReadbackSite>> sorted(sites.begin(), sites.end());
+			std::ranges::sort(sorted, [](const auto& a, const auto& b) {
+				return a.second.wait_us > b.second.wait_us;
+			});
+			LOGF("Readback stats (%" PRIu64 " readbacks, %zu pages; fault tick %" PRIu64
+			     ", GPU at %" PRIu64 "):\n",
+			     total, sites.size(), fault_tick, known_tick);
+			for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); i++) {
+				const auto& [page, s] = sorted[i];
+				const auto known      = s.count - s.unknown;
+				LOGF("  page 0x%" PRIx64 "000: %" PRIu64 " reads, wait %.1f ms (avg %.2f), write age "
+				     "%.1f ticks, write already done %" PRIu64 "/%" PRIu64 "\n",
+				     page, s.count, s.wait_us / 1000.0, s.wait_us / 1000.0 / s.count,
+				     known != 0 ? static_cast<double>(s.age) / known : 0.0, s.completed, known);
+			}
+			sites.clear();
+		}
+	};
 	for (;;) {
 		uint64_t wait_tick = 0;
 		m_scheduler.Context().GetGpu().SendCommandSync(
@@ -405,6 +459,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
 		    });
 		if (wait_tick == 0) {
+			record();
 			return;
 		}
 		m_scheduler.WaitPriorityOperations(wait_tick);
@@ -1163,6 +1218,14 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			m_bitmap_tracked.Subtract(first, last - first);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		const auto tick = m_scheduler.CurrentTick();
+		if (m_write_ticks.size() > (1u << 20u)) m_write_ticks.clear();
+		if (size <= 0x10000) {
+			for (auto page = first >> 12u; page < (last >> 12u); page++) m_write_ticks[page] = tick;
+		} else {
+			for (auto region = vaddr >> 22u; region <= (vaddr + size - 1) >> 22u; region++)
+				m_write_ticks[region | (uint64_t {1} << 63u)] = tick;
+		}
 	}
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
 	// the bindings that mark bytes of those ranges GPU-written: the first write of each
