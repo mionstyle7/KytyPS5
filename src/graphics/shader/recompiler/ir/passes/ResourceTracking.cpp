@@ -63,7 +63,7 @@ bool GpuResources(uint64_t shader_hash) {
 // compute shader at a title menu did that every frame (~23 ms). Default: that shader.
 bool GpuDescriptors(uint64_t shader_hash) {
 	static const auto list = [] {
-		std::pair<bool, std::unordered_set<uint64_t>> result {false, {0xfb5ee753d43f3f0bull}};
+		std::pair<bool, std::unordered_set<uint64_t>> result {false, {0xfb5ee753d43f3f0bull, 0x380b6ffba703cef1ull}};
 		const char* value = std::getenv("KYTY_GPU_DESCRIPTORS");
 		if (value == nullptr) return result;
 		const std::string_view text(value);
@@ -967,7 +967,9 @@ private:
 			for (auto* block: m_program.blocks) {
 				for (auto& inst: *block) {
 					uint32_t index = 0;
+					// Loads of descriptors the shader evaluates itself stay GPU reads.
 					if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && !written(inst) &&
+					    !m_gpu_descriptor_reads.contains(&inst) &&
 					    ScalarReadMemory(inst, index) != nullptr &&
 					    inst.Arg(1).Resolve().IsImmediate() &&
 					    ValidateRuntimeValue(m_program, Value(&inst)))
@@ -2902,6 +2904,7 @@ private:
 		if (const auto found = m_gpu_descriptor_handles.find(&handle);
 		    found != m_gpu_descriptor_handles.end())
 			return found->second;
+		std::vector<const Inst*> descriptor_reads;
 		const auto eligible = [&] {
 			if (!GpuDescriptors(m_program.shader_hash) ||
 			    handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
@@ -2938,11 +2941,13 @@ private:
 				if (op == ValueOpcode::Phi) return false;
 				if (BufferAccessOf(op) != BufferAccess::None ||
 				    AddressOpcodeInfoOf(op).access != AddressAccess::None) {
-					if (op != ValueOpcode::ReadConstBuffer) return false;
 					const auto index = inst->Flags<MemoryFlags>().index;
-					if (index >= m_program.memory_info.size() ||
-					    m_program.memory_info[index].kind != ResourceKind::ScalarBuffer)
+					if (index >= m_program.memory_info.size()) return false;
+					const auto kind = m_program.memory_info[index].kind;
+					if (!(op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer) &&
+					    !(op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress))
 						return false;
+					descriptor_reads.push_back(inst);
 					reads_memory = true;
 					// The load's own handle is evaluated on the host, as before.
 					for (size_t arg = 1; arg < inst->NumArgs(); arg++) {
@@ -2958,6 +2963,7 @@ private:
 			}
 			return reads_memory;
 		}();
+		if (eligible) m_gpu_descriptor_reads.insert(descriptor_reads.begin(), descriptor_reads.end());
 		m_gpu_descriptor_handles.emplace(&handle, eligible);
 		if (eligible) {
 			LOGF("shader resource tracking: hash=0x%016" PRIx64 " GPU descriptor: a buffer reads "
@@ -2978,7 +2984,8 @@ private:
 			const auto* inst = pending.back();
 			pending.pop_back();
 			if (!visited.insert(inst).second) continue;
-			if (inst->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+			if (inst->GetOpcode() == ValueOpcode::ReadConstBuffer ||
+			    inst->GetOpcode() == ValueOpcode::LoadAddressU32) {
 				const auto index = inst->Flags<MemoryFlags>().index;
 				if (index >= m_program.memory_info.size() || m_program.memory_info[index].planning_only)
 					return false;
@@ -3427,6 +3434,7 @@ private:
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::optional<std::unordered_set<const Inst*>> m_handle_feeders;
 	std::unordered_map<const Inst*, bool>          m_gpu_descriptor_handles;
+	std::unordered_set<const Inst*>                m_gpu_descriptor_reads;
 	std::unordered_set<const Inst*>            m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
