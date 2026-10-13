@@ -384,6 +384,22 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${dispatch_indirect_groups_shader_header}")
+
+set(dispatch_guard_shader_source "${gpu_tiler_shader_dir}/dispatch_guard.comp")
+set(dispatch_guard_shader_spv "${gpu_tiler_generated_dir}/dispatch_guard.spv")
+set(dispatch_guard_shader_header "${gpu_tiler_generated_dir}/dispatch_guard_spv.h")
+add_custom_command(
+	OUTPUT "${dispatch_guard_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dispatch_guard_shader_spv}" "${dispatch_guard_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dispatch_guard_shader_spv}
+	        -DOUTPUT=${dispatch_guard_shader_header}
+	        -DSYMBOL=DISPATCH_GUARD_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dispatch_guard_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dispatch_guard_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")

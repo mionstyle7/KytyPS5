@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/indirectDispatch.h"
 
 #include "common/assert.h"
+#include "gpu_tiler_shaders/dispatch_guard_spv.h"
 #include "gpu_tiler_shaders/dispatch_indirect_groups_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -111,6 +112,118 @@ IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
 	                        {}, 1, &groups_ready, 0, nullptr, 0, nullptr);
 	return {m_groups.Handle(), offset,
 	        m_groups.BufferDeviceAddress() + offset + 4u * sizeof(uint32_t)};
+}
+
+namespace {
+
+struct GuardPushConstants {
+	uint32_t address[DispatchGuard::MaxWords][2];
+	uint32_t expected[DispatchGuard::MaxWords];
+	uint32_t count;
+	uint32_t group[3];
+	uint32_t output_dword;
+};
+static_assert(sizeof(GuardPushConstants) == 68);
+
+} // namespace
+
+DispatchGuard::DispatchGuard(GraphicContext& graphics, CommandScheduler& scheduler)
+    : m_graphics(graphics),
+      m_groups(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
+               vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer,
+               Entries * EntryDwords * sizeof(uint32_t)) {
+	SetVulkanObjectNameF(graphics.device, m_groups.Handle(), "Dispatch Guard Groups");
+
+	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eStorageBuffer, 1,
+	                                              vk::ShaderStageFlagBits::eCompute, nullptr};
+	vk::DescriptorSetLayoutCreateInfo    layout_info {};
+	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	layout_info.bindingCount = 1;
+	layout_info.pBindings    = &binding;
+	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&layout_info, nullptr,
+	                                                               &m_set_layout),
+	                     "create dispatch-guard descriptor layout");
+
+	const vk::PushConstantRange  push_range {vk::ShaderStageFlagBits::eCompute, 0,
+                                            sizeof(GuardPushConstants)};
+	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+	pipeline_layout_info.setLayoutCount         = 1;
+	pipeline_layout_info.pSetLayouts            = &m_set_layout;
+	pipeline_layout_info.pushConstantRangeCount = 1;
+	pipeline_layout_info.pPushConstantRanges    = &push_range;
+	RequireVulkanSuccess(graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+	                                                          &m_pipeline_layout),
+	                     "create dispatch-guard pipeline layout");
+
+	const auto                        module = CompileSPV(DISPATCH_GUARD_SPV, graphics.device);
+	vk::PipelineShaderStageCreateInfo stage {};
+	stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	stage.module = module;
+	stage.pName  = "main";
+	vk::ComputePipelineCreateInfo pipeline_info {};
+	pipeline_info.stage  = stage;
+	pipeline_info.layout = m_pipeline_layout;
+	const auto result =
+	    graphics.device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &m_pipeline);
+	graphics.device.destroyShaderModule(module, nullptr);
+	RequireVulkanSuccess(result, "create dispatch-guard pipeline");
+}
+
+DispatchGuard::~DispatchGuard() {
+	m_graphics.device.destroyPipeline(m_pipeline, nullptr);
+	m_graphics.device.destroyPipelineLayout(m_pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(m_set_layout, nullptr);
+}
+
+std::pair<vk::Buffer, vk::DeviceSize> DispatchGuard::Record(const CommandRecorder& command,
+                                                            std::span<const Word> words,
+                                                            uint32_t x, uint32_t y, uint32_t z) {
+	EXIT_IF(words.empty() || words.size() > MaxWords);
+	const auto entry  = m_next;
+	m_next            = (m_next + 1u) % Entries;
+	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
+
+	// The words come from earlier shader or transfer writes; the entry's previous indirect read
+	// must finish before it is rewritten.
+	vk::MemoryBarrier words_ready {};
+	words_ready.srcAccessMask =
+	    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	words_ready.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &words_ready, 0,
+	                        nullptr, 0, nullptr);
+
+	GuardPushConstants push {};
+	for (size_t i = 0; i < words.size(); i++) {
+		push.address[i][0] = static_cast<uint32_t>(words[i].address);
+		push.address[i][1] = static_cast<uint32_t>(words[i].address >> 32u);
+		push.expected[i]   = words[i].expected;
+	}
+	push.count        = static_cast<uint32_t>(words.size());
+	push.group[0]     = x;
+	push.group[1]     = y;
+	push.group[2]     = z;
+	push.output_dword = entry * EntryDwords;
+
+	const vk::DescriptorBufferInfo info {m_groups.Handle(), 0, VK_WHOLE_SIZE};
+	vk::WriteDescriptorSet         write {};
+	write.dstBinding      = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
+	write.pBufferInfo     = &info;
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, 1, &write);
+	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+	                      &push);
+	command.dispatch(1, 1, 1);
+
+	vk::MemoryBarrier groups_ready {};
+	groups_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	groups_ready.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                        vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &groups_ready, 0,
+	                        nullptr, 0, nullptr);
+	return {m_groups.Handle(), offset};
 }
 
 } // namespace Libs::Graphics

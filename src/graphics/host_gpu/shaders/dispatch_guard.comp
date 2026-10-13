@@ -1,0 +1,42 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+// The guard of a dispatch prepared with speculated SRT words (KYTY_SRT_SPECULATE): the host used
+// remembered values of words the GPU writes instead of draining the GPU to read them. This pass
+// reads the words on the GPU, just before the dispatch, and writes the dispatch's workgroup
+// counts only when every word still holds the value the host used; otherwise the dispatch runs
+// no workgroups instead of using stale descriptors.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Word {
+    uint value;
+};
+
+layout(std430, binding = 0) writeonly buffer Groups {
+    uint groups[];
+};
+
+layout(push_constant) uniform Push {
+    uvec2 address[4];
+    uint  expected[4];
+    uint  count;
+    uint  group_x;
+    uint  group_y;
+    uint  group_z;
+    uint  output_dword;
+} pc;
+
+void main() {
+    bool same = true;
+    for (uint i = 0u; i < pc.count && i < 4u; i++) {
+        if (Word(pc.address[i]).value != pc.expected[i]) {
+            same = false;
+        }
+    }
+    groups[pc.output_dword + 0u] = same ? pc.group_x : 0u;
+    groups[pc.output_dword + 1u] = same ? pc.group_y : 0u;
+    groups[pc.output_dword + 2u] = same ? pc.group_z : 0u;
+    groups[pc.output_dword + 3u] = same ? 0u : 1u;
+}

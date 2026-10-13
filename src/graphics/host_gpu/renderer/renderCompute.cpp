@@ -554,10 +554,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	ShaderProgram compute_program;
+	// SRT words the refresh speculates (KYTY_SRT_SPECULATE): the dispatch is guarded on the GPU.
+	std::vector<SrtSpeculatedWord> speculated;
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::GetComputeProgram");
+		SetSrtSpeculationGuards(&speculated);
 		compute_program =
 		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+		SetSrtSpeculationGuards(nullptr);
 	}
 	if (!compute_program) {
 		char groups[48];
@@ -577,7 +581,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& resources = *input_info.stage.resources;
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::TryConsumeClears");
-		if (resources.specialization_reads.empty() &&
+		// A dispatch whose descriptors were speculated must run guarded, not as a host clear.
+		if (resources.specialization_reads.empty() && speculated.empty() &&
 		    (TryConsumeComputeMetaClear(input_info, buffer) ||
 		     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 		                                 thread_group_z, mode))) {
@@ -683,9 +688,27 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	if (!speculated.empty() && m_dispatch_guard == nullptr) {
+		m_dispatch_guard = std::make_unique<DispatchGuard>(m_context.GetGraphics(),
+		                                                   m_context.GetCommandScheduler());
+	}
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
+		// The guard pass binds its own pipeline: before the guest dispatch's bindings.
+		std::pair<vk::Buffer, vk::DeviceSize> guarded {};
+		if (!speculated.empty()) {
+			std::array<DispatchGuard::Word, DispatchGuard::MaxWords> words {};
+			for (size_t i = 0; i < speculated.size(); i++) {
+				const auto [word_buffer, word_offset] = m_context.GetBufferCache().ObtainBuffer(
+				    speculated[i].address, sizeof(uint32_t), false, false, {}, true);
+				EXIT_IF(word_buffer == nullptr || !word_buffer->HasDeviceAddress());
+				words[i] = {word_buffer->BufferDeviceAddress() + word_offset, speculated[i].value};
+			}
+			guarded = m_dispatch_guard->Record(buffer.Recorder(),
+			                                   std::span(words).first(speculated.size()),
+			                                   thread_group_x, thread_group_y, thread_group_z);
+		}
 		RebindBuffers(bindings);
 		const auto        vk_buffer        = buffer.Recorder();
 		PreparedBindings* descriptor_stage = &bindings;
@@ -710,7 +733,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
 		const auto gpu_zone = BeginGpuZone(m_context, buffer, program.shader_hash);
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		if (guarded.first) {
+			vk_buffer.dispatchIndirect(guarded.first, guarded.second);
+		} else {
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		}
 		Profiler::Add(Profiler::Counter::Dispatches);
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);

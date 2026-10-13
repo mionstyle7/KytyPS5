@@ -284,6 +284,8 @@ private:
 	std::vector<uint32_t>                 m_image_occurrences;
 	// Created at the first thread-dimension indirect dispatch.
 	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
+	// Created at the first direct dispatch prepared with speculated SRT words.
+	std::unique_ptr<DispatchGuard>          m_dispatch_guard;
 	// Ring of VkDrawMeshTasksIndirectCommandEXT for indirect fast-launch mesh draws (16 bytes an
 	// entry); an entry is rewritten only after the ring has gone round, behind its last read.
 	std::unique_ptr<Buffer>                 m_mesh_indirect;

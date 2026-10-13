@@ -159,6 +159,16 @@ class PipelineCompiler;
 // their pipeline compiles (pipelineCache.cpp).
 bool SmallColorTargetDraw(const HW::Context& context);
 
+// KYTY_SRT_SPECULATE (pipelineCache.cpp): SRT words the host took from memory of its own instead
+// of draining the GPU. While a list is set on the GPU thread, speculation is allowed and every
+// speculated word is appended to it; the dispatch must then be guarded on the GPU (DispatchGuard).
+// Without a list, such reads go to memory as before.
+struct SrtSpeculatedWord {
+	uint64_t address = 0;
+	uint32_t value   = 0;
+};
+void SetSrtSpeculationGuards(std::vector<SrtSpeculatedWord>* words);
+
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);

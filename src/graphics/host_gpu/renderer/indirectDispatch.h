@@ -5,6 +5,8 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <span>
+#include <utility>
 #include <vulkan/vulkan.hpp>
 
 namespace Libs::Graphics {
@@ -42,6 +44,39 @@ private:
 	// ordered behind the indirect reads before it.
 	static constexpr uint32_t Entries      = 4096;
 	static constexpr uint32_t EntryDwords  = 8; // groups at 0, thread counts at 4
+
+	GraphicContext&         m_graphics;
+	Buffer                  m_groups;
+	vk::DescriptorSetLayout m_set_layout      = nullptr;
+	vk::PipelineLayout      m_pipeline_layout = nullptr;
+	vk::Pipeline            m_pipeline        = nullptr;
+	uint32_t                m_next            = 0;
+};
+
+// The guard pass of a dispatch prepared with speculated SRT words (KYTY_SRT_SPECULATE,
+// pipelineCache.cpp): checks the words on the GPU and writes the dispatch's workgroup counts, or
+// zeros when a word changed, for dispatchIndirect.
+class DispatchGuard {
+public:
+	static constexpr uint32_t MaxWords = 4;
+
+	DispatchGuard(GraphicContext& graphics, CommandScheduler& scheduler);
+	~DispatchGuard();
+	KYTY_CLASS_NO_COPY(DispatchGuard);
+
+	struct Word {
+		vk::DeviceAddress address  = 0;
+		uint32_t          expected = 0;
+	};
+	// Binds a compute pipeline and push state: call it before committing the guest dispatch's
+	// bindings. Returns the location of the counts for dispatchIndirect.
+	[[nodiscard]] std::pair<vk::Buffer, vk::DeviceSize> Record(const CommandRecorder& command,
+	                                                           std::span<const Word> words,
+	                                                           uint32_t x, uint32_t y, uint32_t z);
+
+private:
+	static constexpr uint32_t Entries     = 4096;
+	static constexpr uint32_t EntryDwords = 4;
 
 	GraphicContext&         m_graphics;
 	Buffer                  m_groups;

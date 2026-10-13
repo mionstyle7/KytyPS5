@@ -367,15 +367,20 @@ struct SrtSpeculation {
 	uint32_t                same        = 0; // consecutive real reads that gave `value`
 	uint32_t                since_check = 0;
 	uint32_t                mismatches  = 0;
+	uint32_t                checks      = 0;
 	bool                    disabled    = false;
 };
 
 bool ReadShaderGuestMemoryRawExact(std::span<uint32_t> values, uint64_t address);
 
+thread_local std::vector<SrtSpeculatedWord>* t_speculation_guards = nullptr;
+
 // GPU thread only. True when `values` was served (speculated or read for real and recorded).
 bool ReadSpeculated(uint64_t address, std::span<uint32_t> values) {
 	const auto interval = SrtSpeculateInterval();
-	if (interval == 0 || values.size() > 4u) {
+	// Only single words, and only where the dispatch will be guarded on the GPU.
+	if (interval == 0 || values.size() != 1u || t_speculation_guards == nullptr ||
+	    t_speculation_guards->size() >= 4u) {
 		return false;
 	}
 	static std::unordered_map<uint64_t, SrtSpeculation> states;
@@ -388,6 +393,7 @@ bool ReadSpeculated(uint64_t address, std::span<uint32_t> values) {
 	if (state.words == words && state.same >= 2u && state.since_check + 1u < interval) {
 		state.since_check++;
 		std::copy_n(state.value.begin(), words, values.begin());
+		t_speculation_guards->push_back({address, state.value[0]});
 		if ((++speculated & 1023u) == 1u) {
 			LOGF("SRT speculation: %" PRIu64 " reads served, last addr=0x%016" PRIx64 "\n",
 			     speculated, address);
@@ -404,10 +410,14 @@ bool ReadSpeculated(uint64_t address, std::span<uint32_t> values) {
 		LOGF("SRT speculation: value changed at 0x%016" PRIx64 " (shader 0x%016" PRIx64
 		     ", mismatch %u)\n",
 		     address, t_srt_shader_hash, state.mismatches);
-		if (state.mismatches >= 2u) {
+		// Guarded: a stale value only skips the dispatch on the GPU. Speculation resumes once two
+		// real reads agree again; values that change at most checks are read for real.
+		if (state.mismatches >= 16u && state.mismatches * 2u > state.checks) {
 			state.disabled = true;
+			LOGF("SRT speculation: off for 0x%016" PRIx64 " (changes too often)\n", address);
 		}
 	}
+	state.checks++;
 	state.same        = equal ? state.same + 1u : 1u;
 	state.words       = words;
 	state.since_check = 0;
@@ -2957,4 +2967,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	return *iter->second;
 }
+void SetSrtSpeculationGuards(std::vector<SrtSpeculatedWord>* words) {
+	t_speculation_guards = words;
+}
+
 } // namespace Libs::Graphics
