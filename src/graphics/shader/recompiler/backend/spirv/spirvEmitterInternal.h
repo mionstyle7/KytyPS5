@@ -144,6 +144,8 @@ struct EmitterState {
 	bool                                             emitting_write          = false;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
+	// Buffer handles of indirect stores, by report entry (BufferCachePages::kIndirectWriteReport*).
+	std::vector<const IR::Inst*>                     indirect_store_handles;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         gds_variable            = 0;

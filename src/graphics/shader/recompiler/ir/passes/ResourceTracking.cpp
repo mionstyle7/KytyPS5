@@ -2923,6 +2923,8 @@ private:
 				if (memory.kind != ResourceKind::Buffer || memory.planning_only ||
 				    (!load && !memory.SupportsIndirectBufferStore(op)))
 					return false;
+				// The host learns the written ranges of compute dispatches only (renderCompute.cpp).
+				if (!load && m_program.stage != ShaderType::Compute) return false;
 			}
 			// The descriptor must come from memory (otherwise a binding is cheaper), and only
 			// through loads that stay GPU reads.

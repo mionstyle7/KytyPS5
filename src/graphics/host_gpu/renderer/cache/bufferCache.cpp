@@ -1499,6 +1499,64 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
+bool BufferCache::MarkIndirectWrites(uint64_t shader_hash) {
+	using namespace BufferCachePages;
+	constexpr uint64_t entry_bytes = kIndirectWriteReportDwords * sizeof(uint32_t);
+	constexpr uint64_t table_bytes =
+	    uint64_t {kIndirectWriteReportShaders} * kIndirectWriteReportBuffers * entry_bytes;
+	if (m_indirect_write_reports == nullptr) {
+		m_indirect_write_reports = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Stream, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    table_bytes);
+		// The host reads the reports in place, without a flush.
+		EXIT_IF(!m_indirect_write_reports->IsCoherent() ||
+		        m_indirect_write_reports->Mapped().size() < table_bytes ||
+		        !m_indirect_write_reports->HasDeviceAddress());
+		std::memset(m_indirect_write_reports->Mapped().data(), 0, static_cast<size_t>(table_bytes));
+		const vk::DeviceAddress address = m_indirect_write_reports->BufferDeviceAddress();
+		WriteDataBuffer(m_bda_pagetable_buffer, kIndirectWriteReportEntry * sizeof(vk::DeviceAddress),
+		                &address, sizeof(address));
+		LOGF("BufferCache: indirect-write reports on (%" PRIu64 " KB)\n", table_bytes >> 10u);
+	}
+	auto& known = m_indirect_writes[shader_hash];
+	const auto* words = reinterpret_cast<const volatile uint32_t*>(
+	    m_indirect_write_reports->Mapped().data());
+	const auto slot = static_cast<uint32_t>((shader_hash ^ (shader_hash >> 32u)) %
+	                                        kIndirectWriteReportShaders);
+	const auto tag  = static_cast<uint32_t>(shader_hash) | 1u;
+	for (uint32_t i = 0; i < kIndirectWriteReportBuffers; i++) {
+		const auto* entry = words + (uint64_t {slot} * kIndirectWriteReportBuffers + i) *
+		                                kIndirectWriteReportDwords;
+		if (entry[3] != tag) continue;
+		const auto base = uint64_t {entry[0]} | (uint64_t {entry[1] & 0xffffu} << 32u);
+		const auto end  = uint64_t {entry[2]};
+		if (base == 0 || end == 0) continue;
+		const std::pair<uint64_t, uint64_t> range {base & ~uint64_t {3},
+		                                           ((base + end + 3) & ~uint64_t {3}) - (base & ~uint64_t {3})};
+		if (std::find(known.begin(), known.end(), range) == known.end()) {
+			// Ranges of the same base grow to the largest end seen.
+			std::erase_if(known, [&](const auto& other) {
+				return other.first == range.first && other.second <= range.second;
+			});
+			known.push_back(range);
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1) < 32) {
+				LOGF("Indirect write: hash=0x%016" PRIx64 " buffer=%u 0x%016" PRIx64 "+0x%" PRIx64
+				     "\n",
+				     shader_hash, i, range.first, range.second);
+			}
+			if (known.size() > 64) known.erase(known.begin());
+		}
+	}
+	for (const auto& [address, size]: known) {
+		if (GuestRange {address, size}.Valid()) {
+			MarkGpuWritten(address, size);
+		}
+	}
+	return !known.empty();
+}
+
 void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.ForEachMaybeCpuDirtyRegion(
 	    vaddr, size, [this](uint64_t address, uint64_t bytes) {

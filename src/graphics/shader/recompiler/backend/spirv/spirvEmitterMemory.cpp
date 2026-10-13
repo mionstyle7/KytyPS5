@@ -964,10 +964,74 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t value) {
 	});
 }
 
+// Records the store's guest range in the indirect-write report table (its address is the BDA
+// page table's extra entry): the descriptor base and the largest end offset stored through it.
+void ReportIndirectStore(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t byte_end) {
+	using namespace BufferCachePages;
+	auto&       state  = ctx.state;
+	const auto* handle = inst.Arg(0).ResolveInstruction();
+	auto&       list   = state.indirect_store_handles;
+	auto        found  = std::ranges::find(list, handle);
+	if (found == list.end()) {
+		list.push_back(handle);
+		found = list.end() - 1;
+	}
+	const auto index = std::min<uint32_t>(static_cast<uint32_t>(found - list.begin()),
+	                                      kIndirectWriteReportBuffers - 1u);
+	const auto hash  = state.program.shader_hash;
+	const auto slot  = static_cast<uint32_t>((hash ^ (hash >> 32u)) % kIndirectWriteReportShaders);
+	const auto tag   = static_cast<uint32_t>(hash) | 1u;
+	const auto u64   = TypeScalarU64(state);
+	const auto entry_pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
+	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
+	                          ConstantU32(state, static_cast<uint32_t>(kIndirectWriteReportEntry)));
+	const auto table = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, u64, table, entry_pointer);
+	const auto entry_offset = (uint64_t {slot} * kIndirectWriteReportBuffers + index) *
+	                          kIndirectWriteReportDwords * sizeof(uint32_t);
+	const auto word_pointer = [&](uint32_t word) {
+		const auto address = Binary(state, spv::OpIAdd, u64, table,
+		                            ConstantDeviceAddress(state, entry_offset + word * 4u));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          address);
+		return pointer;
+	};
+	const auto store = [&](uint32_t word, uint32_t value) {
+		state.builder.AddFunction(spv::OpStore, word_pointer(word), value,
+		                          spv::MemoryAccessAlignedMask, 4u);
+	};
+	const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), table,
+	                            ConstantDeviceAddress(state, 0));
+	EmitIfCondition(state, present, [&]() {
+		const auto word1 = ctx.Arg(*handle, 1);
+		store(0, ctx.Arg(*handle, 0));
+		store(1, Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, ConstantU32(state, 0xffffu)));
+		const auto old = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicUMax, TypeU32(state), old, word_pointer(2),
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0),
+		                          byte_end);
+		store(3, ConstantU32(state, tag));
+	});
+}
+
 void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto buffer       = PrepareIndirectBuffer(ctx, inst);
+		{
+			const auto& handle = *inst.Arg(0).ResolveInstruction();
+			const auto  base   = DeviceAddressFromWords(
+			    state, ctx.Arg(handle, 0),
+			    EmitBitFieldUExtract(state, ctx.Arg(handle, 1), ConstantU32(state, 0), ConstantU32(state, 16)));
+			const auto offset = Unary(state, spv::OpUConvert, TypeU32(state),
+			                          Binary(state, spv::OpISub, TypeScalarU64(state),
+			                                 buffer.address, base));
+			ReportIndirectStore(ctx, inst,
+			                    Binary(state, spv::OpIAdd, TypeU32(state), offset,
+			                           ConstantU32(state, components * 4u)));
+		}
 		const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
 		                                 ConstantU32(state, 0));
 		const auto base = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), buffer.address,

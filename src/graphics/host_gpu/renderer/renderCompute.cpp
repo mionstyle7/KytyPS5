@@ -692,6 +692,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_dispatch_guard = std::make_unique<DispatchGuard>(m_context.GetGraphics(),
 		                                                   m_context.GetCommandScheduler());
 	}
+	// Stores through descriptors the shader reads on the GPU: their ranges, as earlier
+	// dispatches reported them, become GPU-written before later work can upload over them.
+	const bool indirect_writes =
+	    program.info.indirect_buffer_writes &&
+	    m_context.GetBufferCache().MarkIndirectWrites(program.shader_hash);
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
@@ -750,6 +755,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 	} while (recovery.Retry());
+	if (program.info.indirect_buffer_writes && !indirect_writes) {
+		// Nothing reported yet: wait for this dispatch once to learn its ranges.
+		m_context.GetCommandScheduler().Finish();
+		(void)m_context.GetBufferCache().MarkIndirectWrites(program.shader_hash);
+	}
 	ResetBindings();
 }
 
@@ -801,6 +811,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	RebindBuffers(bindings);
+	// Stores through descriptors the shader reads on the GPU: their ranges, as earlier
+	// dispatches reported them, become GPU-written before later work can upload over them.
+	const bool indirect_writes =
+	    program.info.indirect_buffer_writes &&
+	    m_context.GetBufferCache().MarkIndirectWrites(program.shader_hash);
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
@@ -863,6 +878,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 	} while (recovery.Retry());
+	if (program.info.indirect_buffer_writes && !indirect_writes) {
+		// Nothing reported yet: wait for this dispatch once to learn its ranges.
+		m_context.GetCommandScheduler().Finish();
+		(void)m_context.GetBufferCache().MarkIndirectWrites(program.shader_hash);
+	}
 	ResetBindings();
 }
 

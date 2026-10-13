@@ -18,6 +18,14 @@ inline constexpr uint64_t kLowerAddressSize   = uint64_t {1} << 40u;
 inline constexpr uint64_t kExtendedMemoryBase = 0x080000000000ull;
 inline constexpr uint64_t kExtendedMemorySize = 512ull * 1024 * 1024 * 1024;
 inline constexpr uint64_t kNumPages           = (kLowerAddressSize + kExtendedMemorySize) >> kPageBits;
+// The BDA page table has one entry past the pages: the device address of the indirect-write
+// report table (BufferCache::IndirectWriteReports). Stores through a descriptor the shader reads
+// on the GPU (KYTY_GPU_DESCRIPTORS) record there which guest range they wrote, so the host can
+// mark it GPU-written without draining the GPU to evaluate the descriptor.
+inline constexpr uint64_t kIndirectWriteReportEntry = kNumPages;
+inline constexpr uint32_t kIndirectWriteReportShaders = 1024; // slots by shader hash
+inline constexpr uint32_t kIndirectWriteReportBuffers = 8;    // written buffers per shader
+inline constexpr uint32_t kIndirectWriteReportDwords  = 4;    // base lo, base hi, end, tag
 
 } // namespace Libs::Graphics::BufferCachePages
 

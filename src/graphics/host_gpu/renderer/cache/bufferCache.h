@@ -40,7 +40,7 @@ public:
 	              LibKernel::Memory::kExtendedMemoryBase == BufferCachePages::kExtendedMemoryBase,
 	              "bufferCachePages.h is out of date");
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	    (CACHING_NUMPAGES + 1) * sizeof(vk::DeviceAddress);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -116,6 +116,10 @@ public:
 	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void                            ProcessFaultBuffer();
+	// Before a dispatch whose shader stores through descriptors it reads on the GPU: marks the
+	// ranges its earlier dispatches reported GPU-written. Returns false while the shader has
+	// reported nothing yet (the caller then waits once for this dispatch and calls it again).
+	bool                            MarkIndirectWrites(uint64_t shader_hash);
 	// GPU thread: writes bytes on a page protected because the GPU wrote to it, without
 	// downloading the page: the host copy through the backing store, the GPU copy in the command
 	// stream, after the GPU's earlier writes. Bytes the GPU had written are then current on both
@@ -196,6 +200,8 @@ private:
 	FaultManager                                       m_fault_manager;
 	Buffer                                             m_gds_buffer;
 	Buffer                                             m_bda_pagetable_buffer;
+	std::unique_ptr<Buffer>                            m_indirect_write_reports;
+	std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> m_indirect_writes;
 	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                          m_buffers;
