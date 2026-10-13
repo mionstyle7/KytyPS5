@@ -449,6 +449,36 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
+
+// An indirect dispatch with thread dimensions can run with its thread counts as group counts
+// (renderCompute.cpp, without the conversion pass): workgroups that hold none of the guest's
+// threads return at once, before anything with side effects. The branch is uniform per
+// workgroup.
+void EmitIndirectGroupBound(EmitterState& state) {
+	if (!DispatchDimensionsIndirect(state) ||
+	    state.program.bindings.dispatch_thread_dword == IR::PushData::NoStart) {
+		return;
+	}
+	const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info);
+	if (cs == nullptr) return;
+	uint32_t outside = 0;
+	for (uint32_t axis = 0; axis < 3u; axis++) {
+		const auto group  = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, axis);
+		const auto first  = EmitBinaryU32(state, spv::OpIMul, group,
+		                                  ConstantU32(state, std::max(cs->threads_num[axis], 1u)));
+		const auto extent = EmitBuiltinU32(state, IR::StageInputKind::DispatchThreadCount, axis);
+		const auto beyond = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), first, extent);
+		outside = outside == 0 ? beyond
+		                       : Binary(state, spv::OpLogicalOr, TypeBool(state), outside, beyond);
+	}
+	const auto exit_label = state.builder.AllocateId();
+	const auto body_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, body_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, outside, exit_label, body_label);
+	EmitLabel(state, exit_label);
+	state.builder.AddFunction(spv::OpReturn);
+	EmitLabel(state, body_label);
+}
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();

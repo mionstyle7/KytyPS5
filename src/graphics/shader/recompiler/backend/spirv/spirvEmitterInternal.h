@@ -433,6 +433,7 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
                                          uint32_t component);
 
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component);
+void     EmitIndirectGroupBound(EmitterState& state);
 
 uint32_t EmitLocalInvocationIndex(EmitterState& state);
 
