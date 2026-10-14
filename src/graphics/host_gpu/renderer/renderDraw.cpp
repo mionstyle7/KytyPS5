@@ -1425,8 +1425,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
+	{
+		// The pipeline's guest shaders, so a device loss names the draw that faulted: the VS hash
+		// in arg4, the PS hash in arg5.
+		const auto vs_hash = vertex_stages.back().stage.program->shader_hash;
+		const auto ps_hash = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
+		buffer.SetDebugInfo(static_cast<uint32_t>(draw.debug_op), submit_id, 0x500u,
+		                    draw.index_count, 0, draw.instance_count, vs_hash, ps_hash);
 	}
 	GpuTiming::Before(m_context, buffer);
 	int64_t gpu_zone = -1;
