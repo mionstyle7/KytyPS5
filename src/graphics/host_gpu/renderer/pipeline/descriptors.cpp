@@ -1791,7 +1791,15 @@ void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_
 	// them), so the probe evicts them only when the device itself is short of memory (4-8 GB
 	// cards), not at the texture cache's bound: under a 6 GiB bound it evicted 27,915 of them in
 	// 14 minutes, each settled again when drawn.
-	if (frame >= m_bindless_next_probe && m_context.GetGraphics().DeviceMemoryAtLeast(90)) {
+	// KYTY_BINDLESS_EVICT_PERCENT (default 80; 90 before): the device use that arms the probe.
+	// At 90 % a 12 GB card reached the budget during a cutscene's streaming before the probe's
+	// 16 frames had run, and the buffer collector's emergency sweep took over.
+	static const uint32_t arm_percent = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_EVICT_PERCENT");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 80ul;
+		return static_cast<uint32_t>(std::clamp<unsigned long>(parsed, 10ul, 100ul));
+	}();
+	if (frame >= m_bindless_next_probe && m_context.GetGraphics().DeviceMemoryAtLeast(arm_percent)) {
 		table.ArmUsageProbe();
 		m_bindless_probe_frame = frame;
 	}

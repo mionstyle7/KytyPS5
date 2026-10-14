@@ -1350,7 +1350,18 @@ void BufferCache::RunGarbageCollector() {
 		m_base_trigger_gc_memory  = m_trigger_gc_memory;
 		m_base_critical_gc_memory = m_critical_gc_memory;
 	}
-	if (const auto shortfall = m_graphics.MemoryShortfall(); shortfall != 0) {
+	// KYTY_BUFFER_GC_PRESSURE=1: device-wide memory pressure also lowers this cache's thresholds.
+	// Off by default: shaders that read through the BDA page table reach buffers no binding
+	// touches, so the LRU calls them idle, and the collector's pressure sweep (64 buffers a run
+	// from two frames of age) lost the device within a second of the first "Memory: short" in
+	// five runs on a 12 GB card. Pressure is left to the texture cache; this cache keeps its own
+	// bound (KYTY_BUFFER_CACHE_MB).
+	static const bool pressure_collects = [] {
+		const char* value = std::getenv("KYTY_BUFFER_GC_PRESSURE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (const auto shortfall = pressure_collects ? m_graphics.MemoryShortfall() : 0;
+	    shortfall != 0) {
 		const auto cap = std::max<uint64_t>(
 		    m_total_used_memory > shortfall ? m_total_used_memory - shortfall : 0, 512ull << 20u);
 		m_trigger_gc_memory  = std::min(m_base_trigger_gc_memory, cap);
