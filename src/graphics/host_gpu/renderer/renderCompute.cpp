@@ -453,7 +453,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
-	                    sh_ctx.GetCs().cs_regs.data_addr);
+	                    sh_ctx.GetCs().cs_regs.data_addr,
+	                    ShaderDeclaredHash(sh_ctx.GetCs().cs_regs.data_addr));
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
 		static std::atomic<uint32_t> log_count {0};
@@ -703,7 +704,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
-	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
+	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr,
+	                    ShaderDeclaredHash(buffer.GetShaders().GetCs().cs_regs.data_addr));
 	Common::LockGuard lock(m_context.GetMutex());
 	const auto&       cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {

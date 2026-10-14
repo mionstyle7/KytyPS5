@@ -27,6 +27,7 @@ struct DiagnosticCheckpoint {
 	uint32_t arg2      = 0;
 	uint32_t arg3      = 0;
 	uint64_t arg4      = 0;
+	uint64_t arg5      = 0; // the guest shader hash(es) where known
 	uint64_t sequence  = 0;
 };
 

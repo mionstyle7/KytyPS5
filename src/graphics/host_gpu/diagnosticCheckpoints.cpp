@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cinttypes>
@@ -36,13 +37,13 @@ const char* OpName(uint32_t op) {
 
 void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	std::printf("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64
-	            "\n",
+	            " shader=0x%016" PRIx64 "\n",
 	            stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id,
 	            checkpoint.arg0, checkpoint.arg1, checkpoint.arg2, checkpoint.arg3,
-	            checkpoint.arg4);
-	LOGF("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+	            checkpoint.arg4, checkpoint.arg5);
+	LOGF("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 " shader=0x%016" PRIx64 "\n",
 	     stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id, checkpoint.arg0,
-	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4);
+	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4, checkpoint.arg5);
 }
 
 } // namespace
@@ -124,6 +125,8 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics) {
 	            data.size(), g_checkpoint_sequence.load(std::memory_order_relaxed));
 	LOGF("--- Diagnostic checkpoints (%zu, last recorded seq=%" PRIu64 ") ---\n", data.size(),
 	     g_checkpoint_sequence.load(std::memory_order_relaxed));
+	uint64_t lowest  = UINT64_MAX;
+	uint64_t highest = 0;
 	for (const auto& entry: data) {
 		const auto* checkpoint = static_cast<const DiagnosticCheckpoint*>(entry.pCheckpointMarker);
 		const auto  stage      = vk::to_string(entry.stage);
@@ -138,6 +141,20 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics) {
 			continue;
 		}
 		Print(stage.c_str(), *checkpoint);
+		lowest  = std::min(lowest, checkpoint->sequence);
+		highest = std::max(highest, checkpoint->sequence);
+	}
+	// Everything recorded between the last checkpoint the GPU finished and the last it started:
+	// the command that faulted is among these (draws carry their VS/PS hashes, dispatches theirs).
+	if (lowest <= highest && highest - lowest < 256) {
+		LOGF("--- Commands in flight (seq %" PRIu64 "..%" PRIu64 ") ---\n", lowest, highest);
+		std::printf("--- Commands in flight (seq %" PRIu64 "..%" PRIu64 ") ---\n", lowest, highest);
+		for (uint64_t seq = lowest; seq <= highest; seq++) {
+			const auto& entry = g_checkpoints[seq % CHECKPOINT_RING_SIZE];
+			if (entry.sequence == seq) {
+				Print("in flight", entry);
+			}
+		}
 	}
 	std::fflush(stdout);
 }
