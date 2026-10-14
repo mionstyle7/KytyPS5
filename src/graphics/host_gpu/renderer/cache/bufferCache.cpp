@@ -285,6 +285,20 @@ static bool SideReadbackEnabled() {
 	return enabled;
 }
 
+// The GPU write ticks (m_write_ticks) cost the GPU thread on every written binding: kept only
+// for side readbacks and KYTY_READBACK_STATS=1 (the readback stats in the log).
+static bool ReadbackStatsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static bool WriteTicksTracked() {
+	return SideReadbackEnabled() || ReadbackStatsEnabled();
+}
+
 struct BufferCache::SideState {
 	static constexpr uint32_t Slots  = 16;
 	static constexpr uint64_t Window = 64 * 1024;
@@ -764,7 +778,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	uint64_t                                                write_tick = 0;
 	const auto                                              fault_tick = m_scheduler.CurrentTick();
 	const auto known_tick = m_scheduler.GetMasterSemaphore().KnownGpuTick();
-	if (!from_gpu_thread) {
+	if (!from_gpu_thread && ReadbackStatsEnabled()) {
 		wait_timer.Start();
 		std::shared_lock lock(m_dirty_ranges_mutex);
 		if (const auto found = m_write_ticks.find(vaddr >> 12u); found != m_write_ticks.end()) {
@@ -775,7 +789,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 	}
 	const auto record = [&] {
-		if (from_gpu_thread) return;
+		if (from_gpu_thread || !ReadbackStatsEnabled()) return;
 		std::lock_guard lock(stats_mutex);
 		auto& site = sites[vaddr >> 12u];
 		site.count++;
@@ -1634,21 +1648,24 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		if (m_eager_any.load(std::memory_order_relaxed)) {
 			std::lock_guard eager_lock(m_eager_mutex);
-			for (const auto& [page, hot]: m_eager_pages) {
-				(void)hot;
-				if (page < vaddr + size && vaddr < page + TRACKER_PAGE_SIZE &&
-				    std::ranges::find(m_eager_written, page) == m_eager_written.end()) {
-					m_eager_written.push_back(page);
+			// Only the hot pages inside the written range: a lookup, not a walk of every hot page
+			// for each of the ~8,000 written bindings a frame.
+			for (auto it = m_eager_pages.lower_bound(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
+			     it != m_eager_pages.end() && it->first < vaddr + size; ++it) {
+				if (std::ranges::find(m_eager_written, it->first) == m_eager_written.end()) {
+					m_eager_written.push_back(it->first);
 				}
 			}
 		}
-		const auto tick = m_scheduler.CurrentTick();
-		if (m_write_ticks.size() > (1u << 20u)) m_write_ticks.clear();
-		if (size <= 0x10000) {
-			for (auto page = first >> 12u; page < (last >> 12u); page++) m_write_ticks[page] = tick;
-		} else {
-			for (auto region = vaddr >> 22u; region <= (vaddr + size - 1) >> 22u; region++)
-				m_write_ticks[region | (uint64_t {1} << 63u)] = tick;
+		if (WriteTicksTracked()) {
+			const auto tick = m_scheduler.CurrentTick();
+			if (m_write_ticks.size() > (1u << 20u)) m_write_ticks.clear();
+			if (size <= 0x10000) {
+				for (auto page = first >> 12u; page < (last >> 12u); page++) m_write_ticks[page] = tick;
+			} else {
+				for (auto region = vaddr >> 22u; region <= (vaddr + size - 1) >> 22u; region++)
+					m_write_ticks[region | (uint64_t {1} << 63u)] = tick;
+			}
 		}
 	}
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names

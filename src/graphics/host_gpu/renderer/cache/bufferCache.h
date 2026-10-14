@@ -166,7 +166,7 @@ private:
 	void NoteHotRead(uint64_t vaddr);
 	void IssueEagerReadbacks();
 	std::mutex                              m_eager_mutex;
-	std::unordered_map<uint64_t, EagerPage> m_eager_pages;   // guarded by m_eager_mutex
+	std::map<uint64_t, EagerPage>           m_eager_pages;   // guarded by m_eager_mutex (ordered: range lookups)
 	std::vector<uint64_t>                   m_eager_written; // GPU thread: hot pages written this recording
 	std::atomic<bool>                       m_eager_any {false};
 	uint64_t                                m_eager_issued = 0;
