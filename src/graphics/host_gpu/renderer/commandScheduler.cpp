@@ -320,10 +320,13 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		{
 			KYTY_PROFILER_BLOCK("CommandScheduler::Wait (forced submit-then-wait)");
+			// The pre-submit hook (eager readback copies) can itself wrap a stream buffer and
+			// submit `tick` from inside this Submit; the recording submitted here is then a later
+			// one, and waiting for `tick` is still what the caller needs.
 			const auto submitted_tick = Submit();
-			EXIT_IF(submitted_tick != tick);
+			EXIT_IF(submitted_tick < tick);
 			Timeline::Mark("drain-begin", tick);
-			if (ReadbacksDuringWait() && GuestGpu::IsGpuThread()) {
+			if (ReadbacksDuringWait() && GuestGpu::IsGpuThread() && !m_in_pre_submit) {
 				// Game threads' readbacks are served while the GPU works, from a fresh recording.
 				BeginNext();
 				WaitServingReadbacks(tick);
