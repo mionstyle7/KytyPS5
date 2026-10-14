@@ -580,7 +580,12 @@ void BufferCache::NoteHotRead(uint64_t vaddr) {
 	if (!EagerReadbackEnabled()) {
 		return;
 	}
-	constexpr size_t MaxPages = 64;
+	// KYTY_READBACK_EAGER_PAGES (default 256): a title menu reads ~100 distinct pages a window.
+	static const size_t MaxPages = [] {
+		const char* value = std::getenv("KYTY_READBACK_EAGER_PAGES");
+		const auto  pages = value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull;
+		return static_cast<size_t>(std::clamp<unsigned long long>(pages, 1, 1024));
+	}();
 	const auto       page     = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto       frame    = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	std::lock_guard  lock(m_eager_mutex);
