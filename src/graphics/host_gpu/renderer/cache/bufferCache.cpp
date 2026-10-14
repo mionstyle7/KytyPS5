@@ -302,6 +302,16 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	}
 }
 
+// Ring sizes (KYTY_STREAM_RING_MB, default 64; KYTY_DOWNLOAD_RING_MB, default 256, 64 before).
+// In gameplay ~140 readbacks a frame, each downloading up to a 4 MiB window, cycled the 64 MiB
+// download ring several times a frame, and every wrap waited for the GPU (~36 ms a frame in
+// "ring wrap wait").
+static uint64_t RingBytes(const char* name, uint64_t default_mb) {
+	const char* value = std::getenv(name);
+	const auto  mb    = value != nullptr ? std::strtoull(value, nullptr, 10) : default_mb;
+	return std::clamp<uint64_t>(mb, 16, 2048) * 1024 * 1024;
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
@@ -310,8 +320,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, RingBytes("KYTY_STREAM_RING_MB", 64)),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download,
+                        RingBytes("KYTY_DOWNLOAD_RING_MB", 256)),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
