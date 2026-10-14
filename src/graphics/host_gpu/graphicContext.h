@@ -181,6 +181,9 @@ struct GraphicContext {
 		return budget != 0 && GetDeviceMemoryUsage() / 100 >= budget / 100 * percent / 100;
 	}
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	// Memory types without property flags, and whether a new image goes there (see CreateImage).
+	[[nodiscard]] uint32_t PlainMemoryTypeBits() const;
+	[[nodiscard]] bool     PlainTextureMemory(const vk::ImageCreateInfo& info) const;
 	void                   DeleteImage(VulkanImage& image);
 
 	uint32_t screen_width  = 0;

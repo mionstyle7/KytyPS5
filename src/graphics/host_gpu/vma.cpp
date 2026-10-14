@@ -254,6 +254,41 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+uint32_t GraphicContext::PlainMemoryTypeBits() const {
+	static const uint32_t bits = [this] {
+		uint32_t mask = 0;
+		for (uint32_t i = 0; i < physical_device_memory_properties.memoryTypeCount; i++) {
+			if (!physical_device_memory_properties.memoryTypes[i].propertyFlags) {
+				mask |= 1u << i;
+			}
+		}
+		LOGF("Textures: plain memory types mask=0x%08" PRIx32 "\n", mask);
+		return mask;
+	}();
+	return bits;
+}
+
+bool GraphicContext::PlainTextureMemory(const vk::ImageCreateInfo& image_info) const {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_PLAIN_MEMORY");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || allocator == nullptr || !CanReportMemoryUsage() ||
+	    physical_device_properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu ||
+	    PlainMemoryTypeBits() == 0) {
+		return false;
+	}
+	constexpr auto kept = vk::ImageUsageFlagBits::eColorAttachment |
+	                      vk::ImageUsageFlagBits::eDepthStencilAttachment |
+	                      vk::ImageUsageFlagBits::eStorage;
+	if ((image_info.usage & kept) || !(image_info.usage & vk::ImageUsageFlagBits::eSampled)) {
+		return false;
+	}
+	constexpr uint64_t SmallBudget = 12ull << 30u;
+	const auto         budget      = GetTotalMemoryBudget();
+	return budget != 0 && budget < SmallBudget && GetDeviceMemoryUsage() >= budget / 2;
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
@@ -262,9 +297,36 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	auto             result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	auto             result       = vk::Result::eErrorOutOfDeviceMemory;
+	// Textures in the driver's plain memory type on a card whose budget is under 12 GiB, once half
+	// of it is in use (KYTY_TEXTURE_PLAIN_MEMORY=0 turns it off). Idea from chenxiao07's fork:
+	// NVIDIA fails device-local allocations past its video memory instead of paging, so whatever is
+	// allocated last (render targets, buffers) went to system memory. A memory type without flags
+	// the driver places in video memory while there is room and in system memory after, so
+	// sampled-only images give way first; render targets, depth and storage images keep video
+	// memory.
+	if (PlainTextureMemory(image_info)) {
+		VmaAllocationCreateInfo plain {};
+		plain.memoryTypeBits = PlainMemoryTypeBits();
+		result = static_cast<vk::Result>(
+		    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+		                   &plain, &native_image, &image.allocation, nullptr));
+		static std::atomic<uint32_t> plain_count {0};
+		if (result == vk::Result::eSuccess && plain_count.fetch_add(1) == 0) {
+			LOGF("Textures: sampled-only images now use the plain memory type (budget %" PRIu64
+			     " MB, use %" PRIu64 " MB)\n",
+			     GetTotalMemoryBudget() >> 20u, GetDeviceMemoryUsage() >> 20u);
+		}
+		if (result != vk::Result::eSuccess) {
+			native_image     = VK_NULL_HANDLE;
+			image.allocation = nullptr;
+		}
+	}
+	if (result != vk::Result::eSuccess) {
+		result = static_cast<vk::Result>(
+		    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+		                   &alloc_info, &native_image, &image.allocation, nullptr));
+	}
 	if (result != vk::Result::eSuccess) {
 		// The device heap is full. The guest has a unified 16 GB pool, so the image is
 		// real; place it in host memory and pay in bandwidth rather than fail.
