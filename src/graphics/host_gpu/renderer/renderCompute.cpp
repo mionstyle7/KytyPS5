@@ -584,6 +584,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
+	BufferCache::SetCurrentWriter(program.shader_hash);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
@@ -734,6 +735,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	BufferCache::SetCurrentWriter(input_info.stage.program->shader_hash);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {

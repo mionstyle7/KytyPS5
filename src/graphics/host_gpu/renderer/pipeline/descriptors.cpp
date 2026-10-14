@@ -2229,6 +2229,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
+	if (!stages.empty()) {
+		BufferCache::SetCurrentWriter(stages.back()->runtime->program->shader_hash);
+	}
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;

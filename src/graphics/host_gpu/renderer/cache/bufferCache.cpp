@@ -29,6 +29,34 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <chrono>
+#include <map>
+#include <unordered_map>
+
+namespace {
+// Readback hot-region diagnostics: per 1 MiB of guest memory, who wrote it last on the GPU and
+// how long game threads wait reading it back. Printed every 10 s while readbacks happen.
+std::atomic<uint64_t> g_current_writer {0};
+struct RegionWrite {
+	uint64_t writer = 0;
+	uint64_t tick   = 0;
+	uint64_t bytes  = 0;
+	uint64_t writes = 0;
+};
+struct RegionRead {
+	uint64_t calls     = 0;
+	double   ms        = 0;
+	uint64_t gpu_bytes = 0; // the faulting bytes were GPU-written
+	uint64_t shared    = 0; // only the page was
+	uint64_t age_sum   = 0; // ticks since the region's last GPU write, summed
+	uint64_t writer    = 0;
+};
+std::mutex                                 g_readback_diag_mutex;
+std::unordered_map<uint64_t, RegionWrite>  g_region_writes;
+std::unordered_map<uint64_t, RegionRead>   g_region_reads;
+int64_t                                    g_readback_diag_next_ms = 0;
+constexpr int                              kDiagRegionBits = 20;
+} // namespace
 
 namespace Libs::Graphics {
 
@@ -398,16 +426,73 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	const bool from_gpu_thread = GuestGpu::IsGpuThread();
 	const bool async           = g_async_readback && !from_gpu_thread;
+	Common::Timer timer;
+	timer.Start();
+	bool     first      = true;
+	bool     gpu_bytes  = false;
+	uint64_t age        = 0;
 	for (;;) {
 		uint64_t wait_tick = 0;
 		m_scheduler.Context().GetGpu().SendCommandSync(
-		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick] {
+		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &first, &gpu_bytes,
+		     &age] {
+			    if (first) {
+				    first     = false;
+				    gpu_bytes = HasGpuDirtyBytes(vaddr, std::max<uint64_t>(size, 4));
+				    std::lock_guard lock(g_readback_diag_mutex);
+				    if (const auto found = g_region_writes.find(vaddr >> kDiagRegionBits);
+				        found != g_region_writes.end()) {
+					    age = m_scheduler.CurrentTick() - found->second.tick;
+				    }
+			    }
 			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
 		    });
 		if (wait_tick == 0) {
-			return;
+			break;
 		}
 		m_scheduler.WaitPriorityOperations(wait_tick);
+	}
+	NoteReadback(vaddr, timer.GetTimeS() * 1000.0, gpu_bytes, age);
+}
+
+void BufferCache::NoteReadback(uint64_t vaddr, double ms, bool gpu_bytes, uint64_t age) {
+	std::lock_guard lock(g_readback_diag_mutex);
+	const auto region = vaddr >> kDiagRegionBits;
+	auto&      read   = g_region_reads[region];
+	read.calls++;
+	read.ms += ms;
+	(gpu_bytes ? read.gpu_bytes : read.shared)++;
+	read.age_sum += age;
+	if (const auto found = g_region_writes.find(region); found != g_region_writes.end()) {
+		read.writer = found->second.writer;
+	}
+	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch())
+	                     .count();
+	if (now < g_readback_diag_next_ms) {
+		return;
+	}
+	g_readback_diag_next_ms = now + 10000;
+	std::vector<std::pair<uint64_t, RegionRead>> top(g_region_reads.begin(), g_region_reads.end());
+	std::sort(top.begin(), top.end(),
+	          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+	LOGF("Readback hot regions (last 10 s, %zu regions):\n", top.size());
+	for (size_t i = 0; i < std::min<size_t>(top.size(), 8); i++) {
+		const auto& [r, info] = top[i];
+		const auto  w         = g_region_writes.find(r);
+		LOGF("\t region=0x%016" PRIx64 " calls=%" PRIu64 " ms=%.0f avg=%.2fms gpu_bytes=%" PRIu64
+		     " page_only=%" PRIu64 " avg_age_ticks=%.1f writer=0x%016" PRIx64 " writes=%" PRIu64
+		     " written_bytes=%" PRIu64 "\n",
+		     r << kDiagRegionBits, info.calls, info.ms, info.ms / static_cast<double>(info.calls),
+		     info.gpu_bytes, info.shared,
+		     static_cast<double>(info.age_sum) / static_cast<double>(info.calls), info.writer,
+		     w != g_region_writes.end() ? w->second.writes : 0,
+		     w != g_region_writes.end() ? w->second.bytes : 0);
+	}
+	g_region_reads.clear();
+	for (auto& [r, w]: g_region_writes) {
+		w.writes = 0;
+		w.bytes  = 0;
 	}
 }
 
@@ -1115,8 +1200,26 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 	return false;
 }
 
+void BufferCache::SetCurrentWriter(uint64_t shader_hash) {
+	g_current_writer.store(shader_hash, std::memory_order_relaxed);
+}
+
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
+	if (size != 0) {
+		const auto tick   = m_scheduler.CurrentTick();
+		const auto writer = g_current_writer.load(std::memory_order_relaxed);
+		std::lock_guard lock(g_readback_diag_mutex);
+		for (auto region = vaddr >> kDiagRegionBits; region <= (vaddr + size - 1) >> kDiagRegionBits &&
+		                                        region < (vaddr >> kDiagRegionBits) + 64;
+		     region++) {
+			auto& info = g_region_writes[region];
+			info.writer = writer;
+			info.tick   = tick;
+			info.bytes += size;
+			info.writes++;
+		}
+	}
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		const auto first = Common::AlignDown(vaddr, WriteBitmapPage);
