@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <fmt/format.h>
 #include <atomic>
+#include <thread>
+#include <array>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -148,6 +150,11 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 void BufferCache::ReleaseBuffer(BufferId id) {
 	const auto* buffer = m_slot_buffers.try_get(id);
+	// A side readback may still copy from it on the side queue, which ticks do not order.
+	if (buffer != nullptr && SideBusy()) {
+		m_scheduler.DeferRelease([this, id] { ReleaseBuffer(id); });
+		return;
+	}
 	if (buffer != nullptr && !m_scheduler.IsFree(buffer->last_use_tick)) {
 		// Bound after it was dropped, in a tick the GPU has not finished: keep it until then.
 		static std::atomic<uint32_t> reported = 0;
@@ -312,6 +319,260 @@ static uint64_t RingBytes(const char* name, uint64_t default_mb) {
 	return std::clamp<uint64_t>(mb, 16, 2048) * 1024 * 1024;
 }
 
+// KYTY_SIDE_READBACK=1 turns side readbacks on (off by default while they are tested).
+static bool SideReadbackEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SIDE_READBACK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+struct BufferCache::SideState {
+	static constexpr uint32_t Slots  = 8;
+	static constexpr uint64_t Window = 4 * 1024 * 1024;
+
+	SideState(GraphicContext& context, CommandScheduler& scheduler): graphics(context) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.queueFamilyIndex = graphics.queue_family;
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		                  vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		RequireVulkanSuccess(graphics.device.createCommandPool(&pool_info, nullptr, &pool),
+		                     "create side-readback command pool");
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = Slots;
+		RequireVulkanSuccess(graphics.device.allocateCommandBuffers(&allocate, commands.data()),
+		                     "allocate side-readback command buffers");
+		vk::SemaphoreTypeCreateInfo type_info {};
+		type_info.semaphoreType = vk::SemaphoreType::eTimeline;
+		vk::SemaphoreCreateInfo create_info {};
+		create_info.pNext = &type_info;
+		RequireVulkanSuccess(graphics.device.createSemaphore(&create_info, nullptr, &semaphore),
+		                     "create side-readback semaphore");
+		staging = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+		                                   vk::BufferUsageFlagBits::eTransferDst, Window * Slots);
+		EXIT_IF(staging->Mapped().size() < Window * Slots);
+		LOGF("BufferCache: side readbacks on (%u slots of %" PRIu64 " KB)\n", Slots, Window >> 10u);
+	}
+	~SideState() {
+		(void)graphics.device.waitIdle();
+		staging.reset();
+		graphics.device.destroySemaphore(semaphore, nullptr);
+		graphics.device.destroyCommandPool(pool, nullptr);
+	}
+	KYTY_CLASS_NO_COPY(SideState);
+
+	GraphicContext&                      graphics;
+	vk::CommandPool                      pool      = nullptr;
+	vk::Semaphore                        semaphore = nullptr;
+	std::array<vk::CommandBuffer, Slots> commands {};
+	std::array<std::atomic<bool>, Slots> busy {};
+	uint64_t                             next_value = 0; // GPU thread only
+	std::unique_ptr<Buffer>              staging;
+	std::atomic<uint64_t>                issued {0};
+	std::atomic<uint64_t>                declined {0};
+};
+
+// The newest recorded write tick over the bytes of [begin, begin + size), or 0 when one of its
+// regions has no record (then a side readback cannot know what to wait for).
+uint64_t BufferCache::NewestWriteTick(uint64_t begin, uint64_t size) const {
+	uint64_t newest = 0;
+	for (auto region = begin >> 20u; region <= (begin + size - 1) >> 20u; region++) {
+		uint64_t tick = 0;
+		if (const auto found = m_region_write_ticks.find(region); found != m_region_write_ticks.end()) {
+			tick = found->second;
+		}
+		const auto region_begin = region << 20u;
+		const auto region_end   = region_begin + (uint64_t {1} << 20u);
+		for (const auto& write: m_big_writes) {
+			if (write.begin < region_end && region_begin < write.end) {
+				tick = std::max(tick, write.tick);
+			}
+		}
+		if (tick == 0) {
+			return 0;
+		}
+		newest = std::max(newest, tick);
+	}
+	return newest;
+}
+
+// GPU thread. The window's GPU-written bytes, when every writer of them was submitted, are copied
+// on the side queue after a wait for the newest writer only. They leave the GPU-written set now
+// and are published by the faulting thread (FinishSideReadback); their pages stay protected until
+// then (m_side_ranges).
+bool BufferCache::TrySideReadback(Buffer& buffer, uint64_t begin, uint64_t size, SideTicket& ticket) {
+	if (!SideReadbackEnabled() || m_graphics.side_queue == nullptr || size == 0 ||
+	    size > SideState::Window || !buffer.IsInBounds(begin, size)) {
+		return false;
+	}
+	if (m_side == nullptr) {
+		m_side = std::make_unique<SideState>(m_graphics, m_scheduler);
+	}
+	auto&                                      side   = *m_side;
+	uint32_t                                   slot   = SideState::Slots;
+	uint64_t                                   newest = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> dirty;
+	{
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		if (m_downloading_ranges.Intersects(begin, size)) {
+			return false;
+		}
+		m_gpu_modified_ranges.ForEachInRange(begin, size, [&](uint64_t start, uint64_t end) {
+			dirty.emplace_back(start, end - start);
+		});
+		if (dirty.empty()) {
+			return false;
+		}
+		for (const auto& [start, bytes]: dirty) {
+			const auto tick = NewestWriteTick(start, bytes);
+			if (tick == 0) {
+				side.declined++;
+				return false;
+			}
+			newest = std::max(newest, tick);
+		}
+		if (newest >= m_scheduler.CurrentTick()) {
+			// Written by the recording still open: the normal path submits it anyway.
+			side.declined++;
+			return false;
+		}
+		for (uint32_t index = 0; index < SideState::Slots; index++) {
+			if (!side.busy[index].load(std::memory_order_acquire)) {
+				slot = index;
+				break;
+			}
+		}
+		if (slot == SideState::Slots) {
+			side.declined++;
+			return false;
+		}
+		side.busy[slot].store(true, std::memory_order_relaxed);
+		for (const auto& [start, bytes]: dirty) {
+			m_gpu_modified_ranges.Subtract(start, bytes);
+			m_downloading_ranges.Add(start, bytes);
+			m_downloading_list.emplace_back(start, bytes);
+			m_side_ranges.Add(start, bytes);
+		}
+	}
+	const auto command = side.commands[slot];
+	RequireVulkanSuccess(command.reset({}), "reset side-readback command buffer");
+	vk::CommandBufferBeginInfo begin_info {};
+	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(command.begin(&begin_info), "begin side-readback command buffer");
+	std::vector<vk::BufferCopy> copies;
+	const auto                  staging_base = uint64_t {slot} * SideState::Window;
+	for (const auto& [start, bytes]: dirty) {
+		copies.emplace_back(buffer.Offset(start), staging_base + (start - begin), bytes);
+	}
+	command.copyBuffer(buffer.Handle(), side.staging->Handle(), static_cast<uint32_t>(copies.size()),
+	                   copies.data());
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = side.staging->Handle();
+	after.offset              = staging_base;
+	after.size                = SideState::Window;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                        {}, 0, nullptr, 1, &after, 0, nullptr);
+	RequireVulkanSuccess(command.end(), "end side-readback command buffer");
+
+	const auto                      value  = ++side.next_value;
+	const auto                      master = m_scheduler.GetMasterSemaphore().Handle();
+	const vk::PipelineStageFlags    stage  = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount   = 1;
+	timeline.pWaitSemaphoreValues      = &newest;
+	timeline.signalSemaphoreValueCount = 1;
+	timeline.pSignalSemaphoreValues    = &value;
+	vk::SubmitInfo submit {};
+	submit.pNext                = &timeline;
+	submit.waitSemaphoreCount   = 1;
+	submit.pWaitSemaphores      = &master;
+	submit.pWaitDstStageMask    = &stage;
+	submit.commandBufferCount   = 1;
+	submit.pCommandBuffers      = &command;
+	submit.signalSemaphoreCount = 1;
+	submit.pSignalSemaphores    = &side.semaphore;
+	{
+		Common::LockGuard lock(m_graphics.side_queue_mutex);
+		RequireVulkanSuccess(m_graphics.side_queue.submit(1, &submit, nullptr),
+		                     "submit side readback");
+	}
+	ticket.slot   = slot;
+	ticket.value  = value;
+	ticket.begin  = begin;
+	ticket.ranges = std::move(dirty);
+	if ((side.issued.fetch_add(1) & 0x3ffu) == 0u) {
+		LOGF("BufferCache: side readbacks issued=%" PRIu64 " declined=%" PRIu64 "\n",
+		     side.issued.load(), side.declined.load());
+	}
+	return true;
+}
+
+// On the faulting thread: waits for the side copy and publishes its bytes to guest memory.
+void BufferCache::FinishSideReadback(const SideTicket& ticket) {
+	auto&                 side = *m_side;
+	vk::SemaphoreWaitInfo wait_info {};
+	wait_info.semaphoreCount = 1;
+	wait_info.pSemaphores    = &side.semaphore;
+	wait_info.pValues        = &ticket.value;
+	RequireVulkanSuccess(m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX),
+	                     "wait for side readback");
+	const auto staging_base = uint64_t {ticket.slot} * SideState::Window;
+	side.staging->Invalidate(staging_base, SideState::Window);
+	const auto* mapped = side.staging->Mapped().data() + staging_base;
+	for (const auto& [start, bytes]: ticket.ranges) {
+		Libs::LibKernel::Memory::WriteBacking(start, mapped + (start - ticket.begin), bytes);
+	}
+	{
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& range: ticket.ranges) {
+			const auto entry = std::find(m_downloading_list.begin(), m_downloading_list.end(), range);
+			if (entry != m_downloading_list.end()) {
+				*entry = m_downloading_list.back();
+				m_downloading_list.pop_back();
+			}
+			m_downloading_ranges.Subtract(range.first, range.second);
+			m_side_ranges.Subtract(range.first, range.second);
+		}
+		for (const auto& [start, bytes]: m_downloading_list) {
+			m_downloading_ranges.Add(start, bytes);
+		}
+	}
+	side.busy[ticket.slot].store(false, std::memory_order_release);
+}
+
+bool BufferCache::SideBusy() const {
+	if (m_side == nullptr) {
+		return false;
+	}
+	for (const auto& slot: m_side->busy) {
+		if (slot.load(std::memory_order_acquire)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// GPU thread: pages holding unpublished side-readback bytes keep their protection until the
+// faulting thread has published them (it waits only for the side queue, never for this thread).
+void BufferCache::WaitSideRanges(uint64_t vaddr, uint64_t size) {
+	for (;;) {
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			if (m_side_ranges.Empty() || !m_side_ranges.Intersects(vaddr, size)) {
+				return;
+			}
+		}
+		std::this_thread::yield();
+	}
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
@@ -443,10 +704,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	bool     gpu_bytes  = false;
 	uint64_t age        = 0;
 	for (;;) {
-		uint64_t wait_tick = 0;
+		uint64_t   wait_tick = 0;
+		SideTicket ticket;
 		m_scheduler.Context().GetGpu().SendCommandSync(
 		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &first, &gpu_bytes,
-		     &age] {
+		     &age, &ticket] {
 			    if (first) {
 				    first     = false;
 				    gpu_bytes = HasGpuDirtyBytes(vaddr, std::max<uint64_t>(size, 4));
@@ -456,8 +718,20 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 					    age = m_scheduler.CurrentTick() - found->second.tick;
 				    }
 			    }
+			    m_step_ticket = &ticket;
 			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
+			    m_step_ticket = nullptr;
 		    });
+		if (wait_tick == SideIssued) {
+			// Published here; the next step finds the bytes current and lifts the protection.
+			FinishSideReadback(ticket);
+			continue;
+		}
+		if (wait_tick == SideRetry) {
+			// Another thread's side readback of these pages publishes them first.
+			std::this_thread::yield();
+			continue;
+		}
 		if (wait_tick == 0) {
 			break;
 		}
@@ -534,6 +808,21 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
                                      bool from_gpu_thread, bool async) {
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return 0;
+	}
+	{
+		const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto last  = Common::AlignUp(vaddr + std::max<uint64_t>(size, 1), TRACKER_PAGE_SIZE);
+		bool       side  = false;
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			side = !m_side_ranges.Empty() && m_side_ranges.Intersects(first, last - first);
+		}
+		if (side) {
+			if (async) {
+				return SideRetry;
+			}
+			WaitSideRanges(first, last - first);
+		}
 	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
@@ -676,6 +965,10 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	}
 
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
+	if (async && !is_write && m_step_ticket != nullptr &&
+	    TrySideReadback(buffer, window_begin, window_end - window_begin, *m_step_ticket)) {
+		return SideIssued;
+	}
 	if (async) {
 		// The download publishes when its tick completes; the page stays protected until the
 		// caller's next step finds its bytes downloaded and lifts it.
@@ -1267,6 +1560,36 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			m_bitmap_tracked.Subtract(first, last - first);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		if (size != 0) {
+			// Writer ticks for side readbacks.
+			const auto tick         = m_scheduler.CurrentTick();
+			const auto first_region = vaddr >> 20u;
+			const auto last_region  = (vaddr + size - 1) >> 20u;
+			if (last_region - first_region < 64) {
+				for (auto region = first_region; region <= last_region; region++) {
+					m_region_write_ticks[region] = tick;
+				}
+			} else {
+				bool merged = false;
+				for (auto& write: m_big_writes) {
+					if (write.begin == vaddr && write.end == vaddr + size) {
+						write.tick = tick;
+						merged     = true;
+						break;
+					}
+				}
+				if (!merged) {
+					if (m_big_writes.size() >= 128) {
+						// Only writes the GPU has finished may be forgotten: a newer recorded
+						// tick then still bounds every writer that is not finished.
+						std::erase_if(m_big_writes, [this](const BigWrite& write) {
+							return m_scheduler.IsFree(write.tick);
+						});
+					}
+					m_big_writes.push_back({vaddr, vaddr + size, tick});
+				}
+			}
+		}
 	}
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
 	// the bindings that mark bytes of those ranges GPU-written: the first write of each

@@ -184,6 +184,36 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// One readback attempt on the GPU thread: 0 when done, else the tick to wait for.
+	// Side readbacks (KYTY_SIDE_READBACK=1): a game thread's read of GPU-written bytes whose
+	// writers were all submitted is copied on a second queue that waits only for the newest of
+	// them, not behind everything queued since. Published by the faulting thread.
+	struct SideTicket {
+		uint32_t                                   slot  = 0;
+		uint64_t                                   value = 0;
+		uint64_t                                   begin = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	};
+	struct SideState;
+	static constexpr uint64_t SideRetry = UINT64_MAX;
+	static constexpr uint64_t SideIssued = UINT64_MAX - 1;
+	bool TrySideReadback(Buffer& buffer, uint64_t begin, uint64_t size, SideTicket& ticket);
+	void FinishSideReadback(const SideTicket& ticket);
+	void WaitSideRanges(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool SideBusy() const;
+	[[nodiscard]] uint64_t NewestWriteTick(uint64_t begin, uint64_t size) const; // lock held
+	std::unique_ptr<SideState> m_side;
+	RangeSet                   m_side_ranges; // guarded by m_dirty_ranges_mutex
+	// The tick of the last GPU write per 1 MiB region, and writes over 64 regions apart
+	// (guarded by m_dirty_ranges_mutex).
+	struct BigWrite {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	std::unordered_map<uint64_t, uint64_t> m_region_write_ticks;
+	std::vector<BigWrite>                  m_big_writes;
+	SideTicket*                            m_step_ticket = nullptr; // GPU thread, set per step
+
 	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
 	                                      bool from_gpu_thread, bool async);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
