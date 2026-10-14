@@ -204,11 +204,6 @@ public:
 		       heap.watch_generation != m_watch_generation.load(std::memory_order_acquire);
 	}
 	void OnCpuWrite(uint64_t vaddr, uint64_t size); // any thread
-	// Whether [vaddr, vaddr + size) may hold watched heap pages (a bound check, no lock).
-	[[nodiscard]] bool MayWatch(uint64_t vaddr, uint64_t size) const noexcept {
-		return vaddr + size > m_watch_low.load(std::memory_order_acquire) &&
-		       vaddr < m_watch_high.load(std::memory_order_acquire);
-	}
 	void UnwatchRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasWrittenRanges() const noexcept {
 		return m_heap_writes.load(std::memory_order_acquire);

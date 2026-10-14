@@ -131,10 +131,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 		if (const auto window = WriteFaultWindow(); window != 0) {
 			const auto begin = fault_vaddr & ~(window - 1u);
-			// Only plain buffer memory: a window over images or the bindless heaps' watched
-			// pages ended in a black screen once (2026-10-14), so those keep faulting page by page.
-			if (IsMapped(begin, window) && !m_bindless_table.MayWatch(begin, window) &&
-			    !m_texture_cache.HasImagesInRegion(begin, window)) {
+			if (IsMapped(begin, window)) {
 				m_buffer_cache.InvalidateMemoryNoDownload(begin, window);
 			}
 		}
