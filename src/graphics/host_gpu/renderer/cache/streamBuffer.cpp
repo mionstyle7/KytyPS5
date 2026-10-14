@@ -70,9 +70,24 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
 
+	// Buffers with device addresses (every guest buffer) took dedicated memory, a driver
+	// allocation each (~100 us on Windows; 100-400 in a frame that streams a new area).
+	// KYTY_BDA_SHARED_BLOCKS (default on; =0 dedicated memory for every one) lets the ones up to
+	// 64 MiB share VMA's memory blocks instead, as in the official tree (e985317d, after
+	// chenxiao07's af29b93d). Nothing here needs the allocation offset to be 0: the BDA page table
+	// stores vkGetBufferDeviceAddress (placement included), mapped pointers come from
+	// pMappedData, flushes go through vmaFlush/InvalidateAllocation, and the allocator is created
+	// with the device-address flag.
+	static const bool shared_blocks = [] {
+		const auto* value = std::getenv("KYTY_BDA_SHARED_BLOCKS");
+		return value == nullptr || value[0] != '0';
+	}();
+	static constexpr uint64_t SharedBlockMax = 64ull * 1024 * 1024;
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && !(shared_blocks && size <= SharedBlockMax)
+	        ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
+	        : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
