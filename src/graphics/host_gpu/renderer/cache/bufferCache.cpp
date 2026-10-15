@@ -679,6 +679,67 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	return true;
 }
 
+bool BufferCache::CanWriteCleanConcurrently(uint64_t vaddr, uint64_t size) const {
+	const auto       page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	if (m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	    m_downloading_ranges.Intersects(vaddr, size) ||
+	    (!m_side_ranges.Empty() && m_side_ranges.Intersects(page, TRACKER_PAGE_SIZE))) {
+		return false;
+	}
+	// A page with nothing GPU-written left only needs its protection lifted, which costs no
+	// download: the ordinary path does that, and later stores to the page no longer fault.
+	return m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) ||
+	       m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE);
+}
+
+void BufferCache::PostCleanWrite(uint64_t vaddr, uint64_t size) {
+	static std::atomic<uint64_t> posted = 0;
+	if (const auto count = posted.fetch_add(1, std::memory_order_relaxed) + 1;
+	    count <= 8 || count % 4096 == 0) {
+		LOGF("Clean write emulation: %" PRIu64 " stores, last vaddr=0x%016" PRIx64 " size=%" PRIu64
+		     "\n",
+		     count, vaddr, size);
+	}
+	(void)m_scheduler.Context().GetGpu().TrySendCommand(
+	    [this, vaddr, size] { ApplyCleanWrite(vaddr, size); });
+}
+
+// GPU thread: the GPU copy of bytes an emulated store wrote to guest memory (PostCleanWrite).
+// Commands run before later submissions, so the work the guest submits after its store sees it.
+void BufferCache::ApplyCleanWrite(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
+	std::array<uint8_t, 32> data {};
+	if (size > data.size() || !Libs::LibKernel::Memory::TryReadBacking(vaddr, data.data(), size)) {
+		return;
+	}
+	// GPU work recorded since the store wrote these bytes (or is bringing them back): its value
+	// lands in guest memory with its download, and the GPU copy already holds it.
+	if (!IsCleanForConcurrentRead(vaddr, size)) {
+		return;
+	}
+	const auto  page  = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (!m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+		// The page was downloaded and lifted since: an ordinary CPU write, uploaded from guest
+		// memory before the GPU next reads it.
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		return;
+	}
+	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size)) {
+		// No GPU copy of these bytes: a buffer created later uploads them from guest memory.
+		return;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	WriteDataBuffer(buffer, vaddr, data.data(), size);
+	// Bring the page's GPU-written bytes back in the background, so the page can be lifted and
+	// the guest's next stores to it stop faulting.
+	if (HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE) && buffer.IsInBounds(page, TRACKER_PAGE_SIZE) &&
+	    DownloadBufferMemory<true>(buffer, page, TRACKER_PAGE_SIZE)) {
+		m_last_async_download_tick = m_scheduler.CurrentTick();
+	}
+}
+
 // A game thread's fault on GPU-written memory no longer makes the GPU thread wait for the GPU.
 // The GPU thread records the download, submits it and goes on; the faulting thread waits for
 // that download's publication itself, then asks again (the window's pages then have no

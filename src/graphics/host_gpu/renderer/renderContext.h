@@ -55,6 +55,16 @@ public:
 	// but none of them is GPU-written, so guest memory already holds their value.
 	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
 	                                     uint64_t size) const noexcept;
+	// Any thread, for a store that faulted on a page protected because the GPU wrote other bytes
+	// of it (KYTY_CLEAN_WRITE_EMULATION=1): when none of the stored bytes is GPU-written or on its
+	// way back, writes them to guest memory now and to the GPU copy in the GPU thread's order,
+	// leaving the page protected, instead of waiting for the GPU to download the page. False
+	// (nothing written) otherwise.
+	// Cheap pre-check before decoding the faulting store: enabled, and the page is protected
+	// against reads too (GPU-written), not only watched for CPU writes.
+	[[nodiscard]] bool MayWriteClean(uint64_t fault_vaddr) const noexcept;
+	[[nodiscard]] bool TryWriteClean(uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+	                                 uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

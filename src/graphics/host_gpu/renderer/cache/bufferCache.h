@@ -127,6 +127,13 @@ public:
 	// protected as GPU-written) or it would be wrong (a download of these bytes is in flight, or
 	// no cached buffer covers them); the caller then writes normally.
 	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
+	// Any thread (RenderContext::TryWriteClean): none of the bytes is GPU-written or on its way
+	// back, and their page still holds bytes that are, so a store to them would make the guest
+	// wait for a download it does not need.
+	[[nodiscard]] bool              CanWriteCleanConcurrently(uint64_t vaddr, uint64_t size) const;
+	// Any thread: the bytes were just written to guest memory by an emulated store; the GPU
+	// thread copies them to the GPU (ApplyCleanWrite) before it processes later submissions.
+	void                            PostCleanWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
 	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
 		return m_fault_manager.UnattributedFaults();
@@ -251,6 +258,7 @@ private:
 	std::unordered_map<uint64_t, uint64_t>             m_bitmap_ticks;
 	uint64_t                                           m_bitmap_dropped_pages = 0;
 	uint64_t                                           m_bitmap_written_pages = 0;
+	void ApplyCleanWrite(uint64_t vaddr, uint64_t size);
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
 	// Guards changes to both range sets (GPU thread and download completions) against

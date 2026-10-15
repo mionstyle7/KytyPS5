@@ -781,6 +781,18 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			                   Libs::Graphics::GuestGpu::IsGpuThread(), elapsed(), true);
 			return true;
 		}
+		// A store to bytes the GPU has not written, on a page protected because it wrote others:
+		// write them without the download (RenderContext::TryWriteClean decides, and declines
+		// unless KYTY_CLEAN_WRITE_EMULATION=1).
+		if (access == GpuAccess::Write &&
+		    Libs::LibKernel::Memory::MayWriteCleanFaultingBytes(info->access_violation_vaddr) &&
+		    Loader::X64InstructionEmulator::TryEmulateStore(
+		        info->native_context, info->access_violation_vaddr,
+		        &Libs::LibKernel::Memory::TryWriteCleanFaultingBytes)) {
+			RecordTrackedFault(info->exception_address, info->access_violation_vaddr, false,
+			                   Libs::Graphics::GuestGpu::IsGpuThread(), elapsed(), true);
+			return true;
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr,
 			                   access == GpuAccess::Read, Libs::Graphics::GuestGpu::IsGpuThread(),

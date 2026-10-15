@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -145,6 +146,42 @@ bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
                                       uint64_t size) const noexcept {
 	return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&
 	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
+}
+
+static bool CleanWriteEmulation() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CLEAN_WRITE_EMULATION");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) {
+			LOGF("Clean write emulation: enabled\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+bool RenderContext::MayWriteClean(uint64_t fault_vaddr) const noexcept {
+	return CleanWriteEmulation() && m_page_manager.IsReadWatched(fault_vaddr);
+}
+
+bool RenderContext::TryWriteClean(uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+                                  uint64_t size) noexcept {
+	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	if (!CleanWriteEmulation() || size == 0 ||
+	    Common::AlignDown(vaddr + size - 1u, TRACKER_PAGE_SIZE) != page ||
+	    !IsMapped(vaddr, size) || !m_page_manager.IsReadWatched(fault_vaddr) ||
+	    !m_buffer_cache.CanWriteCleanConcurrently(vaddr, size)) {
+		return false;
+	}
+	// As HandleFault does for a write, and before the bytes land, as there: images and bindless
+	// heaps in these bytes see the write, after anything they bring back from the GPU.
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_bindless_table.OnCpuWrite(vaddr, size);
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	m_buffer_cache.PostCleanWrite(vaddr, size);
+	return true;
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
