@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <bit>
 #include <utility>
 
@@ -280,15 +281,44 @@ void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resour
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
 
+// KYTY_BRANCHLESS_LOADS=1: loads from bound storage buffers are made unconditionally and their
+// value selected, instead of each dword sitting in its own branch on its lane mask and bounds.
+// The branches kept the GPU from issuing a shader's loads together: CS 0xdec083415ec94cc6 (819
+// buffer_load_dwordx3, four nested branches each) took ~210 ms a dispatch. Out-of-range and
+// inactive-lane loads are memory-safe: the device runs with robustBufferAccess, and storage
+// buffers are the only resources this applies to (not LDS, scratch or device addresses).
+static bool BranchlessLoads() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BRANCHLESS_LOADS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static bool BranchlessLoad(const IR::MemoryInfo& mem) {
+	return BranchlessLoads() && mem.kind == IR::ResourceKind::Buffer;
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem);
+	if (BranchlessLoad(mem) && resource.kind == IR::ResourceKind::Buffer) {
+		const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+		const auto value     = LoadWordInBounds(ctx, resource, index);
+		return Select(ctx.state, TypeU32(ctx.state), in_bounds, value, ConstantU32(ctx.state, 0));
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
+	if (BranchlessLoad(mem)) {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		const auto value    = LoadWordPrepared(ctx, inst, mem, resource);
+		return Select(ctx.state, TypeU32(ctx.state), ctx.Arg(inst, inst.NumArgs() - 1), value,
+		              ConstantU32(ctx.state, 0));
+	}
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return LoadWordPrepared(ctx, inst, mem, resource);
@@ -993,6 +1023,23 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
+	if (const auto mem = ctx.Memory(inst);
+	    BranchlessLoad(mem) &&
+	    Format::GetFormatInfo(mem.formatted ? BufferFormat(ctx, mem)
+	                                        : Prospero::BufferFormat::kInvalid)
+	            .type == Format::ComponentType::Unknown) {
+		// Raw dwords (see BranchlessLoads): every component loaded, then masked by the lane mask.
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		const auto active   = ctx.Arg(inst, inst.NumArgs() - 1);
+		std::array<uint32_t, 4> values {};
+		for (uint32_t component = 0; component < components; component++) {
+			values[component] = Select(
+			    state, TypeU32(state), active,
+			    LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource),
+			    ConstantU32(state, 0));
+		}
+		return components == 1u ? values[0] : ConstructU32Composite(state, components, values);
+	}
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
