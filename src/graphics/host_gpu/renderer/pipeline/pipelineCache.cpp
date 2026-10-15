@@ -238,7 +238,28 @@ bool SrtDrainLogEnabled() {
 	return enabled;
 }
 
+// KYTY_SRT_NO_DRAIN=1 (experiment, not correct): an SRT read of bytes GPU work wrote takes the
+// stale backing bytes instead of waiting for the GPU. It shows how fast the frame gets once the
+// GPU thread never waits for GPU output while it translates commands; values can be wrong.
+bool SrtNoDrain() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_NO_DRAIN");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 bool TryReadBufferBackingLogged(uint64_t address, std::span<uint32_t> values) {
+	if (SrtNoDrain() && t_srt_shader_hash != 0 &&
+	    Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes())) {
+		static uint64_t stale = 0;
+		if (++stale % 1000u == 1u) {
+			LOGF("SRT no-drain: %" PRIu64 " stale reads of GPU-written bytes (last: shader 0x%016" PRIx64
+			     " at 0x%016" PRIx64 ")\n",
+			     stale, t_srt_shader_hash, address);
+		}
+		return Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes());
+	}
 	if (!SrtDrainLogEnabled() || t_srt_shader_hash == 0 ||
 	    !Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes())) {
 		return Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
