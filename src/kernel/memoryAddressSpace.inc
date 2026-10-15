@@ -945,13 +945,53 @@ public:
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
+	// The page tracker's protection changes (the GPU thread's, hundreds a frame). The mapped
+	// pieces are found under the lock and protected after it is released, as the Demon's Souls
+	// fork does (+1.1 fps there): VirtualProtect under the lock made every other user of it wait
+	// (Tracy sampling: 5.2% of the GPU thread in VirtualProtect, 2.3% waiting for this lock).
+	// A piece that fails (unmapped meanwhile) is done again under the lock, which skips it.
+	// KYTY_PROTECT_UNDER_LOCK=1 keeps the old behavior.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-
-		std::lock_guard lock(m_mutex);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		static const bool under_lock = [] {
+			const char* value = std::getenv("KYTY_PROTECT_UNDER_LOCK");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (under_lock) {
+			std::lock_guard lock(m_mutex);
+			return ProtectMappedUnlocked(vaddr, size, mode);
+		}
+		std::array<std::pair<uint64_t, uint64_t>, 8> pieces {};
+		size_t                                       count = 0;
+		{
+			std::lock_guard lock(m_mutex);
+			const auto      end = vaddr + size;
+			auto            it  = m_mapped.upper_bound(vaddr);
+			if (it != m_mapped.begin()) {
+				--it;
+			}
+			for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
+				const auto& region      = it->second;
+				const auto  range_start = std::max(vaddr, region.vaddr);
+				const auto  range_end   = std::min(end, region.vaddr + region.size);
+				if (range_start >= range_end) {
+					continue;
+				}
+				if (count == pieces.size()) {
+					return ProtectMappedUnlocked(vaddr, size, mode);
+				}
+				pieces[count++] = {range_start, range_end - range_start};
+			}
+		}
+		for (size_t i = 0; i < count; i++) {
+			if (!VirtualMemory::Protect(pieces[i].first, pieces[i].second, mode)) {
+				std::lock_guard lock(m_mutex);
+				return ProtectMappedUnlocked(vaddr, size, mode);
+			}
+		}
+		return true;
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
