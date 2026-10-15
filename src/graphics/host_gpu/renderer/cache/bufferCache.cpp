@@ -570,14 +570,17 @@ bool BufferCache::SideBusy() const {
 	return false;
 }
 
-// KYTY_DIRECT_READBACK (default on; =0 off): guest-thread reads of GPU-written bytes whose writers
+// KYTY_DIRECT_READBACK=1 (off by default): guest-thread reads of GPU-written bytes whose writers
 // were submitted are copied on the side queue by the faulting thread itself (TryDirectRead). Each
 // such read went to the GPU thread twice (issue the download, then lift the page), and waited in
-// its queue for ~2.7 of ~3.9 ms; 95% of them read bytes written over 10 ticks before.
+// its queue for ~2.7 of ~3.9 ms; 95% of them read bytes written over 10 ticks before. Measured
+// in gameplay (2026-10-15): ~70K reads went this way, yet the frame stayed at 2.5-4 fps, and the
+// publications queued on the GPU thread made the remaining readbacks slower: the guest threads'
+// readback waits are not what bounds the frame here.
 static bool DirectReadEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_DIRECT_READBACK");
-		const bool  on    = value == nullptr || value[0] != '0';
+		const bool  on    = value != nullptr && value[0] == '1';
 		LOGF("Direct readbacks: %s\n", on ? "on" : "off");
 		return on;
 	}();
