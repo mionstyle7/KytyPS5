@@ -35,6 +35,8 @@ public:
 	// GPU writes can be attributed to it. Set by the draw and dispatch paths on the GPU thread.
 	static void SetCurrentWriter(uint64_t shader_hash);
 	void        NoteReadback(uint64_t vaddr, double ms, bool gpu_bytes, uint64_t age);
+	void        NoteGuestReadbackTiming(double total_ms, double service_ms, uint32_t steps,
+	                                    bool gpu_bytes, uint64_t age);
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;

@@ -792,14 +792,17 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	bool     first      = true;
 	bool     gpu_bytes  = false;
 	uint64_t age        = 0;
+	double   service_ms = 0.0; // inside requests to the GPU thread (its queue wait + the step)
+	uint32_t steps      = 0;
 	for (;;) {
 		uint64_t   wait_tick = 0;
 		SideTicket ticket;
+		const double request_start = timer.GetTimeS();
 		m_scheduler.Context().GetGpu().SendCommandSync(
 		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &first, &gpu_bytes,
-		     &age, &ticket] {
+		     &age, &ticket, &steps] {
 			    if (first) {
-				    first     = false;
+				    first      = false;
 				    gpu_bytes = HasGpuDirtyBytes(vaddr, std::max<uint64_t>(size, 4));
 				    std::lock_guard lock(g_readback_diag_mutex);
 				    if (const auto found = g_region_writes.find(vaddr >> kDiagRegionBits);
@@ -808,9 +811,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				    }
 			    }
 			    m_step_ticket = &ticket;
+			    steps++;
 			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
 			    m_step_ticket = nullptr;
 		    });
+		service_ms += (timer.GetTimeS() - request_start) * 1000.0;
 		if (wait_tick == SideIssued) {
 			// Published here; the next step finds the bytes current and lifts the protection.
 			FinishSideReadback(ticket);
@@ -826,7 +831,51 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		m_scheduler.WaitPriorityOperations(wait_tick);
 	}
-	NoteReadback(vaddr, timer.GetTimeS() * 1000.0, gpu_bytes, age);
+	const double total_ms = timer.GetTimeS() * 1000.0;
+	NoteReadback(vaddr, total_ms, gpu_bytes, age);
+	if (!from_gpu_thread) {
+		NoteGuestReadbackTiming(total_ms, service_ms, steps, gpu_bytes, age);
+	}
+}
+
+// Guest-thread readbacks, every 10 s: how long they took, how much of it was waiting for the GPU
+// thread to take the request (it runs between PM4 commands) versus the GPU work and copy after,
+// and how old the bytes' last GPU write was (ticks; 0 = the recording still open).
+void BufferCache::NoteGuestReadbackTiming(double total_ms, double service_ms, uint32_t steps,
+                                          bool gpu_bytes, uint64_t age) {
+	struct Stats {
+		uint64_t calls = 0, gpu = 0, steps = 0;
+		double   total = 0.0, service = 0.0, max = 0.0;
+		uint64_t age_bins[4] {};
+		std::chrono::steady_clock::time_point next {};
+	};
+	static Stats     stats;
+	static std::mutex mutex;
+	std::lock_guard  lock(mutex);
+	stats.calls++;
+	stats.gpu += gpu_bytes ? 1u : 0u;
+	stats.steps += steps;
+	stats.total += total_ms;
+	stats.service += service_ms;
+	stats.max = std::max(stats.max, total_ms);
+	stats.age_bins[age == 0 ? 0 : age <= 2 ? 1 : age <= 10 ? 2 : 3]++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now < stats.next) {
+		return;
+	}
+	stats.next = now + std::chrono::seconds(10);
+	LOGF("Guest readbacks: %" PRIu64 " calls (%" PRIu64 " with GPU-written bytes), %.0f ms total, "
+	     "avg %.2f ms (in requests to the GPU thread %.2f ms, waiting for the GPU %.2f ms), "
+	     "max %.1f ms, %.2f steps; write age in ticks: 0 %" PRIu64 ", 1-2 %" PRIu64 ", 3-10 %" PRIu64
+	     ", >10 %" PRIu64 "\n",
+	     stats.calls, stats.gpu, stats.total, stats.total / static_cast<double>(stats.calls),
+	     stats.service / static_cast<double>(stats.calls),
+	     (stats.total - stats.service) / static_cast<double>(stats.calls), stats.max,
+	     static_cast<double>(stats.steps) / static_cast<double>(stats.calls), stats.age_bins[0],
+	     stats.age_bins[1], stats.age_bins[2], stats.age_bins[3]);
+	const auto next = stats.next;
+	stats           = {};
+	stats.next      = next;
 }
 
 void BufferCache::NoteReadback(uint64_t vaddr, double ms, bool gpu_bytes, uint64_t age) {
