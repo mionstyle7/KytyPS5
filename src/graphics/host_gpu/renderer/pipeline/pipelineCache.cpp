@@ -264,6 +264,20 @@ bool TryReadBufferBackingLogged(uint64_t address, std::span<uint32_t> values) {
 		std::snprintf(word, sizeof(word), "%s%08x", i == 0 ? "" : " ", ok ? values[i] : 0u);
 		value += word;
 	}
+	// KYTY_SRT_DRAIN_STACKS=<n>: the host stack of the first n such reads of 1 ms or more per
+	// shader (at most 64 in all), to see which part of the refresh made the read.
+	static const uint32_t stack_limit = [] {
+		const char* value = std::getenv("KYTY_SRT_DRAIN_STACKS");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+	}();
+	static std::map<uint64_t, uint32_t> stacks_per_shader;
+	static uint32_t                     stacks_logged = 0;
+	if (ms >= 1.0 && stacks_logged < 64u && stacks_per_shader[t_srt_shader_hash] < stack_limit) {
+		stacks_per_shader[t_srt_shader_hash]++;
+		stacks_logged++;
+		LOGF("SRT drain stack: hash=0x%016" PRIx64 " addr=0x%016" PRIx64 " %.2f ms\n%s",
+		     t_srt_shader_hash, address, ms, Common::HostBacktrace().c_str());
+	}
 	auto& entry      = entries[{t_srt_shader_hash, address}];
 	const bool changed = entry.count != 0 && entry.last != value;
 	entry.count++;
