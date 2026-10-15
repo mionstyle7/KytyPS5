@@ -144,6 +144,12 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+bool RenderContext::TryDirectRead(uint64_t fault_vaddr, uint64_t vaddr, void* data,
+                                  uint64_t size) {
+	return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&
+	       m_buffer_cache.TryDirectRead(vaddr, data, size);
+}
+
 bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
                                       uint64_t size) const noexcept {
 	return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&

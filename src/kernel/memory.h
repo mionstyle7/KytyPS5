@@ -133,6 +133,9 @@ void SetGpuReadDelegate(bool delegate);
 // Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
 // it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
+// Guest threads, for a read that faulted at fault_vaddr on bytes the GPU wrote: reads them
+// without the GPU thread when their writers were submitted (BufferCache::TryDirectRead).
+bool TryReadDirectFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
 // Any thread, for a store that faulted at fault_vaddr on a page protected because the GPU wrote
 // other bytes of it: writes [vaddr, vaddr + size) to the backing store, and to the GPU copy in
 // the GPU thread's order, when none of those bytes is GPU-written (RenderContext::TryWriteClean).

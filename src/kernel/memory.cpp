@@ -1042,6 +1042,11 @@ bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 	       TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadDirectFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size) {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->TryDirectRead(fault_vaddr, vaddr, data, size);
+}
+
 bool TryWriteCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, const void* data,
                                 uint64_t size) {
 	return g_gpu_resources != nullptr &&

@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <fmt/format.h>
 #include <atomic>
+#include <bit>
 #include <thread>
 #include <array>
 #include <cinttypes>
@@ -110,6 +111,11 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
+		{
+			std::lock_guard direct_lock(m_direct_buffers_mutex);
+			m_direct_buffers[buffer.CpuAddress()] = {.end    = buffer.CpuAddress() + buffer.Size(),
+			                                         .handle = buffer.Handle()};
+		}
 		m_total_used_memory += buffer.Size();
 		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
@@ -124,6 +130,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
 		m_buffers.erase(found);
+		{
+			std::lock_guard direct_lock(m_direct_buffers_mutex);
+			m_direct_buffers.erase(buffer.CpuAddress());
+		}
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
@@ -369,7 +379,7 @@ struct BufferCache::SideState {
 	vk::Semaphore                        semaphore = nullptr;
 	std::array<vk::CommandBuffer, Slots> commands {};
 	std::array<std::atomic<bool>, Slots> busy {};
-	uint64_t                             next_value = 0; // GPU thread only
+	uint64_t                             next_value = 0; // under m_side_mutex
 	std::unique_ptr<Buffer>              staging;
 	std::atomic<uint64_t>                issued {0};
 	std::atomic<uint64_t>                declined {0};
@@ -408,6 +418,7 @@ bool BufferCache::TrySideReadback(Buffer& buffer, uint64_t begin, uint64_t size,
 	    size > SideState::Window || !buffer.IsInBounds(begin, size)) {
 		return false;
 	}
+	std::lock_guard side_lock(m_side_mutex);
 	if (m_side == nullptr) {
 		m_side = std::make_unique<SideState>(m_graphics, m_scheduler);
 	}
@@ -559,6 +570,239 @@ bool BufferCache::SideBusy() const {
 	return false;
 }
 
+// KYTY_DIRECT_READBACK (default on; =0 off): guest-thread reads of GPU-written bytes whose writers
+// were submitted are copied on the side queue by the faulting thread itself (TryDirectRead). Each
+// such read went to the GPU thread twice (issue the download, then lift the page), and waited in
+// its queue for ~2.7 of ~3.9 ms; 95% of them read bytes written over 10 ticks before.
+static bool DirectReadEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DIRECT_READBACK");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Direct readbacks: %s\n", on ? "on" : "off");
+		return on;
+	}();
+	return enabled;
+}
+
+// The window a direct read copies around the faulting bytes (KYTY_DIRECT_READBACK_KB, default 64).
+static uint64_t DirectReadWindow() {
+	static const uint64_t window = [] {
+		const char* value = std::getenv("KYTY_DIRECT_READBACK_KB");
+		uint64_t    kb    = value != nullptr ? std::strtoull(value, nullptr, 10) : 64u;
+		kb                = std::clamp<uint64_t>(kb, 4u, 4096u);
+		return std::bit_ceil(kb) << 10u;
+	}();
+	return window;
+}
+
+bool BufferCache::TryDirectRead(uint64_t vaddr, void* data, uint64_t size) {
+	if (!DirectReadEnabled() || m_side == nullptr || size == 0 || size > 4096 ||
+	    GuestGpu::IsGpuThread() || !GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	struct Stats {
+		std::atomic<uint64_t> copies {0}, hits {0}, declined {0};
+	};
+	static Stats stats;
+	// Bytes already copied by a direct read and not written since: guest memory is current.
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (m_downloading_ranges.Intersects(vaddr, size) ||
+		    !m_gpu_modified_ranges.Intersects(vaddr, size)) {
+			return false;
+		}
+		const auto newest = NewestWriteTick(vaddr, size);
+		if (newest == 0) {
+			stats.declined++;
+			return false;
+		}
+		std::lock_guard cache_lock(m_direct_cache_mutex);
+		for (const auto& window: m_direct_cache) {
+			if (window.tick != 0 && window.begin <= vaddr && vaddr + size <= window.end &&
+			    newest <= window.tick) {
+				stats.hits++;
+				return Libs::LibKernel::Memory::TryReadBacking(vaddr, data, size);
+			}
+		}
+	}
+	const auto window = DirectReadWindow();
+	auto       begin  = Common::AlignDown(vaddr, window);
+	auto       end    = Common::AlignUp(vaddr + size, window);
+	if (end - begin > SideState::Window) {
+		return false;
+	}
+	auto&                                      side   = *m_side;
+	uint32_t                                   slot   = SideState::Slots;
+	uint64_t                                   newest = 0;
+	uint64_t                                   value  = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> dirty;
+	{
+		std::lock_guard side_lock(m_side_mutex);
+		for (uint32_t index = 0; index < SideState::Slots; index++) {
+			if (!side.busy[index].load(std::memory_order_acquire)) {
+				slot = index;
+				break;
+			}
+		}
+		if (slot == SideState::Slots) {
+			stats.declined++;
+			return false;
+		}
+		// Busy before the lookup: a buffer still registered now is not released until it clears.
+		side.busy[slot].store(true, std::memory_order_release);
+		const auto decline = [&] {
+			side.busy[slot].store(false, std::memory_order_release);
+			stats.declined++;
+			return false;
+		};
+		uint64_t   buffer_begin = 0;
+		vk::Buffer handle       = nullptr;
+		{
+			std::lock_guard direct_lock(m_direct_buffers_mutex);
+			auto            found = m_direct_buffers.upper_bound(vaddr);
+			if (found != m_direct_buffers.begin()) {
+				--found;
+				if (found->first <= vaddr && vaddr + size <= found->second.end) {
+					buffer_begin = found->first;
+					handle       = found->second.handle;
+					begin        = std::max(begin, found->first);
+					end          = std::min(end, found->second.end);
+				}
+			}
+		}
+		if (handle == nullptr) {
+			return decline();
+		}
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			if (m_downloading_ranges.Intersects(begin, end - begin)) {
+				return decline();
+			}
+			m_gpu_modified_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t stop) {
+				dirty.emplace_back(start, stop - start);
+			});
+			for (const auto& [start, bytes]: dirty) {
+				const auto tick = NewestWriteTick(start, bytes);
+				if (tick == 0) {
+					return decline();
+				}
+				newest = std::max(newest, tick);
+			}
+		}
+		// Written by the recording still open: only the GPU thread can submit it.
+		if (dirty.empty() || newest >= m_scheduler.CurrentTick()) {
+			return decline();
+		}
+		const auto command = side.commands[slot];
+		RequireVulkanSuccess(command.reset({}), "reset direct-read command buffer");
+		vk::CommandBufferBeginInfo begin_info {};
+		begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+		RequireVulkanSuccess(command.begin(&begin_info), "begin direct-read command buffer");
+		std::vector<vk::BufferCopy> copies;
+		const auto                  staging_base = uint64_t {slot} * SideState::Window;
+		for (const auto& [start, bytes]: dirty) {
+			copies.emplace_back(start - buffer_begin, staging_base + (start - begin), bytes);
+		}
+		command.copyBuffer(handle, side.staging->Handle(), static_cast<uint32_t>(copies.size()),
+		                   copies.data());
+		vk::BufferMemoryBarrier after {};
+		after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.buffer              = side.staging->Handle();
+		after.offset              = staging_base;
+		after.size                = SideState::Window;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after, 0,
+		                        nullptr);
+		RequireVulkanSuccess(command.end(), "end direct-read command buffer");
+		value                                  = ++side.next_value;
+		const auto                      master = m_scheduler.GetMasterSemaphore().Handle();
+		const vk::PipelineStageFlags    stage  = vk::PipelineStageFlagBits::eTransfer;
+		vk::TimelineSemaphoreSubmitInfo timeline {};
+		timeline.waitSemaphoreValueCount   = 1;
+		timeline.pWaitSemaphoreValues      = &newest;
+		timeline.signalSemaphoreValueCount = 1;
+		timeline.pSignalSemaphoreValues    = &value;
+		vk::SubmitInfo submit {};
+		submit.pNext                = &timeline;
+		submit.waitSemaphoreCount   = 1;
+		submit.pWaitSemaphores      = &master;
+		submit.pWaitDstStageMask    = &stage;
+		submit.commandBufferCount   = 1;
+		submit.pCommandBuffers      = &command;
+		submit.signalSemaphoreCount = 1;
+		submit.pSignalSemaphores    = &side.semaphore;
+		Common::LockGuard queue_lock(m_graphics.side_queue_mutex);
+		RequireVulkanSuccess(m_graphics.side_queue.submit(1, &submit, nullptr),
+		                     "submit direct read");
+	}
+	vk::SemaphoreWaitInfo wait_info {};
+	wait_info.semaphoreCount = 1;
+	wait_info.pSemaphores    = &side.semaphore;
+	wait_info.pValues        = &value;
+	RequireVulkanSuccess(m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX),
+	                     "wait for direct read");
+	const auto staging_base = uint64_t {slot} * SideState::Window;
+	side.staging->Invalidate(staging_base, SideState::Window);
+	const auto* mapped = side.staging->Mapped().data() + staging_base;
+	for (const auto& [start, bytes]: dirty) {
+		Libs::LibKernel::Memory::WriteBacking(start, mapped + (start - begin), bytes);
+	}
+	side.busy[slot].store(false, std::memory_order_release);
+	{
+		std::lock_guard cache_lock(m_direct_cache_mutex);
+		m_direct_cache[m_direct_next++ % m_direct_cache.size()] = {
+		    .begin = begin, .end = end, .tick = newest};
+	}
+	// The GPU thread takes the bytes out of the GPU-written set and lifts the pages, unless a
+	// newer write came in meanwhile; until then reads of them come back here and hit the cache.
+	(void)m_scheduler.Context().GetGpu().TrySendCommand(
+	    [this, dirty = std::move(dirty), newest] { PublishDirectRead(dirty, newest); });
+	const auto copies = stats.copies.fetch_add(1) + 1;
+	if (copies % 1024u == 1u) {
+		LOGF("Direct readbacks: %" PRIu64 " copied, %" PRIu64 " served from earlier copies, %" PRIu64
+		     " declined\n",
+		     copies, stats.hits.load(), stats.declined.load());
+	}
+	return Libs::LibKernel::Memory::TryReadBacking(vaddr, data, size);
+}
+
+// GPU thread: the bytes a direct read put in guest memory leave the GPU-written set when no write
+// came after the one it waited for, and pages left without GPU-written bytes are lifted.
+void BufferCache::PublishDirectRead(const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                                    uint64_t newest) {
+	std::vector<std::pair<uint64_t, uint64_t>> published;
+	{
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& [start, bytes]: ranges) {
+			if (NewestWriteTick(start, bytes) > newest ||
+			    m_downloading_ranges.Intersects(start, bytes)) {
+				continue;
+			}
+			m_gpu_modified_ranges.Subtract(start, bytes);
+			published.emplace_back(start, bytes);
+		}
+	}
+	for (const auto& [start, bytes]: published) {
+		const auto first = Common::AlignDown(start, TRACKER_PAGE_SIZE);
+		const auto last  = Common::AlignUp(start + bytes, TRACKER_PAGE_SIZE);
+		for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
+			bool downloading = false;
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				downloading = m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE) ||
+				              m_side_ranges.Intersects(page, TRACKER_PAGE_SIZE);
+			}
+			if (!downloading && !HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE) &&
+			    m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+			}
+		}
+	}
+}
+
 // GPU thread: pages holding unpublished side-readback bytes keep their protection until the
 // faulting thread has published them (it waits only for the side queue, never for this thread).
 void BufferCache::WaitSideRanges(uint64_t vaddr, uint64_t size) {
@@ -594,6 +838,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	if (m_graphics.side_queue != nullptr && DirectReadEnabled()) {
+		m_side = std::make_unique<SideState>(m_graphics, m_scheduler);
+	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}

@@ -51,6 +51,9 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Guest threads: a read of GPU-written bytes off the GPU thread (BufferCache::TryDirectRead).
+	[[nodiscard]] bool TryDirectRead(uint64_t fault_vaddr, uint64_t vaddr, void* data,
+	                                 uint64_t size);
 	// Any thread: a read of these bytes faulted on a page protected because the GPU wrote to it,
 	// but none of them is GPU-written, so guest memory already holds their value.
 	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,

@@ -12,7 +12,9 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <shared_mutex>
 #include <span>
@@ -119,6 +121,12 @@ public:
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
 	// memory holds their current value even when their page is protected.
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
+	// Guest threads (KYTY_DIRECT_READBACK, default on): reads [vaddr, vaddr + size) of GPU-written
+	// bytes whose writers were all submitted, without the GPU thread: the window around them is
+	// copied on the side queue after a wait for the newest writer only, put in guest memory, and
+	// read from there. The GPU thread lifts the pages' protection later (PublishDirectRead).
+	// False to decline (the caller takes the ordinary readback).
+	[[nodiscard]] bool              TryDirectRead(uint64_t vaddr, void* data, uint64_t size);
 	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void                            ProcessFaultBuffer();
@@ -215,6 +223,27 @@ private:
 	[[nodiscard]] bool SideBusy() const;
 	[[nodiscard]] uint64_t NewestWriteTick(uint64_t begin, uint64_t size) const; // lock held
 	std::unique_ptr<SideState> m_side;
+	// Side command buffers, their pool and next_value: the GPU thread's side readbacks and the
+	// guest threads' direct reads.
+	std::mutex                 m_side_mutex;
+	// Registered buffers by guest address, for direct reads off the GPU thread (a buffer found
+	// here while a side slot is busy is not released until the slot is free: ReleaseBuffer).
+	struct DirectBuffer {
+		uint64_t   end    = 0;
+		vk::Buffer handle = nullptr;
+	};
+	std::mutex                         m_direct_buffers_mutex;
+	std::map<uint64_t, DirectBuffer>   m_direct_buffers;
+	// Windows direct reads put in guest memory, with the newest writer tick they cover.
+	struct DirectWindow {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	std::mutex                         m_direct_cache_mutex;
+	std::array<DirectWindow, 64>       m_direct_cache {};
+	size_t                             m_direct_next = 0;
+	void PublishDirectRead(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t newest);
 	RangeSet                   m_side_ranges; // guarded by m_dirty_ranges_mutex
 	// The tick of the last GPU write per 1 MiB region, and writes over 64 regions apart
 	// (guarded by m_dirty_ranges_mutex).
