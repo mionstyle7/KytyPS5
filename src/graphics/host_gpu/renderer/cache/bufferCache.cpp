@@ -757,9 +757,14 @@ void BufferCache::ApplyCleanWrite(uint64_t vaddr, uint64_t size) {
 	WriteDataBuffer(buffer, vaddr, data.data(), size);
 	// Bring the page's GPU-written bytes back in the background, so the page can be lifted and
 	// the guest's next stores to it stop faulting.
+	// Submitted now, as ReadMemoryStep does: a guest access that finds these bytes downloading
+	// waits for m_last_async_download_tick (WaitPriorityOperations does not submit), and an
+	// unsubmitted tick then held it until something else submitted (the menu stalled).
 	if (HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE) && buffer.IsInBounds(page, TRACKER_PAGE_SIZE) &&
 	    DownloadBufferMemory<true>(buffer, page, TRACKER_PAGE_SIZE)) {
-		m_last_async_download_tick = m_scheduler.CurrentTick();
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Flush();
+		m_last_async_download_tick = tick;
 	}
 }
 
