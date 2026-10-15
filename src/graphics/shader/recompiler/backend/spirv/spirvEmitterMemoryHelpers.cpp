@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -133,6 +134,15 @@ void EmitMemoryOffsets(EmitterState& state) {
 	}
 }
 
+// KYTY_WRITE_BITMAP_TEST_FIRST=0: mark every store with an atomic, as before (A/B runs).
+static bool WriteBitmapTestFirst() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WRITE_BITMAP_TEST_FIRST");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 // Rework Phase 2, first step: a store or atomic through a write-tracked binding sets the bit of
 // its guest page (4 KiB) in the GPU write bitmap; the host then downloads only pages that were
 // written. A binding the host does not track in this draw has a base of 0 and skips it.
@@ -160,10 +170,26 @@ void EmitWriteBitmapMark(EmitterState& state, const MemoryResourceAccess& access
 		           Binary(state, spv::OpShiftLeftLogical, u64, word, ConstantDeviceAddress(state, 2)));
 		const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
 		                           word_address);
-		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), value, pointer,
-		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), bit);
-		return value;
+		const auto set_bit = [&]() {
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), value, pointer,
+			                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), bit);
+			return value;
+		};
+		if (!WriteBitmapTestFirst()) {
+			return set_bit();
+		}
+		// Test, then set: every store of a dispatch that writes one region hit the same word with
+		// an atomic, and the GPU serialised them (a ~150-instruction compute shader took ~78 ms on
+		// an RTX 4070, its warps stalled at the store and at exit). Most marks find the bit set by
+		// an earlier store; a plain load of the word costs no atomic. A stale load only costs one.
+		const auto current = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), current, pointer,
+		                          spv::MemoryAccessAlignedMask, 4u);
+		const auto unset = Binary(state, spv::OpIEqual, TypeBool(state),
+		                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), current, bit),
+		                          ConstantU32(state, 0));
+		return EmitValueOrZeroIfCondition(state, unset, set_bit);
 	});
 }
 
