@@ -134,6 +134,23 @@ DispatchRecoveryPolicy& RecoveryPolicy() {
 // can be rolled back before any dependent dispatch observes its results.
 // KYTY_WATCH_DISPATCH=<hash>[,<hash>...] (hex): logs the first 64 direct dispatches of those
 // shaders as the graphics debug dump does (groups, local size, buffers and textures).
+// KYTY_GUEST_BARRIERS_ONLY=1 (experiment): no host barrier before and after each compute dispatch.
+// On the console, dispatches overlap unless the game orders them (CS/PS partial flush events,
+// which TriggerEvent turns into a global barrier); here every dispatch waits for all earlier work
+// and blocks all later work, so the GPU runs dispatches one at a time. The Demon's Souls fork
+// measured its largest wins from this (33.9 -> 40.6 fps; +12.7%).
+bool GuestBarriersOnly() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_BARRIERS_ONLY");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) {
+			LOGF("Compute dispatches: host barriers off, guest flushes only\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
 bool WatchDispatch(uint64_t shader_hash) {
 	static const std::vector<uint64_t> hashes = [] {
 		std::vector<uint64_t> result;
@@ -691,7 +708,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 		                }) ||
 		    has_storage_writes;
-		if (has_storage_writes) {
+		if (has_storage_writes && !GuestBarriersOnly()) {
 			// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 			// while allowing the queue to execute asynchronously.
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -708,7 +725,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                   (thread_group_y << 16u) | thread_group_z);
 
 		// The removed host fence also ordered read-only dispatches before later writers.
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (!GuestBarriersOnly()) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	} while (recovery.Retry());
 	ResetBindings();
 }
@@ -802,7 +821,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			        return image.written && image.resource_class ==
 			                                    ShaderRecompiler::IR::ImageResourceClass::Storage;
 		        });
-		if (has_storage_writes) {
+		if (has_storage_writes && !GuestBarriersOnly()) {
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		vk::MemoryBarrier barrier {};
@@ -821,7 +840,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (!GuestBarriersOnly()) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	} while (recovery.Retry());
 	ResetBindings();
 }
