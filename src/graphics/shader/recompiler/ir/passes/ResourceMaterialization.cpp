@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
@@ -18,6 +19,8 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -1064,6 +1067,57 @@ bool BoundableWriteOperand(const Program& program, Value value, Value predicate,
 
 } // namespace
 
+// KYTY_SOFT_RECORDS=<hash>[,<hash>...] (hex), "all", or "0": the shaders whose buffer
+// descriptors may leave a GPU-written NumRecords dword to the GPU (soft_record_buffers). Default:
+// the title's GPU-driven sort (CS 0xfb5ee753d43f3f0b), whose element count a compute shader writes
+// just before it: reading it drained the GPU once a frame (16 ms on the menu, 72 ms in gameplay).
+// Only for shaders that bound their own accesses by that count: the host binds the buffer over
+// the dispatch's write extent, so lanes past the count are no longer dropped by the descriptor.
+static bool SoftRecordsAllowed(uint64_t shader_hash) {
+	static const auto list = [] {
+		std::pair<bool, std::unordered_set<uint64_t>> result {false, {}};
+		const char* value = std::getenv("KYTY_SOFT_RECORDS");
+		const std::string_view text(value != nullptr ? value : "fb5ee753d43f3f0b");
+		result.first = text == "all";
+		for (size_t begin = 0; !result.first && begin < text.size();) {
+			const auto end = std::min(text.find(',', begin), text.size());
+			if (end > begin) {
+				const auto hash =
+				    std::strtoull(std::string(text.substr(begin, end - begin)).c_str(), nullptr, 16);
+				if (hash != 0) result.second.insert(hash);
+			}
+			begin = end + 1;
+		}
+		return result;
+	}();
+	return list.first || list.second.contains(shader_hash);
+}
+
+// The flat slot a buffer's NumRecords dword reads directly, when the shader is allowed to leave
+// it to the GPU; UINT32_MAX otherwise.
+static uint32_t SoftRecordsSlot(const ResourcePlan& plan, uint32_t buffer) {
+	if (!SoftRecordsAllowed(plan.shader_hash) || buffer >= plan.info.buffers.size()) {
+		return UINT32_MAX;
+	}
+	const auto source = plan.info.buffers[buffer].source;
+	if (source >= plan.descriptor_sources.size()) {
+		return UINT32_MAX;
+	}
+	const auto& descriptor = plan.descriptor_sources[source];
+	if (descriptor.indirect_descriptor.has_value() || descriptor.dword_count < 3u) {
+		return UINT32_MAX;
+	}
+	const auto* inst = descriptor.dwords[2].Resolve().TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::ReadConst) {
+		return UINT32_MAX;
+	}
+	const auto slot = inst->Arg(1).Resolve();
+	if (!slot.IsImmediate() || slot.GetType() != Type::U32 || slot.U32() >= plan.srt_reads.size()) {
+		return UINT32_MAX;
+	}
+	return slot.U32();
+}
+
 // Flat slots the host never needs, so their bytes can be left to the GPU when it wrote them
 // (SrtGpuFill): the slot's value is a raw scalar read whose address comes from user data and
 // immediates alone, and no value the host evaluates refers to the slot (descriptor dwords and
@@ -1096,8 +1150,19 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 			}
 		}
 	};
-	for (const auto& source: plan.descriptor_sources) {
+	// NumRecords dwords the host may leave to the GPU (SoftRecordsSlot) are not host uses.
+	std::unordered_set<uint32_t> soft_sources;
+	for (uint32_t buffer = 0; buffer < plan.info.buffers.size(); buffer++) {
+		if (SoftRecordsSlot(plan, buffer) != UINT32_MAX) {
+			soft_sources.insert(plan.info.buffers[buffer].source);
+		}
+	}
+	for (uint32_t index = 0; index < plan.descriptor_sources.size(); index++) {
+		const auto& source = plan.descriptor_sources[index];
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
+			if (dword == 2u && soft_sources.contains(index)) {
+				continue;
+			}
 			mark(source.dwords[dword]);
 		}
 		if (source.indirect_descriptor.has_value()) {
@@ -1112,7 +1177,42 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		mark(plan.uniform_fill.values[i]);
 	}
+	// A store's predicate is not evaluated on the host: EvaluateWriteInterval only matches it to
+	// skip the select on it. For the soft-record shaders it is not marked, so a count that both
+	// bounds the stores (v_cmpx) and sizes the buffer can be left to the GPU.
+	const bool predicate_free = SoftRecordsAllowed(plan.shader_hash);
+	const auto mark_write = [&](Value root, Value predicate) {
+		std::vector<Value>              stack {root};
+		std::unordered_set<const Inst*> seen;
+		while (!stack.empty()) {
+			const auto value = stack.back().Resolve();
+			stack.pop_back();
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || !seen.insert(inst).second) {
+				continue;
+			}
+			if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->NumArgs() == 3 &&
+			    inst->Arg(0).Resolve() == predicate) {
+				stack.push_back(inst->Arg(1)); // EvaluateWriteInterval follows only this arm
+				continue;
+			}
+			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+				mark(value);
+				continue;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				stack.push_back(inst->Arg(arg));
+			}
+		}
+	};
 	for (const auto& write: plan.buffer_writes) {
+		if (predicate_free) {
+			const auto predicate = write.predicate.Resolve();
+			mark_write(write.index, predicate);
+			mark_write(write.offset, predicate);
+			mark_write(write.soffset, predicate);
+			continue;
+		}
 		mark(write.index);
 		mark(write.offset);
 		mark(write.soffset);
@@ -1375,6 +1475,14 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 	}
 	plan.gpu_fill_slots = GpuFillSlots(plan);
+	plan.soft_record_buffers.assign(buffer_count, 0u);
+	for (uint32_t i = 0; i < buffer_count; ++i) {
+		const auto slot = SoftRecordsSlot(plan, i);
+		plan.soft_record_buffers[i] =
+		    slot != UINT32_MAX && slot < plan.gpu_fill_slots.size() && plan.gpu_fill_slots[slot] != 0u
+		        ? 1u
+		        : 0u;
+	}
 	return plan;
 }
 
@@ -1613,6 +1721,7 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 	};
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
+	std::vector<uint32_t> soft_buffers;
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
@@ -1629,6 +1738,26 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
 					        NormalizeIndirectStoreBuffer))
 						return false;
+				}
+			} else if (i < program.soft_record_buffers.size() && program.soft_record_buffers[i] != 0u &&
+			           (active.empty() || active[base.source])) {
+				bool soft = false;
+				if (!(capture_reads && base.written ? clean : walker)
+				         .EvaluateDescriptorSoftRecords(base.source, snapshot.buffers[i], soft)) {
+					return false;
+				}
+				// Also soft when the slot was filled on the GPU this refresh and dword 2 came
+				// from the walker's memo of that (zero) value rather than from a read.
+				const auto slot = SoftRecordsSlot(program, i);
+				if (!soft && slot != UINT32_MAX && runtime.gpu_fills != nullptr) {
+					const auto offset = program.srt_reads[slot].flat_offset;
+					soft = std::ranges::any_of(*runtime.gpu_fills, [&](const SrtGpuFill& fill) {
+						return fill.flat_offset == offset;
+					});
+				}
+				if (soft) {
+					snapshot.buffers[i].dwords[2] = 0xffffffffu;
+					soft_buffers.push_back(i);
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
 				return false;
@@ -1669,6 +1798,28 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		ComputeBufferWriteExtents(program, observed, walker, snapshot);
 		if (capture_reads) {
 			reads.resize(captured);
+		}
+	}
+	// Soft NumRecords: bind over what the dispatch can write (the shader bounds itself by the
+	// count it reads on the GPU), or 64 MB when the writes are not bounded.
+	for (const auto i: soft_buffers) {
+		ShaderBufferResource descriptor;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], descriptor)) {
+			continue;
+		}
+		const uint64_t stride = descriptor.Stride();
+		const auto&    extent = i < snapshot.buffer_write_extents.size()
+		                            ? snapshot.buffer_write_extents[i]
+		                            : decltype(snapshot.buffer_write_extents)::value_type {};
+		const uint64_t bytes  = extent.valid ? extent.end : (uint64_t {64} << 20u);
+		const uint64_t records =
+		    std::min<uint64_t>(stride != 0u ? (bytes + stride - 1u) / stride : bytes, 0xffffffffu);
+		snapshot.buffers[i].dwords[2] = static_cast<uint32_t>(records);
+		static std::atomic<uint32_t> logged = 0;
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Soft records: shader 0x%016" PRIx64 " buffer %u left to the GPU, bound to %" PRIu64
+			     " records (stride %" PRIu64 ", write extent %s)\n",
+			     program.shader_hash, i, records, stride, extent.valid ? "bounded" : "unbounded");
 		}
 	}
 	snapshot.images.resize(program.info.images.size());

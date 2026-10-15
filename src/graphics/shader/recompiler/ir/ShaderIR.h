@@ -654,6 +654,10 @@ struct ResourcePlan {
 	// Flat slots only the shader uses (GpuFillSlots): a raw read whose address comes from user data
 	// and immediates alone, which no host-evaluated value refers to.
 	std::vector<uint8_t>                gpu_fill_slots;
+	// Per buffer of info.buffers: its descriptor's NumRecords dword is a GPU-fillable slot that
+	// the host leaves to the GPU when the GPU wrote it (SoftRecordsAllowed). The host binds the
+	// buffer over the dispatch's bounded write extent instead, and the shader reads the count.
+	std::vector<uint8_t>                soft_record_buffers;
 	bool                                requires_specialization_memory = false;
 	bool                                capture_specialization_reads = false;
 	// The device supports bindless images: an indirect image the enumeration cannot cover

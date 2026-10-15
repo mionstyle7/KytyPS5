@@ -996,6 +996,12 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 }
 
 bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
+	if (m_soft_active && m_runtime.gpu_written != nullptr &&
+	    m_runtime.gpu_written(address, sizeof(uint32_t))) {
+		m_soft_hit = true;
+		result     = 0xffffffffu;
+		return true;
+	}
 	if (m_fill_active && m_runtime.gpu_written(address, sizeof(uint32_t))) {
 		// Only the shader uses this slot: the GPU copies the bytes into the flat buffer before
 		// the command (SrtGpuFill), where reading them here would wait for the GPU.
@@ -1183,6 +1189,46 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		default: break;
 	}
 	return false;
+}
+
+bool SrtWalker::EvaluateDescriptorSoftRecords(uint32_t source, DescriptorValue& result,
+                                              bool& soft) {
+	soft = false;
+	if (m_runtime.gpu_written == nullptr || source >= m_program.descriptor_sources.size() ||
+	    m_program.descriptor_sources[source].dword_count < 3u ||
+	    m_program.descriptor_sources[source].dword_count > result.dwords.size()) {
+		return EvaluateDescriptor(source, result);
+	}
+	// Through the interpreter, whose raw reads go through ReadRawWord (not the native tables).
+	const auto& descriptor = m_program.descriptor_sources[source];
+	result                 = {};
+	result.dword_count     = descriptor.dword_count;
+	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
+		// Dword 2 without the native code or a replay trace, whose reads would not see the soft
+		// mode: through the interpreter (or its memo), and ReadRawWord.
+		const auto* native = m_native;
+		auto*       trace  = m_trace;
+		if (index == 2u) {
+			m_soft_active = true;
+			m_soft_hit    = false;
+			m_native      = nullptr;
+			m_trace       = nullptr;
+		}
+		const bool ok = Evaluate(descriptor.dwords[index], result.dwords[index]);
+		if (index == 2u) {
+			m_native      = native;
+			m_trace       = trace;
+			m_soft_active = false;
+			if (ok && m_soft_hit) {
+				result.dwords[index] = 0xffffffffu;
+				soft                 = true;
+			}
+		}
+		if (!ok) {
+			return false;
+		}
+	}
+	return true;
 }
 
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {

@@ -187,6 +187,10 @@ public:
 
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
+	// EvaluateDescriptor for a buffer whose NumRecords dword (2) may be left to the GPU: when that
+	// dword's raw read hits GPU-written bytes it is not read (no wait for the GPU); the dword is
+	// 0xffffffff and `soft` is set. The caller bounds it (ResourcePlan::soft_record_buffers).
+	bool EvaluateDescriptorSoftRecords(uint32_t source, DescriptorValue& result, bool& soft);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
@@ -241,6 +245,10 @@ private:
 	// While a GPU-fillable slot is refreshed: its flat offset (its own read is the only raw read).
 	bool           m_fill_active  = false;
 	uint32_t       m_fill_offset  = 0;
+	// While a soft NumRecords dword is evaluated (EvaluateDescriptorSoftRecords): GPU-written raw
+	// reads are not made, and m_soft_hit records that one was skipped.
+	bool           m_soft_active  = false;
+	bool           m_soft_hit     = false;
 	const uint8_t* m_mapped_bytes = nullptr;
 	// The last raw read that failed, for RefreshFlatBuffer's report.
 	const char* m_read_failure         = nullptr;
