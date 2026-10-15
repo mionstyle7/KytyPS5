@@ -34,6 +34,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -230,6 +231,70 @@ void CountGpuOwnedSrtRead(uint64_t address, uint32_t bytes) {
 	}
 }
 
+// KYTY_SRT_DRAIN_LOG=1: every SRT read of bytes GPU work wrote (each downloads them and drains the
+// GPU), by shader and address: how long it waited and whether the value differs from last time.
+bool SrtDrainLogEnabled() {
+	static const bool enabled = std::getenv("KYTY_SRT_DRAIN_LOG") != nullptr;
+	return enabled;
+}
+
+bool TryReadBufferBackingLogged(uint64_t address, std::span<uint32_t> values) {
+	if (!SrtDrainLogEnabled() || t_srt_shader_hash == 0 ||
+	    !Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes())) {
+		return Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+		                                                     values.size_bytes());
+	}
+	const auto start = std::chrono::steady_clock::now();
+	const bool ok    = Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                                 values.size_bytes());
+	const double ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	struct Entry {
+		uint64_t    count   = 0;
+		uint64_t    changes = 0;
+		double      ms      = 0.0;
+		uint32_t    bytes   = 0;
+		std::string last;
+	};
+	static std::map<std::pair<uint64_t, uint64_t>, Entry> entries;
+	static uint64_t                                       events = 0;
+	std::string value;
+	char        word[12];
+	for (size_t i = 0; i < std::min<size_t>(values.size(), 8); i++) {
+		std::snprintf(word, sizeof(word), "%s%08x", i == 0 ? "" : " ", ok ? values[i] : 0u);
+		value += word;
+	}
+	auto& entry      = entries[{t_srt_shader_hash, address}];
+	const bool changed = entry.count != 0 && entry.last != value;
+	entry.count++;
+	entry.changes += changed ? 1 : 0;
+	entry.ms += ms;
+	entry.bytes = static_cast<uint32_t>(values.size_bytes());
+	entry.last  = value;
+	events++;
+	if (events <= 200) {
+		LOGF("SRT drain: hash=0x%016" PRIx64 " addr=0x%016" PRIx64 " bytes=%u %.2f ms %s [%s]\n",
+		     t_srt_shader_hash, address, entry.bytes, ms, changed ? "changed" : "same",
+		     value.c_str());
+	}
+	if (events % 500 == 0) {
+		std::vector<std::pair<const std::pair<uint64_t, uint64_t>, Entry>*> sorted;
+		for (auto& item: entries) {
+			sorted.push_back(&item);
+		}
+		std::sort(sorted.begin(), sorted.end(),
+		          [](const auto* a, const auto* b) { return a->second.ms > b->second.ms; });
+		LOGF("SRT drains: %" PRIu64 " reads, %zu sites\n", events, entries.size());
+		for (size_t i = 0; i < std::min<size_t>(sorted.size(), 16); i++) {
+			const auto& [key, e] = *sorted[i];
+			LOGF("\t hash=0x%016" PRIx64 " addr=0x%016" PRIx64 " bytes=%u count=%" PRIu64
+			     " changed=%" PRIu64 " total=%.1f ms last=[%s]\n",
+			     key.first, key.second, e.bytes, e.count, e.changes, e.ms, e.last.c_str());
+		}
+	}
+	return ok;
+}
+
 // Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
 // whatever address a descriptor chain produced, including 0 on a path the shader never takes.
@@ -244,8 +309,7 @@ bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32
 	// Bytes the GPU has not written are current in the backing store. Reading them there skips
 	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
 	// wrote: constants that share a page with GPU-written arguments cost a drain per dispatch.
-	if (Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
-	                                                    values.size_bytes())) {
+	if (TryReadBufferBackingLogged(address, values)) {
 		return true;
 	}
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
@@ -280,7 +344,7 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	    cache != nullptr && cache->Read(address, values)) {
 		return true;
 	}
-	if (Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes())) {
+	if (TryReadBufferBackingLogged(address, values)) {
 		return true;
 	}
 	// The bytes are mapped but GPU-owned. Reading them through the guest mapping takes the
