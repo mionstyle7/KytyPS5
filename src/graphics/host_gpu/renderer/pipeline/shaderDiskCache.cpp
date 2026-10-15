@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 2;
+constexpr uint32_t FormatVersion = 3;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -355,6 +355,7 @@ void VisitPlanFields(Io& io, T& v) {
 	io(v.buffer_writes);
 	io(v.clean_flat_slots);
 	io(v.gpu_fill_slots);
+	io(v.soft_record_buffers);
 	io(v.requires_specialization_memory);
 	io(v.capture_specialization_reads);
 	io(v.bindless_images);
@@ -392,7 +393,7 @@ static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 28);
 static_assert(sizeof(IR::ResourceSpecialization::Image) == 36);
 static_assert(sizeof(IR::ResourceSpecialization::Sampler) == 8);
 static_assert(sizeof(IR::ResourceSpecialization) == 72);
-static_assert(sizeof(IR::ResourcePlan) == 856);
+static_assert(sizeof(IR::ResourcePlan) == 880);
 #endif
 
 struct Writer {
