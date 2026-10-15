@@ -12,6 +12,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
@@ -148,16 +150,44 @@ bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
 	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
 }
 
-static bool CleanWriteEmulation() {
-	static const bool enabled = [] {
+// KYTY_CLEAN_WRITE_EMULATION: 0 (default) off; 1 stores to GPU-clean bytes of GPU-written
+// pages complete without a download; 2 also stores over GPU-written bytes, through the GPU thread.
+static int CleanWriteEmulationLevel() {
+	static const int level = [] {
 		const char* value = std::getenv("KYTY_CLEAN_WRITE_EMULATION");
-		const bool  on    = value != nullptr && value[0] == '1';
-		if (on) {
-			LOGF("Clean write emulation: enabled\n");
+		const int   result = value != nullptr && value[0] >= '1' && value[0] <= '2' ? value[0] - '0'
+		                                                                           : 0;
+		if (result != 0) {
+			LOGF("Clean write emulation: level %d\n", result);
 		}
-		return on;
+		return result;
 	}();
-	return enabled;
+	return level;
+}
+
+static bool CleanWriteEmulation() {
+	return CleanWriteEmulationLevel() != 0;
+}
+
+// Emulated stores per page and presented frame. An emulated store leaves its page protected, so a
+// guest loop filling a page store by store faulted on every store (a 32-byte table fill turned
+// the save load into a stall); past the limit the store takes the ordinary path, which brings the
+// page back once and lifts its protection. Approximate: pages that share a slot share a count.
+static bool TakeCleanWriteBudget(uint64_t page, uint64_t frame, uint32_t limit) {
+	struct Slot {
+		std::atomic<uint64_t> page {0};
+		std::atomic<uint64_t> frame {0};
+		std::atomic<uint32_t> count {0};
+	};
+	static std::array<Slot, 4096> slots;
+	auto&      slot = slots[(page >> 12u) * 0x9E3779B97F4A7C15ull >> 52u];
+	if (slot.page.load(std::memory_order_relaxed) != page ||
+	    slot.frame.load(std::memory_order_relaxed) != frame) {
+		slot.page.store(page, std::memory_order_relaxed);
+		slot.frame.store(frame, std::memory_order_relaxed);
+		slot.count.store(0, std::memory_order_relaxed);
+	}
+	return slot.count.fetch_add(1, std::memory_order_relaxed) < limit;
 }
 
 bool RenderContext::MayWriteClean(uint64_t fault_vaddr) const noexcept {
@@ -172,7 +202,11 @@ bool RenderContext::TryWriteClean(uint64_t fault_vaddr, uint64_t vaddr, const vo
 	    !IsMapped(vaddr, size) || !m_page_manager.IsReadWatched(fault_vaddr)) {
 		return false;
 	}
+	const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	if (!m_buffer_cache.CanWriteCleanConcurrently(vaddr, size)) {
+		if (CleanWriteEmulationLevel() < 2 || !TakeCleanWriteBudget(page, frame, 4)) {
+			return false;
+		}
 		// A store over bytes the GPU wrote: the guest does not need their old value, only the
 		// order. WriteClean on the GPU thread writes both copies after the GPU's earlier writes
 		// and drops the bytes from the download; the faulting thread waits for the GPU thread,
@@ -183,6 +217,9 @@ bool RenderContext::TryWriteClean(uint64_t fault_vaddr, uint64_t vaddr, const vo
 		m_texture_cache.InvalidateMemory(vaddr, size);
 		m_bindless_table.OnCpuWrite(vaddr, size);
 		return m_buffer_cache.WriteCleanSync(vaddr, data, size);
+	}
+	if (!TakeCleanWriteBudget(page, frame, 16)) {
+		return false;
 	}
 	// As HandleFault does for a write, and before the bytes land, as there: images and bindless
 	// heaps in these bytes see the write, after anything they bring back from the GPU.
