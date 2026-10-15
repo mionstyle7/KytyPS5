@@ -180,14 +180,19 @@ const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	return &program.descriptor_sources[source];
 }
 
+// skip_dword2: a soft NumRecords dword (SoftRecordsSlots) is left out.
 void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* source,
-                        std::span<uint8_t> slots, Value extra = {}) {
+                        std::span<uint8_t> slots, Value extra = {}, bool skip_dword2 = false) {
 	if (source == nullptr && extra.IsEmpty()) {
 		return;
 	}
 	std::vector<Value>       pending;
 	if (source != nullptr) {
-		pending.assign(source->dwords.begin(), source->dwords.begin() + source->dword_count);
+		for (uint32_t dword = 0; dword < source->dword_count; dword++) {
+			if (!(skip_dword2 && dword == 2u)) {
+				pending.push_back(source->dwords[dword]);
+			}
+		}
 	}
 	if (!extra.IsEmpty()) pending.push_back(extra);
 	std::vector<const Inst*> visited;
@@ -1095,29 +1100,46 @@ static bool SoftRecordsAllowed(uint64_t shader_hash) {
 	return list.first || list.second.contains(shader_hash);
 }
 
-// The flat slot a buffer's NumRecords dword reads directly, when the shader is allowed to leave
-// it to the GPU; UINT32_MAX otherwise.
-static uint32_t SoftRecordsSlot(const ResourcePlan& plan, uint32_t buffer) {
+// The flat slots a buffer's NumRecords dword is computed from (the count itself, or a sum or
+// other expression over counts), when the shader may leave it to the GPU; empty otherwise.
+static std::vector<uint32_t> SoftRecordsSlots(const ResourcePlan& plan, uint32_t buffer) {
+	std::vector<uint32_t> slots;
 	if (!SoftRecordsAllowed(plan.shader_hash) || buffer >= plan.info.buffers.size()) {
-		return UINT32_MAX;
+		return slots;
 	}
 	const auto source = plan.info.buffers[buffer].source;
 	if (source >= plan.descriptor_sources.size()) {
-		return UINT32_MAX;
+		return slots;
 	}
 	const auto& descriptor = plan.descriptor_sources[source];
 	if (descriptor.indirect_descriptor.has_value() || descriptor.dword_count < 3u) {
-		return UINT32_MAX;
+		return slots;
 	}
-	const auto* inst = descriptor.dwords[2].Resolve().TryInstruction();
-	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::ReadConst) {
-		return UINT32_MAX;
+	std::vector<Value>              pending {descriptor.dwords[2]};
+	std::unordered_set<const Inst*> visited;
+	while (!pending.empty()) {
+		const auto value = pending.back().Resolve();
+		pending.pop_back();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || !visited.insert(inst).second) {
+			continue;
+		}
+		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+			    slot.U32() < plan.srt_reads.size()) {
+				if (std::ranges::find(slots, slot.U32()) == slots.end()) {
+					slots.push_back(slot.U32());
+				}
+				pending.push_back(plan.srt_reads[slot.U32()].value);
+			}
+			continue;
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			pending.push_back(inst->Arg(arg));
+		}
 	}
-	const auto slot = inst->Arg(1).Resolve();
-	if (!slot.IsImmediate() || slot.GetType() != Type::U32 || slot.U32() >= plan.srt_reads.size()) {
-		return UINT32_MAX;
-	}
-	return slot.U32();
+	return slots;
 }
 
 // Flat slots the host never needs, so their bytes can be left to the GPU when it wrote them
@@ -1152,10 +1174,10 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 			}
 		}
 	};
-	// NumRecords dwords the host may leave to the GPU (SoftRecordsSlot) are not host uses.
+	// NumRecords dwords the host may leave to the GPU (SoftRecordsSlots) are not host uses.
 	std::unordered_set<uint32_t> soft_sources;
 	for (uint32_t buffer = 0; buffer < plan.info.buffers.size(); buffer++) {
-		if (SoftRecordsSlot(plan, buffer) != UINT32_MAX) {
+		if (!SoftRecordsSlots(plan, buffer).empty()) {
 			soft_sources.insert(plan.info.buffers[buffer].source);
 		}
 	}
@@ -1173,8 +1195,12 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 			mark(source.indirect_descriptor->selector_mask);
 		}
 	}
-	for (const auto& block: plan.control_flow) {
-		mark(block.condition);
+	// For the soft-record shaders a block condition is not a host use either: when a slot it reads
+	// is left to the GPU, the walk takes both successors (SrtWalker::RefreshFlatBuffer).
+	if (!SoftRecordsAllowed(plan.shader_hash)) {
+		for (const auto& block: plan.control_flow) {
+			mark(block.condition);
+		}
 	}
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		mark(plan.uniform_fill.values[i]);
@@ -1276,6 +1302,81 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 		fill[slot] = memory_free(*inst) ? 1u : 0u;
 	}
 	return fill;
+}
+
+// The flat slots a value reads (ReadConst), through the reads' own address operands.
+static void CollectSlots(const ResourcePlan& plan, Value root, std::vector<uint32_t>& slots) {
+	std::vector<Value>              pending {root};
+	std::unordered_set<const Inst*> visited;
+	while (!pending.empty()) {
+		const auto value = pending.back().Resolve();
+		pending.pop_back();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || !visited.insert(inst).second) {
+			continue;
+		}
+		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+			    slot.U32() < plan.srt_reads.size()) {
+				if (std::ranges::find(slots, slot.U32()) == slots.end()) {
+					slots.push_back(slot.U32());
+				}
+				pending.push_back(plan.srt_reads[slot.U32()].value);
+			}
+			continue;
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			pending.push_back(inst->Arg(arg));
+		}
+	}
+}
+
+// For the soft-record shaders: which slots the NumRecords dwords and block conditions read, and
+// whether each can be left to the GPU (fill) or is read on the host (clean: specialization reader;
+// host: another host use). A slot that is not "fill" still drains the GPU when the GPU wrote it.
+static void LogSoftPlan(const ResourcePlan& plan) {
+	if (!SoftRecordsAllowed(plan.shader_hash)) {
+		return;
+	}
+	std::vector<uint32_t> record_slots;
+	std::string           buffers;
+	for (uint32_t i = 0; i < plan.info.buffers.size(); i++) {
+		const auto slots = SoftRecordsSlots(plan, i);
+		for (const auto slot: slots) {
+			if (std::ranges::find(record_slots, slot) == record_slots.end()) {
+				record_slots.push_back(slot);
+			}
+		}
+		if (!slots.empty()) {
+			buffers += fmt::format(" {}{}", i, plan.soft_record_buffers[i] != 0u ? "" : "(no)");
+		}
+	}
+	std::vector<uint32_t> condition_slots;
+	for (const auto& block: plan.control_flow) {
+		if (!block.condition.IsEmpty()) {
+			CollectSlots(plan, block.condition, condition_slots);
+		}
+	}
+	if (record_slots.empty() && condition_slots.empty()) {
+		return;
+	}
+	const auto describe = [&](const std::vector<uint32_t>& slots) {
+		std::string text;
+		for (const auto slot: slots) {
+			const bool fill  = slot < plan.gpu_fill_slots.size() && plan.gpu_fill_slots[slot] != 0u;
+			const bool clean = slot < plan.clean_flat_slots.size() && plan.clean_flat_slots[slot] != 0u;
+			text += fmt::format(" {}@{}:{}", slot, plan.srt_reads[slot].flat_offset * 4u,
+			                    fill ? "fill" : clean ? "clean" : "host");
+		}
+		return text;
+	};
+	static std::atomic<uint32_t> logged = 0;
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 256) {
+		LOGF("Soft plan: shader 0x%016" PRIx64 " soft buffers:%s; record slots:%s; condition slots:%s\n",
+		     plan.shader_hash, buffers.empty() ? " none" : buffers.c_str(),
+		     describe(record_slots).c_str(), describe(condition_slots).c_str());
+	}
 }
 
 ResourcePlan ExtractResourcePlan(const Program& program) {
@@ -1417,8 +1518,14 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.capture_specialization_reads |= capture_indirect_reads || !plan.control_flow.empty();
 	if (plan.capture_specialization_reads) {
 		// Clean writable addresses prove that shader writes cannot overlap captured reads.
-		for (const auto& buffer: plan.info.buffers) {
-			if (buffer.written) MarkCleanFlatSlots(plan, Source(plan, buffer.source), plan.clean_flat_slots);
+		// A soft NumRecords dword is not read on the host when the GPU wrote it (the write extent
+		// bounds the buffer instead), so it is not marked.
+		for (uint32_t i = 0; i < plan.info.buffers.size(); i++) {
+			const auto& buffer = plan.info.buffers[i];
+			if (buffer.written) {
+				MarkCleanFlatSlots(plan, Source(plan, buffer.source), plan.clean_flat_slots, {},
+				                   !SoftRecordsSlots(plan, i).empty());
+			}
 		}
 		for (const auto& image: plan.info.images) {
 			if (image.written) MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
@@ -1479,12 +1586,13 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.gpu_fill_slots = GpuFillSlots(plan);
 	plan.soft_record_buffers.assign(buffer_count, 0u);
 	for (uint32_t i = 0; i < buffer_count; ++i) {
-		const auto slot = SoftRecordsSlot(plan, i);
-		plan.soft_record_buffers[i] =
-		    slot != UINT32_MAX && slot < plan.gpu_fill_slots.size() && plan.gpu_fill_slots[slot] != 0u
-		        ? 1u
-		        : 0u;
+		for (const auto slot: SoftRecordsSlots(plan, i)) {
+			if (slot < plan.gpu_fill_slots.size() && plan.gpu_fill_slots[slot] != 0u) {
+				plan.soft_record_buffers[i] = 1u;
+			}
+		}
 	}
+	LogSoftPlan(plan);
 	return plan;
 }
 
@@ -1750,12 +1858,13 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 				}
 				// Also soft when the slot was filled on the GPU this refresh and dword 2 came
 				// from the walker's memo of that (zero) value rather than from a read.
-				const auto slot = SoftRecordsSlot(program, i);
-				if (!soft && slot != UINT32_MAX && runtime.gpu_fills != nullptr) {
-					const auto offset = program.srt_reads[slot].flat_offset;
-					soft = std::ranges::any_of(*runtime.gpu_fills, [&](const SrtGpuFill& fill) {
-						return fill.flat_offset == offset;
-					});
+				if (!soft && runtime.gpu_fills != nullptr && !runtime.gpu_fills->empty()) {
+					for (const auto slot: SoftRecordsSlots(program, i)) {
+						const auto offset = program.srt_reads[slot].flat_offset;
+						soft |= std::ranges::any_of(*runtime.gpu_fills, [&](const SrtGpuFill& fill) {
+							return fill.flat_offset == offset;
+						});
+					}
 				}
 				if (soft) {
 					snapshot.buffers[i].dwords[2] = 0xffffffffu;

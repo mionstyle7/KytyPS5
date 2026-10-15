@@ -697,6 +697,10 @@ struct ResourcePlan {
 	mutable uint32_t                  srt_trace_uses    = 0;
 	mutable uint32_t                  srt_trace_misses  = 0;
 	mutable uint32_t                  srt_trace_backoff = 0;
+	// Per control_flow block: the GPU-fillable slots its condition reads (built on first use by
+	// SrtWalker::RefreshFlatBuffer). When one was left to the GPU, the condition is not known.
+	mutable bool                                    condition_fill_built = false;
+	mutable std::vector<std::vector<uint32_t>>      condition_fill_slots;
 };
 
 struct Program: ResourcePlan {

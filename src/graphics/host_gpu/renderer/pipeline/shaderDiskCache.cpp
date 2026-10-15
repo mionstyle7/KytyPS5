@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 3;
+constexpr uint32_t FormatVersion = 4;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -393,7 +393,8 @@ static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 28);
 static_assert(sizeof(IR::ResourceSpecialization::Image) == 36);
 static_assert(sizeof(IR::ResourceSpecialization::Sampler) == 8);
 static_assert(sizeof(IR::ResourceSpecialization) == 72);
-static_assert(sizeof(IR::ResourcePlan) == 880);
+// condition_fill_built and condition_fill_slots are runtime caches, not serialized.
+static_assert(sizeof(IR::ResourcePlan) == 880 + sizeof(std::vector<std::vector<uint32_t>>));
 #endif
 
 struct Writer {

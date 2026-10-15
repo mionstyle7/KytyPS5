@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
@@ -1259,6 +1260,8 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
+	// Slots left to the GPU in this refresh (SrtGpuFill), for the block conditions that read them.
+	std::vector<uint8_t> filled;
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
@@ -1272,10 +1275,15 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		    m_runtime.gpu_written != nullptr && m_runtime.gpu_fills != nullptr) {
 			// Through the interpreter or a replay (both read through ReadRawWord), not the native
 			// tables: ReadRawWord leaves GPU-written bytes to the GPU.
-			m_fill_active = true;
-			m_fill_offset = read.flat_offset;
-			const bool ok = Evaluate(read.value, flat[read.flat_offset]);
-			m_fill_active = false;
+			m_fill_active    = true;
+			m_fill_offset    = read.flat_offset;
+			const auto fills = m_runtime.gpu_fills->size();
+			const bool ok    = Evaluate(read.value, flat[read.flat_offset]);
+			m_fill_active    = false;
+			if (m_runtime.gpu_fills->size() != fills) {
+				filled.resize(m_program.srt_reads.size());
+				filled[slot] = 1u;
+			}
 			return ok;
 		}
 		if (evaluator.UseNativeTables()) {
@@ -1295,11 +1303,68 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		return true;
 	}
+	// The GPU-fillable slots each block condition reads (only the soft-record shaders have any:
+	// for the others a condition is a host use, so its slots are never GPU-fillable).
+	if (!m_program.condition_fill_built) {
+		m_program.condition_fill_built = true;
+		m_program.condition_fill_slots.clear();
+		bool any = false;
+		std::vector<std::vector<uint32_t>> lists(m_program.control_flow.size());
+		for (size_t index = 0; index < m_program.control_flow.size(); index++) {
+			const auto& condition = m_program.control_flow[index].condition;
+			if (condition.IsEmpty()) continue;
+			std::vector<Value>              pending {condition};
+			std::unordered_set<const Inst*> visited;
+			while (!pending.empty()) {
+				const auto  value = pending.back().Resolve();
+				pending.pop_back();
+				const auto* inst  = value.TryInstruction();
+				if (inst == nullptr || !visited.insert(inst).second) continue;
+				if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+					const auto slot = inst->Arg(1).Resolve();
+					if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+					    slot.U32() < m_program.srt_reads.size()) {
+						if (slot.U32() < m_program.gpu_fill_slots.size() &&
+						    m_program.gpu_fill_slots[slot.U32()] != 0u) {
+							lists[index].push_back(slot.U32());
+							any = true;
+						}
+						pending.push_back(m_program.srt_reads[slot.U32()].value);
+					}
+					continue;
+				}
+				for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+					pending.push_back(inst->Arg(arg));
+				}
+			}
+		}
+		if (any) {
+			m_program.condition_fill_slots = std::move(lists);
+		}
+	}
 	// 0 false, 1 true, 2 not known (no condition, no reader, or it could not be evaluated).
 	auto&      predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 	const auto outcome   = [&](uint32_t index, const ResourceBlock& block) -> uint8_t {
 		if (block.condition.IsEmpty() || m_runtime.read_specialization_memory == nullptr) {
 			return 2u;
+		}
+		// A condition over a slot the GPU fills is not known on the host: reading the slot would
+		// wait for the GPU. Its slots are refreshed first (each once per refresh, memoized).
+		if (index < m_program.condition_fill_slots.size()) {
+			bool unknown = false;
+			for (const auto slot: m_program.condition_fill_slots[index]) {
+				if (!refresh(slot)) return 2u;
+				unknown |= slot < filled.size() && filled[slot] != 0u;
+			}
+			if (unknown) {
+				static std::atomic<uint64_t> count = 0;
+				if (const auto n = count.fetch_add(1, std::memory_order_relaxed); n % 1024u == 0u) {
+					LOGF("Soft conditions: %" PRIu64 " block conditions over GPU-filled slots taken "
+					     "both ways (shader 0x%016" PRIx64 ")\n",
+					     n + 1u, m_program.shader_hash);
+				}
+				return 2u;
+			}
 		}
 		uint32_t condition = 0;
 		bool     known     = false;
