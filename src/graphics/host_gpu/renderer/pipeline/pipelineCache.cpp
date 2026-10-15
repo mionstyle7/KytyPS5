@@ -611,7 +611,21 @@ struct PendingGraphicsPipeline {
 	vk::Pipeline                           pipeline     = nullptr;
 	vk::Result                             result       = vk::Result::eSuccess;
 	std::atomic<bool>                      done {false};
+	// Set for a fast-first upgrade (graphics or compute): compiles the optimized pipeline. Unset,
+	// the job compiles `build`.
+	std::function<vk::Result(vk::Pipeline*)> create;
 };
+
+// KYTY_PIPELINE_FAST_FIRST (default on; =0 off): a pipeline the driver cache does not hold is
+// built at once without driver optimization (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT, ~150x
+// faster on NVIDIA per the Demon's Souls fork, whose cold stalls went from 22 s to none), used
+// right away, and replaced by the optimized one a worker compiles. Before, a new compute pipeline
+// compiled on the GPU thread (seconds for the large ones) and a new graphics pipeline's draws were
+// skipped until a worker had compiled it.
+static const bool g_fast_first_pipelines = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_FAST_FIRST");
+	return value == nullptr || value[0] != '0';
+}();
 
 // Counts a finished pipeline build and puts it on the timeline (slow ones as a warning).
 static void ReportPipelineBuilt(Profiler::Counter counter, const char* kind, uint64_t first_hash,
@@ -702,8 +716,9 @@ private:
 				zone.SetText("VS 0x%016" PRIx64 " PS 0x%016" PRIx64, job->vs_hash, job->ps_hash);
 				KYTY_PROFILER_PHASE(zone, "PipelineCompiler::Compile", profiler::colors::DeepOrangeA200);
 				const auto begin = std::chrono::steady_clock::now();
-				job->result =
-				    CreateGraphicsPipeline(*job->build, job->driver_cache, &job->pipeline);
+				job->result = job->create ? job->create(&job->pipeline)
+				                          : CreateGraphicsPipeline(*job->build, job->driver_cache,
+				                                                   &job->pipeline);
 				ReportGraphicsPipelineBuilt(job->vs_hash, job->ps_hash, begin);
 				Profiler::Add(Profiler::Counter::PipelinesPending, -1);
 			}
@@ -2088,6 +2103,9 @@ PipelineCache::~PipelineCache() {
 			if (pipeline->pending && pipeline->pending->done.load(std::memory_order_acquire)) {
 				m_graphics.device.destroyPipeline(pipeline->pending->pipeline, nullptr);
 			}
+			if (pipeline->upgrade && pipeline->upgrade->done.load(std::memory_order_acquire)) {
+				m_graphics.device.destroyPipeline(pipeline->upgrade->pipeline, nullptr);
+			}
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
@@ -2095,6 +2113,10 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	for (const auto& [retired, frame]: m_retired_pipelines) {
+		(void)frame;
+		m_graphics.device.destroyPipeline(retired, nullptr);
+	}
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -2540,13 +2562,77 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 			return false;
 		}
 		// The workers stopped before this job started: compile it here.
-		job.result = CreateGraphicsPipeline(*job.build, m_driver_cache, &job.pipeline);
+		job.result = job.create ? job.create(&job.pipeline)
+		                        : CreateGraphicsPipeline(*job.build, m_driver_cache, &job.pipeline);
 		Profiler::Add(Profiler::Counter::PipelinesPending, -1);
 		job.done.store(true, std::memory_order_release);
 	}
 	EXIT_NOT_IMPLEMENTED(job.result != vk::Result::eSuccess || job.pipeline == nullptr);
 	pipeline.pipeline = job.pipeline;
 	pipeline.pending.reset();
+	return true;
+}
+
+void PipelineCache::ApplyUpgrade(Pipeline& pipeline) {
+	const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	// Recorded work may still bind a replaced pipeline for a few frames (recording thread, frames
+	// in flight); 16 presented frames later none can.
+	while (!m_retired_pipelines.empty() && m_retired_pipelines.front().second + 16u < frame) {
+		m_graphics.device.destroyPipeline(m_retired_pipelines.front().first, nullptr);
+		m_retired_pipelines.erase(m_retired_pipelines.begin());
+	}
+	auto& job = *pipeline.upgrade;
+	if (!job.done.load(std::memory_order_acquire)) {
+		return;
+	}
+	if (job.result == vk::Result::eSuccess && job.pipeline != nullptr) {
+		m_retired_pipelines.emplace_back(pipeline.pipeline, frame);
+		pipeline.pipeline = job.pipeline;
+		static uint64_t upgraded = 0;
+		if (++upgraded % 64u == 1u) {
+			LOGF("Fast-first pipelines: %" PRIu64 " replaced by their optimized build\n", upgraded);
+		}
+	}
+	pipeline.upgrade.reset();
+}
+
+bool PipelineCache::BuildFastFirst(
+    Pipeline& pipeline, uint64_t first_hash, uint64_t second_hash,
+    std::function<vk::Result(vk::PipelineCreateFlags, vk::Pipeline*)> create) {
+	if (m_compiler == nullptr || m_compiler->Stopped()) {
+		return false;
+	}
+	static uint64_t cache_hits = 0;
+	static uint64_t fast_builds = 0;
+	if (m_graphics.pipeline_cache_control_enabled) {
+		// Already compiled (driver cache): the optimized pipeline at once, no second build.
+		vk::Pipeline cached = nullptr;
+		const auto   result =
+		    create(vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired, &cached);
+		if (result == vk::Result::eSuccess && cached != nullptr) {
+			pipeline.pipeline = cached;
+			cache_hits++;
+			return true;
+		}
+		EXIT_IF(result != vk::Result::ePipelineCompileRequired && result != vk::Result::eSuccess);
+	}
+	vk::Pipeline fast   = nullptr;
+	const auto   result = create(vk::PipelineCreateFlagBits::eDisableOptimization, &fast);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || fast == nullptr);
+	pipeline.pipeline = fast;
+	auto job          = std::make_shared<PendingGraphicsPipeline>();
+	job->vs_hash      = first_hash;
+	job->ps_hash      = second_hash;
+	job->driver_cache = m_driver_cache;
+	job->create       = [create = std::move(create)](vk::Pipeline* out) { return create({}, out); };
+	pipeline.upgrade  = job;
+	Profiler::Add(Profiler::Counter::PipelinesPending);
+	m_compiler->Submit(std::move(job));
+	if (++fast_builds % 64u == 1u) {
+		LOGF("Fast-first pipelines: %" PRIu64 " built unoptimized while the optimized one compiles, "
+		     "%" PRIu64 " found compiled in the driver cache\n",
+		     fast_builds, cache_hits);
+	}
 	return true;
 }
 
@@ -2754,6 +2840,9 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		if (found.pending && !FinishPending(found)) {
 			return defer();
 		}
+		if (found.upgrade) {
+			ApplyUpgrade(found);
+		}
 		return &found;
 	}
 
@@ -2780,6 +2869,32 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	// Stencil does not count: UI libraries clip their panels with stencil masks.
 	const bool layer_draw = !depth.depth_test_enable && !depth.depth_write_enable &&
 	                        vertex_words <= g_pipeline_sync_ui_vs_words;
+	if (g_fast_first_pipelines) {
+		std::shared_ptr<GraphicsPipelineBuild> shared_build = std::move(build);
+		const auto base_flags   = shared_build->pipeline_info.flags;
+		const auto driver_cache = m_driver_cache;
+		const auto vs_hash      = vs_input_info.stage.program->shader_hash;
+		const auto ps_hash      = ps_active ? ps_input_info->stage.program->shader_hash : 0;
+		const auto build_begin  = std::chrono::steady_clock::now();
+		if (BuildFastFirst(*cached, vs_hash, ps_hash,
+		                   [shared_build, base_flags, driver_cache](vk::PipelineCreateFlags flags,
+		                                                            vk::Pipeline* out) {
+			                   shared_build->pipeline_info.flags = base_flags | flags;
+			                   return CreateGraphicsPipeline(*shared_build, driver_cache, out);
+		                   })) {
+			ReportGraphicsPipelineBuilt(vs_hash, ps_hash, build_begin);
+			LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+			EXIT_IF(!inserted);
+			return iter->second.get();
+		}
+		// The workers are stopped: compile it here, as before.
+		const auto result = CreateGraphicsPipeline(*shared_build, m_driver_cache, &cached->pipeline);
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || cached->pipeline == nullptr);
+		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+		EXIT_IF(!inserted);
+		return iter->second.get();
+	}
 	if (may_defer && spirv_words > g_pipeline_sync_words && !layer_draw && m_compiler != nullptr &&
 	    !m_compiler->Stopped()) {
 		// A pipeline the driver has cached finishes within the wait; a new one is compiled in
@@ -2827,6 +2942,9 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
+		if (iter->second->upgrade) {
+			ApplyUpgrade(*iter->second);
+		}
 		return *iter->second;
 	}
 
@@ -2841,7 +2959,31 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		zone.SetText("CS 0x%016" PRIx64, hash);
 		KYTY_PROFILER_PHASE(zone, "Compute pipeline build", profiler::colors::RedA100);
 		const auto begin = std::chrono::steady_clock::now();
-		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+		bool       fast  = false;
+		if (g_fast_first_pipelines) {
+			CreateComputePipelineLayout(m_graphics, *cached, input_info);
+			auto&      graphics     = m_graphics;
+			const auto layout       = cached->pipeline_layout;
+			const auto wave_size    = input_info.stage.program->wave_size;
+			const auto module       = compute_program.module;
+			const auto driver_cache = m_driver_cache;
+			fast = BuildFastFirst(*cached, hash, 0,
+			                      [&graphics, layout, wave_size, hash, module,
+			                       driver_cache](vk::PipelineCreateFlags flags, vk::Pipeline* out) {
+				                      return CreateComputePipelineHandle(graphics, layout, wave_size,
+				                                                         hash, module, driver_cache,
+				                                                         flags, out);
+			                      });
+			if (!fast) {
+				const auto result = CreateComputePipelineHandle(
+				    m_graphics, layout, wave_size, hash, module, m_driver_cache, {},
+				    &cached->pipeline);
+				EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+			}
+		} else {
+			CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+			                       m_driver_cache);
+		}
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
 	}
 

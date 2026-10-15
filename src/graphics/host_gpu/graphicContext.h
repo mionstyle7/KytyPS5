@@ -60,6 +60,9 @@ struct GraphicContext {
 	bool                               device_fault_enabled                  = false;
 	bool                               shader_device_clock_enabled           = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	// pipelineCreationCacheControl: a pipeline build can ask the driver to fail instead of compiling
+	// (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT), to tell a driver cache hit apart.
+	bool                               pipeline_cache_control_enabled        = false;
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
 	bool                               subgroup_size_control_enabled         = false;
 	bool                               sample_rate_shading_enabled           = false;

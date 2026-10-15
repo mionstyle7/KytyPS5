@@ -91,6 +91,9 @@ public:
 	void EnableRecordingThread();
 	// The current command buffer's commands go through the recording thread.
 	[[nodiscard]] bool Threaded() const noexcept { return m_threaded; }
+	// Commands recorded so far (threaded), raw command-buffer uses included: unchanged between two
+	// points means no command was recorded in between.
+	[[nodiscard]] uint64_t RecordedCommands() const noexcept { return m_recorded_commands; }
 	// Queues fn(vk::CommandBuffer) for the recording thread (threaded only). Captures must be
 	// values; arrays go through Stash().
 	template <typename F>
@@ -98,6 +101,7 @@ public:
 		using Command = TypedCommand<std::decay_t<F>>;
 		void* memory  = Allocate(sizeof(Command), alignof(Command));
 		auto* command = new (memory) Command(std::forward<F>(fn));
+		m_recorded_commands++;
 		if (m_chunk->last != nullptr) {
 			m_chunk->last->next = command;
 		} else {
@@ -231,6 +235,7 @@ private:
 	// free list and counters to m_record_mutex; m_worker_buffer to the recording thread (read by
 	// the producer only after a drain).
 	bool                                m_threaded = false;
+	uint64_t                            m_recorded_commands = 0;
 	std::unique_ptr<Chunk>              m_chunk;
 	std::mutex                          m_record_mutex;
 	std::condition_variable_any         m_record_available;

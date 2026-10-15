@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <type_traits>
@@ -175,6 +176,9 @@ public:
 		bool                    uses_bindless         = false;
 		// Set while a worker compiles `pipeline`; draws skip it until the compile finishes.
 		std::shared_ptr<PendingGraphicsPipeline> pending;
+		// Fast-first pipelines (KYTY_PIPELINE_FAST_FIRST): `pipeline` was built without driver
+		// optimization; a worker compiles the optimized one, which replaces it when done.
+		std::shared_ptr<PendingGraphicsPipeline> upgrade;
 	};
 
 	struct GraphicsPrograms {
@@ -276,6 +280,15 @@ private:
 	void InitializeDriverCache();
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
+	// Fast-first pipelines: swaps in a finished optimized build; destroys replaced pipelines once
+	// no recorded work can still use them.
+	void ApplyUpgrade(Pipeline& pipeline);
+	// Builds `pipeline` without optimization (unless the driver cache already holds it optimized)
+	// and queues the optimized build. `create` compiles with the flags given. False when the
+	// fast-first path is off.
+	bool BuildFastFirst(Pipeline& pipeline, uint64_t first_hash, uint64_t second_hash,
+	                    std::function<vk::Result(vk::PipelineCreateFlags, vk::Pipeline*)> create);
+	std::vector<std::pair<vk::Pipeline, uint64_t>> m_retired_pipelines;
 };
 
 // KYTY_DYNAMIC_RASTER_STATE (default on): cull mode and front face (and, except on macOS, the
@@ -311,6 +324,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+// The compute pipeline's descriptor and pipeline layouts (CreatePipelineInternal's first half).
+void CreateComputePipelineLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ShaderComputeInputInfo& input_info);
+// Any thread. Compiles a compute pipeline over a layout; flags add to the create info's.
+vk::Result CreateComputePipelineHandle(GraphicContext& graphics, vk::PipelineLayout layout,
+                                       uint32_t wave_size, uint64_t shader_hash,
+                                       vk::ShaderModule compute_module,
+                                       vk::PipelineCache driver_cache, vk::PipelineCreateFlags flags,
+                                       vk::Pipeline* pipeline);
 
 } // namespace Libs::Graphics
 

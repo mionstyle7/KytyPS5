@@ -701,25 +701,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
-	EXIT_IF(compute_module == nullptr);
-
-	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
-	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
-	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
-	comp_shader_stage_info.module = compute_module;
-	comp_shader_stage_info.pName  = "main";
+void CreateComputePipelineLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 const ShaderComputeInputInfo& input_info) {
 	EXIT_IF(!input_info.stage);
-	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
-		comp_shader_stage_info.pNext            = &comp_subgroup_size;
-	}
-
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 	                  vk::ShaderStageFlagBits::eCompute);
@@ -741,42 +725,65 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
 	     1u);
-	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                  &pipeline.pipeline_layout);
+	const auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+	                                                        &pipeline.pipeline_layout);
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+}
 
+vk::Result CreateComputePipelineHandle(GraphicContext& graphics, vk::PipelineLayout layout,
+                                       uint32_t wave_size, uint64_t shader_hash,
+                                       vk::ShaderModule compute_module,
+                                       vk::PipelineCache driver_cache, vk::PipelineCreateFlags flags,
+                                       vk::Pipeline* pipeline) {
+	EXIT_IF(compute_module == nullptr || layout == nullptr);
+	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
+	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
+	comp_shader_stage_info.module = compute_module;
+	comp_shader_stage_info.pName  = "main";
+	if (graphics.compute_subgroup_size_control_enabled &&
+	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+		comp_subgroup_size.requiredSubgroupSize = wave_size;
+		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+	}
 	vk::ComputePipelineCreateInfo info {};
 	info.stage             = comp_shader_stage_info;
-	info.layout            = pipeline.pipeline_layout;
+	info.layout            = layout;
 	info.basePipelineIndex = -1;
-	if (DisableOptimizationFor(input_info.stage.program->shader_hash)) {
+	info.flags             = flags;
+	if (DisableOptimizationFor(shader_hash)) {
 		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 		LOGF("PipelineTrace: compute shader 0x%016" PRIx64 " built without optimization\n",
-		     input_info.stage.program->shader_hash);
+		     shader_hash);
 	}
-
-	EXIT_IF(pipeline.pipeline != nullptr);
-
-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
-	     static_cast<void*>(pipeline.pipeline_layout));
+	*pipeline               = nullptr;
 	const auto create_begin = std::chrono::steady_clock::now();
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	const auto result =
+	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, pipeline);
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - create_begin)
 	                               .count();
 	    create_ms >= 500) {
-		LOGF("PipelineTrace: slow compute pipeline CS=0x%016" PRIx64 " ms=%lld\n",
-		     input_info.stage.program->shader_hash, static_cast<long long>(create_ms));
+		LOGF("PipelineTrace: slow compute pipeline CS=0x%016" PRIx64 " ms=%lld%s\n", shader_hash,
+		     static_cast<long long>(create_ms),
+		     (flags & vk::PipelineCreateFlagBits::eDisableOptimization) ? " (unoptimized)" : "");
 	}
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	return result;
+}
 
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const ShaderComputeInputInfo& input_info,
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+	EXIT_IF(compute_module == nullptr);
+	CreateComputePipelineLayout(graphics, pipeline, input_info);
+	EXIT_IF(pipeline.pipeline != nullptr);
+	const auto result = CreateComputePipelineHandle(
+	    graphics, pipeline.pipeline_layout, input_info.stage.program->wave_size,
+	    input_info.stage.program->shader_hash, compute_module, driver_cache, {}, &pipeline.pipeline);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 }
 

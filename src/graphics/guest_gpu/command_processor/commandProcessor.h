@@ -192,6 +192,10 @@ private:
 	uint64_t m_num_instances_args = 0;
 	[[nodiscard]] uint32_t NumInstances();
 
+	// The last global barrier (EmitGlobalBarrier): tick and recorded-command count right after it.
+	uint64_t m_last_barrier_tick     = 0;
+	uint64_t m_last_barrier_commands = UINT64_MAX;
+
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;
 	bool     m_ce_complete = false;

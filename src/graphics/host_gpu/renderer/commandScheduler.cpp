@@ -662,6 +662,8 @@ void CommandScheduler::DispatchChunk() {
 }
 
 vk::CommandBuffer CommandScheduler::DrainRecording() {
+	// A raw use records commands the counter cannot see.
+	m_recorded_commands++;
 	if (!m_threaded) {
 		return m_command.m_buffer;
 	}

@@ -1650,8 +1650,28 @@ void CommandProcessor::EmitGlobalBarrier() {
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
-	GetScheduler().EndRendering();
-	CurrentBuffer().Recorder().pipelineBarrier2(dependency);
+	auto& scheduler = GetScheduler();
+	scheduler.EndRendering();
+	// KYTY_BARRIER_DEDUPE (default on; =0 off): a guest flush with no command recorded since the
+	// last global barrier orders nothing new. The Demon's Souls fork dropped ~330 of ~920 barriers
+	// a frame this way (+1.4%).
+	static const bool dedupe = [] {
+		const char* value = std::getenv("KYTY_BARRIER_DEDUPE");
+		return value == nullptr || value[0] != '0';
+	}();
+	const auto recorder = CurrentBuffer().Recorder();
+	if (dedupe && recorder.Threaded() && m_last_barrier_tick == scheduler.CurrentTick() &&
+	    m_last_barrier_commands == scheduler.RecordedCommands()) {
+		static uint64_t skipped = 0;
+		if (++skipped % 4096u == 1u) {
+			LOGF("Global barriers: %" PRIu64 " skipped (no command since the previous one)\n",
+			     skipped);
+		}
+		return;
+	}
+	recorder.pipelineBarrier2(dependency);
+	m_last_barrier_tick     = scheduler.CurrentTick();
+	m_last_barrier_commands = scheduler.RecordedCommands();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
