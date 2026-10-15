@@ -306,7 +306,20 @@ void CommandScheduler::Wait(uint64_t tick) {
 			Timeline::Mark("drain-end", tick);
 			BeginNext();
 		}
-		RecordWait(timer.GetTimeS(), true);
+		const double elapsed_s = timer.GetTimeS();
+		// KYTY_DRAIN_STACKS=<n>: a host stack for the first n forced drains of 5 ms or more,
+		// to find which caller makes the GPU thread submit and wait mid-frame.
+		static const uint32_t stack_limit = [] {
+			const char* value = std::getenv("KYTY_DRAIN_STACKS");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+		}();
+		static uint32_t stacks_logged = 0;
+		if (elapsed_s >= 0.005 && stacks_logged < stack_limit) {
+			stacks_logged++;
+			LOGF("Forced drain %u: %.1f ms\n%s", stacks_logged, elapsed_s * 1000.0,
+			     Common::HostBacktrace().c_str());
+		}
+		RecordWait(elapsed_s, true);
 	} else {
 		Timeline::Mark("wait-begin", tick);
 		m_master.Wait(tick);
