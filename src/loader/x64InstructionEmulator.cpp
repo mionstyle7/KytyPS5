@@ -1135,7 +1135,8 @@ bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read)
 }
 
 
-bool TryEmulateStore(void* native_context, uint64_t fault_vaddr, StoreWriter write) {
+bool TryEmulateStore(void* native_context, uint64_t fault_vaddr, StoreWriter write,
+                     LoadReader read) {
 	auto* context = static_cast<PCONTEXT>(native_context);
 	if (context == nullptr || write == nullptr) {
 		return false;
@@ -1148,41 +1149,110 @@ bool TryEmulateStore(void* native_context, uint64_t fault_vaddr, StoreWriter wri
 	    (instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_LEGACY &&
 	     instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX) ||
 	    (instruction.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0 ||
-	    instruction.operand_count_visible != 2 || operands[0].type != ZYDIS_OPERAND_TYPE_MEMORY ||
-	    (operands[0].actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
+	    instruction.operand_count_visible == 0 || instruction.operand_count_visible > 2 ||
+	    operands[0].type != ZYDIS_OPERAND_TYPE_MEMORY) {
 		return false;
 	}
-	const auto& mem     = operands[0];
-	const auto& source  = operands[1];
-	uint64_t    address = 0;
-	const auto  bytes   = static_cast<uint64_t>(mem.size) / 8u;
+	const auto& mem       = operands[0];
+	const bool  has_src   = instruction.operand_count_visible == 2;
+	const auto& source    = operands[1];
+	const bool  rmw       = (mem.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0;
+	uint64_t    address   = 0;
+	const auto  bytes     = static_cast<uint64_t>(mem.size) / 8u;
 	if (!EffectiveAddress(context, instruction, mem, address) || bytes == 0 || bytes > 32 ||
 	    fault_vaddr < address || fault_vaddr - address >= bytes) {
 		return false;
 	}
+	// A GPR or immediate source operand, at the memory operand's width.
+	const auto source_value = [&](uint64_t& value) {
+		if (!has_src) {
+			return false;
+		}
+		if (source.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+			return ReadGpr(context, source.reg.value, mem.size, value); // false for non-GPRs
+		}
+		if (source.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+			// Sign-extended by the decoder where the encoding sign-extends.
+			value = source.imm.value.u;
+			return true;
+		}
+		return false;
+	};
 	alignas(32) uint8_t data[32] {};
+	DWORD                flags = context->EFlags;
 	switch (instruction.mnemonic) {
 		case ZYDIS_MNEMONIC_MOV:
 		case ZYDIS_MNEMONIC_MOVNTI: {
-			if (bytes > 8) {
-				return false;
-			}
 			uint64_t value = 0;
-			if (source.type == ZYDIS_OPERAND_TYPE_REGISTER) {
-				if (!ReadGpr(context, source.reg.value, mem.size, value)) {
-					return false; // a segment or other non-GPR source
-				}
-			} else if (source.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-				// Sign-extended by the decoder where the encoding sign-extends.
-				value = source.imm.value.u;
-			} else {
+			if (rmw || bytes > 8 || !source_value(value)) {
 				return false;
 			}
 			std::memcpy(data, &value, bytes);
 			break;
 		}
+		case ZYDIS_MNEMONIC_OR:
+		case ZYDIS_MNEMONIC_AND:
+		case ZYDIS_MNEMONIC_XOR:
+		case ZYDIS_MNEMONIC_ADD:
+		case ZYDIS_MNEMONIC_SUB:
+		case ZYDIS_MNEMONIC_INC:
+		case ZYDIS_MNEMONIC_DEC: {
+			// Read-modify-write of bytes the GPU has not written: the old value comes from the
+			// same backing store the write goes to (`read` declines GPU-written bytes).
+			const uint32_t bits = mem.size;
+			if (read == nullptr || (bits != 8 && bits != 16 && bits != 32 && bits != 64)) {
+				return false;
+			}
+			const bool unary = instruction.mnemonic == ZYDIS_MNEMONIC_INC ||
+			                   instruction.mnemonic == ZYDIS_MNEMONIC_DEC;
+			uint64_t b = 1;
+			if (unary ? has_src : !source_value(b)) {
+				return false;
+			}
+			uint64_t a = 0;
+			if (!read(fault_vaddr, address, &a, bytes)) {
+				return false;
+			}
+			const auto mask = WidthMask(bits);
+			const auto sign = uint64_t {1} << (bits - 1u);
+			a &= mask;
+			b &= mask;
+			uint64_t result   = 0;
+			bool     carry    = false;
+			bool     overflow = false;
+			bool     adjust   = false;
+			switch (instruction.mnemonic) {
+				case ZYDIS_MNEMONIC_OR: result = a | b; break;
+				case ZYDIS_MNEMONIC_AND: result = a & b; break;
+				case ZYDIS_MNEMONIC_XOR: result = a ^ b; break;
+				case ZYDIS_MNEMONIC_ADD:
+				case ZYDIS_MNEMONIC_INC:
+					result   = (a + b) & mask;
+					carry    = result < a;
+					overflow = ((a ^ result) & (b ^ result) & sign) != 0;
+					adjust   = ((a ^ b ^ result) & 0x10u) != 0;
+					break;
+				default: // SUB, DEC
+					result   = (a - b) & mask;
+					carry    = a < b;
+					overflow = ((a ^ b) & (a ^ result) & sign) != 0;
+					adjust   = ((a ^ b ^ result) & 0x10u) != 0;
+					break;
+			}
+			const DWORD saved = context->EFlags;
+			SetResultFlags(context, result, bits, carry, adjust, overflow);
+			if (unary) {
+				// INC and DEC leave CF alone.
+				context->EFlags = (context->EFlags & ~DWORD {1}) | (saved & DWORD {1});
+			}
+			flags           = context->EFlags;
+			context->EFlags = saved; // until the write is accepted
+			std::memcpy(data, &result, bytes);
+			break;
+		}
 		default: {
-			if (!IsVectorStore(instruction.mnemonic) || source.type != ZYDIS_OPERAND_TYPE_REGISTER) {
+			if (rmw || !IsVectorStore(instruction.mnemonic) ||
+			    source.type != ZYDIS_OPERAND_TYPE_REGISTER) {
 				return false;
 			}
 			const auto reg = source.reg.value;
@@ -1211,6 +1281,7 @@ bool TryEmulateStore(void* native_context, uint64_t fault_vaddr, StoreWriter wri
 	if (!write(fault_vaddr, address, data, bytes)) {
 		return false;
 	}
+	context->EFlags = flags;
 	context->Rip += instruction.length;
 	return true;
 }
@@ -1221,7 +1292,8 @@ bool TryEmulateLoad(void* /*native_context*/, uint64_t /*fault_vaddr*/, LoadRead
 	return false;
 }
 
-bool TryEmulateStore(void* /*native_context*/, uint64_t /*fault_vaddr*/, StoreWriter /*write*/) {
+bool TryEmulateStore(void* /*native_context*/, uint64_t /*fault_vaddr*/, StoreWriter /*write*/,
+                     LoadReader /*read*/) {
 	return false;
 }
 

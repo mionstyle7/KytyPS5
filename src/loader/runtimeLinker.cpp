@@ -788,7 +788,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		    Libs::LibKernel::Memory::MayWriteCleanFaultingBytes(info->access_violation_vaddr) &&
 		    Loader::X64InstructionEmulator::TryEmulateStore(
 		        info->native_context, info->access_violation_vaddr,
-		        &Libs::LibKernel::Memory::TryWriteCleanFaultingBytes)) {
+		        &Libs::LibKernel::Memory::TryWriteCleanFaultingBytes,
+		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr, false,
 			                   Libs::Graphics::GuestGpu::IsGpuThread(), elapsed(), true);
 			return true;

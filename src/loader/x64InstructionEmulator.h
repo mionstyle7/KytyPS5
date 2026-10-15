@@ -18,11 +18,13 @@ using LoadReader = bool (*)(uint64_t fault_vaddr, uint64_t vaddr, void* data, ui
 // Writes [vaddr, vaddr + size) for a store that faulted at fault_vaddr; false to decline.
 using StoreWriter = bool (*)(uint64_t fault_vaddr, uint64_t vaddr, const void* data, uint64_t size);
 // Completes a faulting store whose memory operand covers fault_vaddr by handing the stored bytes
-// to `write` instead of the faulting mapping, then steps past the instruction. Plain stores only:
-// MOV and MOVNTI from a register or an immediate, and SSE/AVX moves from a vector register to
-// memory. No read-modify-write, string or locked instruction. False, with the context untouched,
-// for anything else or when `write` declines.
-[[nodiscard]] bool TryEmulateStore(void* native_context, uint64_t fault_vaddr, StoreWriter write);
+// to `write` instead of the faulting mapping, then steps past the instruction: MOV and MOVNTI
+// from a register or an immediate, SSE/AVX moves from a vector register to memory, and the
+// read-modify-write OR, AND, XOR, ADD, SUB, INC and DEC, whose old value comes from `read`. No
+// string or locked instruction. False, with the context untouched, for anything else or when
+// `read` or `write` declines.
+[[nodiscard]] bool TryEmulateStore(void* native_context, uint64_t fault_vaddr, StoreWriter write,
+                                   LoadReader read);
 
 } // namespace Loader::X64InstructionEmulator
 
