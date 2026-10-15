@@ -705,6 +705,29 @@ void BufferCache::PostCleanWrite(uint64_t vaddr, uint64_t size) {
 	    [this, vaddr, size] { ApplyCleanWrite(vaddr, size); });
 }
 
+bool BufferCache::IsGpuDirtyNotDownloading(uint64_t vaddr, uint64_t size) const {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	return m_gpu_modified_ranges.Intersects(vaddr, size) &&
+	       !m_downloading_ranges.Intersects(vaddr, size) &&
+	       (m_side_ranges.Empty() || !m_side_ranges.Intersects(vaddr, size));
+}
+
+bool BufferCache::WriteCleanSync(uint64_t vaddr, const void* data, uint64_t size) {
+	bool written = false;
+	m_scheduler.Context().GetGpu().SendCommandSync(
+	    [this, vaddr, data, size, &written] { written = WriteClean(vaddr, data, size); });
+	static std::atomic<uint64_t> count = 0;
+	if (written) {
+		if (const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+		    n <= 8 || n % 4096 == 0) {
+			LOGF("Clean write emulation: %" PRIu64 " overwrites of GPU-written bytes, last "
+			     "vaddr=0x%016" PRIx64 " size=%" PRIu64 "\n",
+			     n, vaddr, size);
+		}
+	}
+	return written;
+}
+
 // GPU thread: the GPU copy of bytes an emulated store wrote to guest memory (PostCleanWrite).
 // Commands run before later submissions, so the work the guest submits after its store sees it.
 void BufferCache::ApplyCleanWrite(uint64_t vaddr, uint64_t size) {

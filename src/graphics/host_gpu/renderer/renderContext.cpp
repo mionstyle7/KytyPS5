@@ -169,9 +169,20 @@ bool RenderContext::TryWriteClean(uint64_t fault_vaddr, uint64_t vaddr, const vo
 	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	if (!CleanWriteEmulation() || size == 0 ||
 	    Common::AlignDown(vaddr + size - 1u, TRACKER_PAGE_SIZE) != page ||
-	    !IsMapped(vaddr, size) || !m_page_manager.IsReadWatched(fault_vaddr) ||
-	    !m_buffer_cache.CanWriteCleanConcurrently(vaddr, size)) {
+	    !IsMapped(vaddr, size) || !m_page_manager.IsReadWatched(fault_vaddr)) {
 		return false;
+	}
+	if (!m_buffer_cache.CanWriteCleanConcurrently(vaddr, size)) {
+		// A store over bytes the GPU wrote: the guest does not need their old value, only the
+		// order. WriteClean on the GPU thread writes both copies after the GPU's earlier writes
+		// and drops the bytes from the download; the faulting thread waits for the GPU thread,
+		// not for the GPU. Read-modify-writes never get here: their read declines such bytes.
+		if (!m_buffer_cache.IsGpuDirtyNotDownloading(vaddr, size)) {
+			return false;
+		}
+		m_texture_cache.InvalidateMemory(vaddr, size);
+		m_bindless_table.OnCpuWrite(vaddr, size);
+		return m_buffer_cache.WriteCleanSync(vaddr, data, size);
 	}
 	// As HandleFault does for a write, and before the bytes land, as there: images and bindless
 	// heaps in these bytes see the write, after anything they bring back from the GPU.

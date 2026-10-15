@@ -134,6 +134,10 @@ public:
 	// Any thread: the bytes were just written to guest memory by an emulated store; the GPU
 	// thread copies them to the GPU (ApplyCleanWrite) before it processes later submissions.
 	void                            PostCleanWrite(uint64_t vaddr, uint64_t size);
+	// Any thread: some of the bytes are GPU-written and none is on its way back from the GPU.
+	[[nodiscard]] bool              IsGpuDirtyNotDownloading(uint64_t vaddr, uint64_t size) const;
+	// Any thread: WriteClean on the GPU thread, waiting for the GPU thread but not for the GPU.
+	[[nodiscard]] bool              WriteCleanSync(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
 	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
 		return m_fault_manager.UnattributedFaults();
