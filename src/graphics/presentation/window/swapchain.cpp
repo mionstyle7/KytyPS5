@@ -1162,6 +1162,37 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
+// Every 10 s, the presentation rate and its frame intervals, so runs compare without a profiler:
+// "Present rate: 22.6 fps over 10.0 s, interval p50 49.8 ms p90 50.2 ms max 66.8 ms".
+// Presentation runs on one thread.
+static void LogPresentRate() {
+	using Clock = std::chrono::steady_clock;
+	static Clock::time_point window_start {};
+	static Clock::time_point last {};
+	static std::vector<float> intervals;
+	const auto                now = Clock::now();
+	if (window_start == Clock::time_point {}) {
+		window_start = now;
+		last         = now;
+		return;
+	}
+	intervals.push_back(std::chrono::duration<float, std::milli>(now - last).count());
+	last          = now;
+	const auto span = std::chrono::duration<double>(now - window_start).count();
+	if (span < 10.0) {
+		return;
+	}
+	std::sort(intervals.begin(), intervals.end());
+	const auto at = [&](double q) {
+		return intervals[std::min(intervals.size() - 1,
+		                          static_cast<size_t>(q * static_cast<double>(intervals.size())))];
+	};
+	LOGF("Present rate: %.1f fps over %.1f s, interval p50 %.1f ms p90 %.1f ms max %.1f ms\n",
+	     static_cast<double>(intervals.size()) / span, span, at(0.5), at(0.9), intervals.back());
+	intervals.clear();
+	window_start = now;
+}
+
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1209,6 +1240,7 @@ void Presenter::Impl::Present() {
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.UpdateTitle();
+		LogPresentRate();
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
