@@ -1067,17 +1067,19 @@ bool BoundableWriteOperand(const Program& program, Value value, Value predicate,
 
 } // namespace
 
-// KYTY_SOFT_RECORDS=<hash>[,<hash>...] (hex), "all", or "0": the shaders whose buffer
-// descriptors may leave a GPU-written NumRecords dword to the GPU (soft_record_buffers). Default:
+// KYTY_SOFT_RECORDS=<hash>[,<hash>...] (hex) or "all": the shaders whose buffer descriptors may
+// leave a GPU-written NumRecords dword to the GPU (soft_record_buffers). Off by default. Made for
 // the title's GPU-driven sort (CS 0xfb5ee753d43f3f0b), whose element count a compute shader writes
 // just before it: reading it drained the GPU once a frame (16 ms on the menu, 72 ms in gameplay).
+// With it soft, the same drain moved to the next dispatch that reads GPU output (CS
+// 0x380b6ffba703cef1, 112 ms a frame), so the frame did not get faster (2026-10-15).
 // Only for shaders that bound their own accesses by that count: the host binds the buffer over
 // the dispatch's write extent, so lanes past the count are no longer dropped by the descriptor.
 static bool SoftRecordsAllowed(uint64_t shader_hash) {
 	static const auto list = [] {
 		std::pair<bool, std::unordered_set<uint64_t>> result {false, {}};
 		const char* value = std::getenv("KYTY_SOFT_RECORDS");
-		const std::string_view text(value != nullptr ? value : "fb5ee753d43f3f0b");
+		const std::string_view text(value != nullptr ? value : "");
 		result.first = text == "all";
 		for (size_t begin = 0; !result.first && begin < text.size();) {
 			const auto end = std::min(text.find(',', begin), text.size());
