@@ -1857,15 +1857,33 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 	});
 	std::vector<std::pair<uint64_t, uint64_t>> unwritten; // runs of whole pages
 	uint64_t                                   dropped = 0;
+	// The bitmap lives in device memory the host maps (write-combined, uncached on a resizable-BAR
+	// card): every host read of it crosses PCIe (~1 us). Each word is read once and written back
+	// once; reading and clearing it page by page made this loop ~41% of the GPU thread's CPU time
+	// in gameplay (Tracy sampling, 2026-10-15), on behalf of the guest threads' readbacks.
+	uint64_t cached_index = UINT64_MAX;
+	uint32_t cached_word  = 0;
+	bool     cached_dirty = false;
+	const auto flush_word = [&] {
+		if (cached_dirty) {
+			words[cached_index] = cached_word;
+			cached_dirty        = false;
+		}
+	};
 	for (const auto [from, to]: pieces) {
 		m_bitmap_tracked.ForEachInRange(from, to - from, [&](uint64_t tb, uint64_t te) {
 			for (auto page = Common::AlignUp(tb, WriteBitmapPage);
 			     page + WriteBitmapPage <= te && page + WriteBitmapPage <= WriteBitmapLimit;
 			     page += WriteBitmapPage) {
-				const auto index = page >> WriteBitmapPageBits;
-				auto&      word  = words[index >> 5u];
-				const auto bit   = uint32_t {1} << (index & 31u);
-				if ((word & bit) == 0) {
+				const auto index      = page >> WriteBitmapPageBits;
+				const auto word_index = index >> 5u;
+				if (word_index != cached_index) {
+					flush_word();
+					cached_index = word_index;
+					cached_word  = words[word_index];
+				}
+				const auto bit = uint32_t {1} << (index & 31u);
+				if ((cached_word & bit) == 0) {
 					if (!unwritten.empty() && unwritten.back().second == page) {
 						unwritten.back().second = page + WriteBitmapPage;
 					} else {
@@ -1873,12 +1891,14 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 					}
 					dropped++;
 				} else {
-					word &= ~bit; // downloaded with the window now
+					cached_word &= ~bit; // downloaded with the window now
+					cached_dirty = true;
 					m_bitmap_written_pages++;
 				}
 			}
 		});
 	}
+	flush_word();
 	for (const auto [from, to]: unwritten) {
 		m_gpu_modified_ranges.Subtract(from, to - from);
 	}
