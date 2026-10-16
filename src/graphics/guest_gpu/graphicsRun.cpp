@@ -26,7 +26,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
-#if !defined(__GNUC__) && !defined(__clang__)
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 #include <array>
@@ -302,12 +302,34 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
-	std::binary_semaphore done {0};
-	SendCommand([operation = std::move(command), &done]() mutable {
+	// From the Demon's Souls fork (59aa6dc7): the caller spins a while (~20 us) before it sleeps.
+	// Waking a sleeping caller cost the GPU thread a system call each; guest readbacks make
+	// ~2 000 of these requests a second in gameplay. 0 waiting, 1 done, 2 the caller sleeps.
+	constexpr uint32_t    Spins = 500;
+	std::atomic<uint32_t> state {0};
+	SendCommand([operation = std::move(command), &state]() mutable {
 		operation();
-		done.release();
+		if (state.exchange(1, std::memory_order_acq_rel) == 2) {
+			state.notify_one();
+		}
 	});
-	done.acquire();
+	for (uint32_t spin = 0; spin < Spins; ++spin) {
+		if (state.load(std::memory_order_acquire) == 1) {
+			return;
+		}
+#if defined(__x86_64__) || defined(_M_X64)
+		_mm_pause();
+#else
+		std::this_thread::yield();
+#endif
+	}
+	uint32_t expected = 0;
+	if (!state.compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) {
+		return; // done meanwhile
+	}
+	while (state.load(std::memory_order_acquire) != 1) {
+		state.wait(2, std::memory_order_acquire);
+	}
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
@@ -948,8 +970,10 @@ static bool Pm4PrefetchEnabled() {
 static inline void PrefetchLine(const void* address) {
 #if defined(__GNUC__) || defined(__clang__)
 	__builtin_prefetch(address);
-#else
+#elif defined(_M_X64)
 	_mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+#else
+	(void)address;
 #endif
 }
 
