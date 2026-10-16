@@ -364,9 +364,16 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		const char* value = std::getenv("KYTY_TEXTURE_HOST_PLACEMENT");
 		return value == nullptr || value[0] != '0';
 	}();
-	const bool texture = !(image_info.usage & (vk::ImageUsageFlagBits::eColorAttachment |
-	                                           vk::ImageUsageFlagBits::eDepthStencilAttachment |
-	                                           vk::ImageUsageFlagBits::eStorage));
+	// A texture is an image that can be neither a render target nor depth. Storage does not rule it
+	// out: block-compressed images carry storage usage here (a texel view for guest writes to
+	// them) and are the textures that fill video memory; requiring no storage usage left no image
+	// at all to place (no "Textures placed" line in any run).
+	const bool block = image_info.format >= vk::Format::eBc1RgbUnormBlock &&
+	                   image_info.format <= vk::Format::eBc7SrgbBlock;
+	const bool texture =
+	    !(image_info.usage & (vk::ImageUsageFlagBits::eColorAttachment |
+	                          vk::ImageUsageFlagBits::eDepthStencilAttachment)) &&
+	    (block || !(image_info.usage & vk::ImageUsageFlagBits::eStorage));
 	if (host_placement && texture && CanReportMemoryUsage()) {
 		const auto budget = GetTotalMemoryBudget();
 		if (budget < (uint64_t {12} << 30u) && GetDeviceMemoryUsage() >= budget / 2) {

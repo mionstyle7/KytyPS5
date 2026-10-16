@@ -93,9 +93,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	    with_bda && !(shared_blocks && size <= SharedBlockMax)
 	        ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
 	        : 0;
+	// From the Demon's Souls fork: on a card below 12 GB a GPU buffer asks for video memory whatever
+	// VMA's budget says and goes elsewhere only when the driver has none. NVIDIA counts the textures
+	// placed in its system memory type (GraphicContext::CreateImage) under the video memory heap,
+	// so the budget would send buffers the GPU uses every frame to system memory while there is room.
+	const bool ignore_budget = usage == MemoryUsage::DeviceLocal &&
+	                           graphics.CanReportMemoryUsage() &&
+	                           graphics.GetTotalMemoryBudget() < (uint64_t {12} << 30u);
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
+	    (ignore_budget ? VmaAllocationCreateFlags {} : VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) |
+	    bda_flag | AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
