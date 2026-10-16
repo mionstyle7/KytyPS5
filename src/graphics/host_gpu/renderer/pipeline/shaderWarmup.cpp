@@ -173,7 +173,8 @@ bool Decode(std::span<const uint8_t> bytes, Record& record) {
 }
 
 bool Log::Open(const std::filesystem::path& path) {
-	if (!Enabled()) {
+	// The namespace's switch: a plain Enabled() here is the member (whether the file is open).
+	if (!ShaderWarmup::Enabled()) {
 		return false;
 	}
 	std::error_code error;

@@ -2975,6 +2975,7 @@ void PipelineCache::StartDriverCacheSaver() {
 }
 
 bool PipelineCache::WriteDriverCache() {
+	const auto           begin = std::chrono::steady_clock::now();
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -2987,6 +2988,9 @@ bool PipelineCache::WriteDriverCache() {
 		}
 		if (size == m_driver_cache_saved_size) {
 			return true;
+		}
+		if (attempt == 0) {
+			PipelineCacheLog("Vulkan pipeline cache: saving {} bytes...", size);
 		}
 		payload.resize(size);
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
@@ -3025,8 +3029,11 @@ bool PipelineCache::WriteDriverCache() {
 		                 Common::PathToString(m_driver_cache_path));
 		return false;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {} in {} ms", payload.size(),
+	                 Common::PathToString(m_driver_cache_path),
+	                 std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now() - begin)
+	                     .count());
 	m_driver_cache_saved_size = payload.size();
 	return true;
 }

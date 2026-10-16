@@ -15,6 +15,7 @@
 #include <array>
 #include <map>
 #include <mutex>
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <span>
@@ -75,6 +76,10 @@ public:
 	// The emulator wrote guest memory itself (a CP write, copy or fill done on the CPU): pages an
 	// upload kept writable (KYTY_UPLOAD_ONCE) took it without a fault, so they are marked here.
 	void                   NoteHostWrite(uint64_t vaddr, uint64_t size);
+	// Invalidates guest memory the emulator is about to write on the CPU (a DMA copy or fill done
+	// on the GPU thread), as a write fault would, so the write itself does not fault
+	// (RenderContext::InvalidateMemory).
+	std::function<void(uint64_t, uint64_t)> on_host_write;
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);

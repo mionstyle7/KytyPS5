@@ -899,6 +899,20 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+// KYTY_DMA_PREINVALIDATE (default on; =0 off): DMA copies and fills done on the CPU invalidate
+// their destination before writing it. They wrote the guest's view directly, and every
+// write-protected page took an access violation on the GPU thread (~100,000-580,000 per session,
+// CopyBuffer ~5% of the GPU thread in the menu, half of it in the exception path). The Demon's
+// Souls fork measured this variant at about half the gain of writing through the backing view
+// with the protection kept (58e2fd8b: 46.00 -> 46.41 fps, that one 46.81).
+static bool DmaPreinvalidate() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DMA_PREINVALIDATE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void BufferCache::NoteHostWrite(uint64_t vaddr, uint64_t size) {
 	if (g_upload_once && size != 0 && GuestRange {vaddr, size}.Valid() &&
 	    vaddr < TRACKER_ADDRESS_SIZE && size <= TRACKER_ADDRESS_SIZE - vaddr) {
@@ -2104,6 +2118,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
+		if (on_host_write && DmaPreinvalidate()) {
+			on_host_write(vaddr, size);
+		}
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		NoteHostWrite(vaddr, size);
@@ -2130,6 +2147,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		if (on_host_write && DmaPreinvalidate()) {
+			on_host_write(dst_vaddr, size);
+		}
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		NoteHostWrite(dst_vaddr, size);

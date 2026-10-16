@@ -77,11 +77,13 @@ inline std::atomic<uint64_t> g_guest_submission_seq {1};
 // a CPU-written page is uploaded once (RegionManager::ForEachUploadRangeOnce).
 inline std::atomic<uint64_t> g_upload_epoch {1};
 
-// KYTY_UPLOAD_ONCE (default on; =0 off): read-only uploads keep a page they upload CPU-dirty and
-// writable for the rest of the slice instead of write-protecting it at once.
+// KYTY_UPLOAD_ONCE=1 (default off): read-only uploads keep a page they upload CPU-dirty and
+// writable for the rest of the slice instead of write-protecting it at once. Off by default: the
+// title's write faults in the menu stayed at ~38,000 a second with it (each page is written about
+// once per slice, so there was no fault ping-pong to remove) and the menu's frame rate did not move.
 inline bool g_upload_once = [] {
 	const char* value = std::getenv("KYTY_UPLOAD_ONCE");
-	return value == nullptr || value[0] != '0';
+	return value != nullptr && value[0] == '1';
 }();
 
 class RegionManager final {
