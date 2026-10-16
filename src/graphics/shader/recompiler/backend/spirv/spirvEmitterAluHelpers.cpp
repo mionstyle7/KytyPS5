@@ -233,6 +233,9 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	if (state.flush_f32_denorms) {
+		return value; // DenormFlushToZero 32: every FP32 operation flushes its inputs and result
+	}
 	const auto bits      = state.builder.AllocateId();
 	const auto abs_bits  = state.builder.AllocateId();
 	const auto sign_bits = state.builder.AllocateId();

@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -87,6 +88,21 @@ SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 // KYTY_NO_FLOAT_CONTROLS: shaders built without SignedZeroInfNanPreserve (spirvEmitterModule.cpp).
 bool FloatControlsDisabled(uint64_t shader_hash);
 
+// Whether a stage's FP32 arithmetic may run with the host's DenormFlushToZero (see EmitterState).
+inline bool HostFlushesF32Denorms(ShaderType stage, const ShaderStageInputInfo& input_info) {
+	if (!GetHostImageFeatures().denorm_flush_f32) {
+		return false;
+	}
+	switch (stage) {
+		case ShaderType::Pixel:
+		case ShaderType::Vertex:
+		case ShaderType::Mesh: return true;
+		case ShaderType::Compute:
+			return input_info.compute != nullptr && (input_info.compute->float_mode & 0x30u) == 0u;
+		default: return false;
+	}
+}
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -125,6 +141,11 @@ struct EmitterState {
 	// SignedZeroInfNanPreserve for 32-bit floats: NaN-aware GLSL.std.450 operations (NMin, NMax,
 	// OpIsNan) then have the defined results the guest's IEEE instructions need.
 	const bool float_controls = !FloatControlsDisabled(program.shader_hash);
+	// The host flushes FP32 denormals itself (DenormFlushToZero 32): EmitFlushF32DenormToSignedZero
+	// emits nothing. Only stages whose guest float mode flushes FP32 inputs and outputs (MODE
+	// FP_DENORM bits 4-5 clear: 0xc0, which vertex, geometry and pixel shaders are required to
+	// have), when the device supports it.
+	const bool flush_f32_denorms = float_controls && HostFlushesF32Denorms(program.stage, input_info);
 	uint32_t                                         lane_count              = 1;
 	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
 	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.

@@ -513,12 +513,16 @@ uint32_t GetDeviceClockShift() {
 	return g_device_clock_shift.load(std::memory_order_relaxed);
 }
 
+static std::atomic<bool> g_denorm_flush_f32 {false};
+
 void SetHostImageFeatures(const HostImageFeatures& features) {
 	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
+	g_denorm_flush_f32.store(features.denorm_flush_f32, std::memory_order_relaxed);
 }
 
 HostImageFeatures GetHostImageFeatures() {
-	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
+	return {.min_lod          = g_image_min_lod.load(std::memory_order_relaxed),
+	        .denorm_flush_f32 = g_denorm_flush_f32.load(std::memory_order_relaxed)};
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,

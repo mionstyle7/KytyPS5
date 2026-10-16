@@ -821,6 +821,9 @@ void DefineModule(EmitterState& state) {
 	if (float_controls) {
 		state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
 	}
+	if (state.flush_f32_denorms) {
+		state.builder.RequireCapability(spv::CapabilityDenormFlushToZero);
+	}
 	if (state.requirements.buffer_u8) {
 		state.builder.RequireExtension("SPV_KHR_8bit_storage");
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer8BitAccess);
@@ -907,6 +910,9 @@ void DefineModule(EmitterState& state) {
 	if (float_controls) {
 		state.builder.AddExecutionMode(state.main_func,
 		                               spv::ExecutionModeSignedZeroInfNanPreserve, 32u);
+	}
+	if (state.flush_f32_denorms) {
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormFlushToZero, 32u);
 	}
 	if (state.requirements.float64) {
 		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&

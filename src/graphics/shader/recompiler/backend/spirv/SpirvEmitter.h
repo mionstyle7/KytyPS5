@@ -16,6 +16,10 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 struct HostImageFeatures {
 	// shaderResourceMinLod: the MinLod image operand, used for IMAGE_SAMPLE*_CL.
 	bool min_lod = false;
+	// shaderDenormFlushToZeroFloat32 (with independent 32-bit denormal behavior): stages whose
+	// guest float mode flushes FP32 denormals declare DenormFlushToZero instead of emulating the
+	// flush with five instructions around each legacy MAD, compare and conversion operand.
+	bool denorm_flush_f32 = false;
 };
 
 void              SetHostImageFeatures(const HostImageFeatures& features);

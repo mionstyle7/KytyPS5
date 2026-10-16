@@ -637,7 +637,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	const bool shader_resource_min_lod =
 	    supported_features2.features.shaderResourceMinLod == VK_TRUE;
 	device_features.shaderResourceMinLod = shader_resource_min_lod ? VK_TRUE : VK_FALSE;
-	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
+	// FP32 denormal flushing by the host (KYTY_HOST_FTZ=0 keeps the emulated flush): needs the
+	// 32-bit behavior settable on its own, as only FP32 is set (FP64 keeps the default).
+	const bool host_ftz =
+	    float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE &&
+	    float_controls.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone &&
+	    [] {
+		    const char* value = std::getenv("KYTY_HOST_FTZ");
+		    return value == nullptr || value[0] != '0';
+	    }();
+	ShaderRecompiler::Spirv::SetHostImageFeatures(
+	    {.min_lod = shader_resource_min_lod, .denorm_flush_f32 = host_ftz});
+	LOGF("Vulkan FP32 denormal flush in shaders: %s (device %s, independence %d)\n",
+	     host_ftz ? "host" : "emulated",
+	     float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE ? "supports it" : "does not",
+	     static_cast<int>(float_controls.denormBehaviorIndependence));
 	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
 	     shader_resource_min_lod ? "true" : "false");
 	device_features.independentBlend                     = VK_TRUE;
