@@ -2329,6 +2329,18 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// The expander compares the shader and callee code with guest memory once per presented
+	// frame rather than at every dispatch: the copies and compares were ~10% of the GPU thread in
+	// the title's menu (the same code, hundreds of dispatches a frame). Shader code is not
+	// rewritten while a frame's commands run. KYTY_EXPAND_FRAME_MEMO=0 compares every time.
+	uint64_t ExpandEpoch() const {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_EXPAND_FRAME_MEMO");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled ? frame + 1u : 0u;
+	}
+
 	// Shader function expansion decodes the shader and every callee, and a shader with table
 	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
 	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
@@ -2352,7 +2364,8 @@ struct PipelineCache::ProgramCache {
 			        }
 			        return ok;
 		        },
-		        expanded, expanded_hash, reason, wave_size)) {
+		        expanded, expanded_hash, reason, wave_size,
+		        expansion_log != nullptr ? 0u : ExpandEpoch())) {
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1) < 16) {
 				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,

@@ -652,10 +652,12 @@ struct ShaderFunctionExpander::Impl {
 		std::string           reason;
 		std::vector<uint32_t> code;
 		uint64_t              hash = 0; // HashExpansion(code)
+		uint64_t              reads_epoch = 0; // the epoch `reads` were last found unchanged in
 	};
 	struct Shader {
 		ShaderAnalysis         analysis;
 		std::vector<Expansion> expansions; // most recent last
+		uint64_t               code_epoch = 0; // the epoch the code was last compared in
 	};
 	static constexpr size_t MaxExpansions = 8;
 
@@ -710,7 +712,7 @@ bool ShaderFunctionExpander::ExpandKept(std::span<const uint32_t> code, uint64_t
                                         const ShaderCodeReader& read,
                                         const std::vector<uint32_t>*& expanded,
                                         uint64_t& expanded_hash, std::string& reason,
-                                        uint32_t wave_size) {
+                                        uint32_t wave_size, uint64_t epoch) {
 	expanded      = nullptr;
 	expanded_hash = 0;
 	reason.clear();
@@ -720,10 +722,12 @@ bool ShaderFunctionExpander::ExpandKept(std::span<const uint32_t> code, uint64_t
 	}
 	auto& shader = m_impl->shaders[reinterpret_cast<uint64_t>(code.data())];
 	if (shader.analysis.code.size() != code.size() ||
-	    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
+	    ((epoch == 0 || shader.code_epoch != epoch) &&
+	     !std::equal(code.begin(), code.end(), shader.analysis.code.begin()))) {
 		shader = {};
 		AnalyzeShader(code, shader.analysis);
 	}
+	shader.code_epoch = epoch;
 	const auto& analysis = shader.analysis;
 	if (!analysis.has_calls) return true;
 	if (analysis.has_setpc) {
@@ -739,7 +743,8 @@ bool ShaderFunctionExpander::ExpandKept(std::span<const uint32_t> code, uint64_t
 	for (auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
-		    m_impl->StillReads(expansion, read)) {
+		    ((epoch != 0 && expansion.reads_epoch == epoch) || m_impl->StillReads(expansion, read))) {
+			expansion.reads_epoch = epoch;
 			expanded      = &expansion.code;
 			expanded_hash = expansion.hash;
 			reason        = expansion.reason;
@@ -760,7 +765,8 @@ bool ShaderFunctionExpander::ExpandKept(std::span<const uint32_t> code, uint64_t
 	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
 	                              wave_size, expansion.code, expansion.reason);
 	MergeReads(expansion.reads);
-	expansion.hash = HashExpansion(expansion.code);
+	expansion.hash        = HashExpansion(expansion.code);
+	expansion.reads_epoch = epoch;
 	if (shader.expansions.size() >= Impl::MaxExpansions) {
 		shader.expansions.erase(shader.expansions.begin());
 	}

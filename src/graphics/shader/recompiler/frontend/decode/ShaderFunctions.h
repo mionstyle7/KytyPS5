@@ -45,10 +45,13 @@ public:
 	// Expand without copying: `expanded` points at the expansion the expander keeps (valid until
 	// the next call; empty when the shader has no calls) and `expanded_hash` is a hash of its
 	// words, computed once when the expansion was built.
+	// `epoch` (0: none): within one epoch (the pipeline cache passes the presented frame), the
+	// shader code and the callee code an expansion read are compared with guest memory once, not
+	// at every call; the call targets still resolve every time.
 	bool ExpandKept(std::span<const uint32_t> code, uint64_t base,
 	                std::span<const uint32_t> user_data, const ShaderCodeReader& read,
 	                const std::vector<uint32_t>*& expanded, uint64_t& expanded_hash,
-	                std::string& reason, uint32_t wave_size);
+	                std::string& reason, uint32_t wave_size, uint64_t epoch = 0);
 
 private:
 	struct Impl;
