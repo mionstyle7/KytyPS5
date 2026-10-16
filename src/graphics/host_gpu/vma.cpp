@@ -185,6 +185,9 @@ uint64_t GraphicContext::MemoryShortfall() const {
 			     value != 0 ? "short, the caches collect" : "room again", available >> 20u,
 			     limit >> 20u, reserve >> 20u, GetDeviceMemoryUsage() >> 20u,
 			     GetTotalMemoryBudget() >> 20u);
+			// Where the device memory is: per heap, what VMA allocated against what the driver
+			// counts (the rest is the driver's own: pipelines, descriptor pools, ...).
+			LogMemoryBudget();
 		}
 	}
 	return shortfall.load(std::memory_order_relaxed);

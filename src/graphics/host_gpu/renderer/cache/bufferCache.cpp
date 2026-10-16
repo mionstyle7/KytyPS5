@@ -2256,6 +2256,23 @@ void BufferCache::RunGarbageCollector() {
 	if (device_bytes && m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	if (m_gc_tick % 4000u == 0u) {
+		// What this cache holds on the device, whether or not it collects (GcStats only runs
+		// past the trigger): the device memory left for images is the budget minus this.
+		uint64_t host_bytes = 0;
+		uint64_t largest    = 0;
+		m_slot_buffers.ForEach([&](BufferId, const Buffer& buffer) {
+			if (KeptOutOfCollection(buffer)) {
+				host_bytes += buffer.Size();
+			}
+			largest = std::max<uint64_t>(largest, buffer.Size());
+		});
+		LOGF("BufStats: used=%" PRIu64 "MB buffers=%zu kept_in_host=%" PRIu64 "MB largest=%" PRIu64
+		     "MB trigger=%" PRIu64 "MB device=%" PRIu64 "MB of %" PRIu64 "MB\n",
+		     m_total_used_memory >> 20u, m_buffers.size(), host_bytes >> 20u, largest >> 20u,
+		     m_trigger_gc_memory >> 20u, m_graphics.GetDeviceMemoryUsage() >> 20u,
+		     m_graphics.GetTotalMemoryBudget() >> 20u);
+	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
