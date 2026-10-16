@@ -433,6 +433,23 @@ void CommandProcessor::CompleteDraw() {
 	GetScheduler().CompleteDraw();
 }
 
+// Dispatches count toward the periodic flush as draws do (KYTY_DISPATCH_FLUSH=0: they do not).
+// Only draws counted, so a run of compute work (gameplay records ~2 400 dispatches a frame
+// against ~1 700 draws) stayed in one unsubmitted command buffer while the GPU idled; the next
+// read of GPU output (an SRT count, an indirect argument) then submitted it all and waited for
+// the whole run: ~4 ms a wait, 11 s of waiting in a two-minute session. Submitted as it is
+// recorded, the GPU runs it while the commands after it are translated, and such a wait covers
+// only the tail since the last flush. Not tied to any shader.
+void CommandProcessor::CompleteDispatch() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DISPATCH_FLUSH");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (enabled) {
+		GetScheduler().CompleteDraw();
+	}
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -1356,6 +1373,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
 	}
+	CompleteDispatch();
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
@@ -1371,6 +1389,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	CompleteDispatch();
 }
 
 uint32_t CommandProcessor::NumInstances() {
