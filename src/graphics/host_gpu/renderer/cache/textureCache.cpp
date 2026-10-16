@@ -334,6 +334,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	MarkImageGranules(image.info.data.address, image.info.data.size);
 	image.registered = true;
 	NoteBindlessStateChange(image);
 	image.lru_id     = m_lru_cache.Insert(id, LruClock());
@@ -364,6 +365,17 @@ void TextureCache::UnregisterImage(ImageId id) {
 		}
 	});
 	m_lru_cache.Free(image.lru_id);
+	if (++m_image_granule_releases > 4096) {
+		// Released images leave their bits; rebuild from the images still registered (this one
+		// is still marked registered here, which only keeps its bits: a superset).
+		std::fill(m_image_granules.begin(), m_image_granules.end(), 0);
+		m_slot_images.ForEach([&](ImageId other, const Image& registered) {
+			if (other != id && registered.registered) {
+				MarkImageGranules(registered.info.data.address, registered.info.data.size);
+			}
+		});
+		m_image_granule_releases = 0;
+	}
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
 		EXIT("TextureCache: image accounting underflow\n");
@@ -570,10 +582,57 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	}
 }
 
+namespace {
+constexpr uint32_t ImageGranuleBits  = 16;
+constexpr uint64_t ImageGranuleSpace = uint64_t {1} << 40; // the image page table's address space
+
+bool ImageGranulesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_GRANULES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+} // namespace
+
+void TextureCache::MarkImageGranules(uint64_t address, uint64_t size) {
+	if (size == 0 || address >= ImageGranuleSpace) {
+		return;
+	}
+	if (m_image_granules.empty()) {
+		m_image_granules.assign((ImageGranuleSpace >> ImageGranuleBits) / 64, 0);
+	}
+	const uint64_t last = (std::min(address + size, ImageGranuleSpace) - 1) >> ImageGranuleBits;
+	for (uint64_t g = address >> ImageGranuleBits; g <= last; ++g) {
+		m_image_granules[g >> 6] |= uint64_t {1} << (g & 63);
+	}
+}
+
+bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const {
+	if (!ImageGranulesEnabled() || m_image_granules.empty() || size == 0 ||
+	    address >= ImageGranuleSpace || size > ImageGranuleSpace - address) {
+		return true;
+	}
+	const uint64_t last = (address + size - 1) >> ImageGranuleBits;
+	for (uint64_t g = address >> ImageGranuleBits; g <= last;) {
+		const uint64_t bit  = g & 63;
+		const uint64_t span = std::min<uint64_t>(64 - bit, last - g + 1);
+		const uint64_t mask = (span == 64 ? ~uint64_t {0} : (uint64_t {1} << span) - 1) << bit;
+		if ((m_image_granules[g >> 6] & mask) != 0) {
+			return true;
+		}
+		g += span;
+	}
+	return false;
+}
+
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
                                                         bool page_overlap) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return {};
+	}
+	if (!MayHaveImages(address, size)) {
 		return {};
 	}
 

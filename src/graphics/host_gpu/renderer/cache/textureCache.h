@@ -256,6 +256,13 @@ private:
 	// stretch without presents (a loading screen) still ages its entries.
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
+	// From the Demon's Souls fork (KYTY_IMAGE_GRANULES, default on here; =0 off): a bit per 64 KiB
+	// granule that a registered image covered since the last rebuild (a superset). Region queries
+	// (buffer bindings, texel buffers' image-start queries) skip the page walk on a miss.
+	std::vector<uint64_t> m_image_granules;
+	uint32_t              m_image_granule_releases = 0;
+	void                  MarkImageGranules(uint64_t address, uint64_t size);
+	[[nodiscard]] bool    MayHaveImages(uint64_t address, uint64_t size) const;
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;
