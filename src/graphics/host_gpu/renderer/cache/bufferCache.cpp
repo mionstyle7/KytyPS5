@@ -899,6 +899,13 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::NoteHostWrite(uint64_t vaddr, uint64_t size) {
+	if (g_upload_once && size != 0 && GuestRange {vaddr, size}.Valid() &&
+	    vaddr < TRACKER_ADDRESS_SIZE && size <= TRACKER_ADDRESS_SIZE - vaddr) {
+		m_memory_tracker.InvalidateRegion(vaddr, size, [] {});
+	}
+}
+
 void BufferCache::InvalidateMemoryNoDownload(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return;
@@ -2099,6 +2106,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		NoteHostWrite(vaddr, size);
 		return;
 	}
 
@@ -2124,6 +2132,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
+		NoteHostWrite(dst_vaddr, size);
 		return;
 	}
 

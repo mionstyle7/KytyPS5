@@ -259,6 +259,7 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 		(void)TrySendCommand([this, address, value, size, sequence] {
 			Timeline::Mark("label", address, value);
 			std::memcpy(reinterpret_cast<void*>(address), &value, size);
+			m_renderer.GetBufferCache().NoteHostWrite(address, size);
 			const auto pending = m_pending_labels.find(address);
 			if (pending != m_pending_labels.end() && pending->second.sequence == sequence) {
 				m_pending_labels.erase(pending);
@@ -553,6 +554,9 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
+	// The guest may have written what the next commands read before releasing this wait, into
+	// pages an upload in this slice kept writable (RegionManager::ForEachUploadRangeOnce).
+	g_upload_epoch.fetch_add(1, std::memory_order_relaxed);
 	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -590,12 +594,14 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
 		}
+		cache.NoteHostWrite(reinterpret_cast<uint64_t>(dst), sizeof(uint32_t));
 	} else {
 		const auto bytes = static_cast<size_t>(dw_num) * sizeof(uint32_t);
 		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), src, bytes)) {
 			return;
 		}
 		memcpy(dst, src, bytes);
+		cache.NoteHostWrite(reinterpret_cast<uint64_t>(dst), bytes);
 	}
 }
 
@@ -607,6 +613,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	m_renderer.GetBufferCache().NoteHostWrite(dst_address, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -814,6 +821,7 @@ bool GuestGpu::Process(Submission& submission) {
 		}
 	} end_mark {submission};
 
+	g_upload_epoch.fetch_add(1, std::memory_order_relaxed);
 	if (first_slice) {
 		g_guest_submission_seq.fetch_add(1, std::memory_order_relaxed);
 		// Texture-heap entries the guest wrote before submitting are visible to all of this
@@ -1606,6 +1614,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			                                    sizeof(data));
 		} else {
 			std::memcpy(dst, &data, sizeof(data));
+			m_renderer.GetBufferCache().NoteHostWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
 		}
 
 		if (with_interrupt) {
@@ -1665,6 +1674,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						                                    value, sizeof(value));
 					} else {
 						std::memcpy(dst, &value, sizeof(value));
+						m_renderer.GetBufferCache().NoteHostWrite(reinterpret_cast<uint64_t>(dst),
+						                                          sizeof(value));
 					}
 
 					if (with_interrupt) {
@@ -1922,6 +1933,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	}
 
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	m_renderer.GetBufferCache().NoteHostWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
@@ -1947,6 +1959,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		EXIT("unknown event type\n");
 	}
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	m_renderer.GetBufferCache().NoteHostWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(

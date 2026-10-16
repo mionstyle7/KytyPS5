@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdlib>
@@ -132,6 +133,28 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
+		// KYTY_UPLOAD_ONCE: a read-only range walked in this slice with no page made CPU-dirty
+		// anywhere since has nothing left to upload (the pages kept writable were copied then), so
+		// the heap-wide bindings synced at nearly every draw skip the walk.
+		const uint64_t dirty_epoch  = g_cpu_dirty_epoch.load(std::memory_order_acquire);
+		const uint64_t upload_epoch = g_upload_epoch.load(std::memory_order_relaxed);
+		UploadMemo*    memo         = nullptr;
+		if (!is_written && g_upload_once) {
+			static thread_local std::array<UploadMemo, 512> memos {};
+			memo = &memos[((vaddr >> 12u) ^ (size * 0x9E3779B97F4A7C15ull)) % memos.size()];
+			if (memo->vaddr == vaddr && memo->size == size && memo->dirty_epoch == dirty_epoch &&
+			    memo->upload_epoch == upload_epoch) {
+				const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+				upload_func();
+				s_upload_owner = previous_upload_owner;
+				return;
+			}
+		}
+		const auto remember = [&] {
+			if (memo != nullptr) {
+				*memo = {vaddr, size, dirty_epoch, upload_epoch};
+			}
+		};
 		if (!is_written && g_tracker_skip_clean && g_tracker_bitmap &&
 		    IsRangeCpuCleanHint(vaddr, size)) {
 			// What the walk below finds for a read-only range whose regions all exist and are
@@ -139,6 +162,7 @@ public:
 			const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 			upload_func();
 			s_upload_owner = previous_upload_owner;
+			remember();
 			return;
 		}
 		if (!is_written && g_tracker_skip_clean && g_tracker_bitmap && g_tracker_dirty_walk &&
@@ -146,15 +170,22 @@ public:
 			// The loop below for a read-only range, with the clean regions skipped by their bitmap
 			// bits rather than by loading each region (the bits mirror the regions' summaries).
 			const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+			const auto epoch = g_upload_epoch.load(std::memory_order_relaxed);
 			ForEachCpuDirtyRegion(vaddr, size,
 			                      [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 				                      manager->lock.lock();
-				                      manager->ForEachModifiedRange<DirtySource::Cpu, true>(
-				                          manager->GetCpuAddr() + offset, bytes, range_func);
+				                      if (g_upload_once) {
+					                      manager->ForEachUploadRangeOnce(
+					                          manager->GetCpuAddr() + offset, bytes, epoch, range_func);
+				                      } else {
+					                      manager->ForEachModifiedRange<DirtySource::Cpu, true>(
+					                          manager->GetCpuAddr() + offset, bytes, range_func);
+				                      }
 				                      manager->lock.unlock();
 			                      });
 			upload_func();
 			s_upload_owner = previous_upload_owner;
+			remember();
 			return;
 		}
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
@@ -173,8 +204,14 @@ public:
 					     manager->GetCpuAddr(), offset, bytes, static_cast<int>(is_written));
 				}
 			}
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
+			if (!is_written && g_upload_once) {
+				manager->ForEachUploadRangeOnce(manager->GetCpuAddr() + offset, bytes,
+				                                g_upload_epoch.load(std::memory_order_relaxed),
+				                                range_func);
+			} else {
+				manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
+				                                                      bytes, range_func);
+			}
 			if (!is_written) {
 				manager->lock.unlock();
 			}
@@ -194,6 +231,12 @@ public:
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+	struct UploadMemo {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		uint64_t dirty_epoch  = 0;
+		uint64_t upload_epoch = 0;
+	};
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {

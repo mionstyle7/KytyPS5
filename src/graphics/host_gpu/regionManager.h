@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <utility>
 
@@ -71,6 +72,18 @@ inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
 // Bumped by the GPU thread when it starts a guest submission (its first slice).
 inline std::atomic<uint64_t> g_guest_submission_seq {1};
 
+// Bumped by the GPU thread at every slice of a guest submission it processes (a submission's
+// start, and its resumption after a WAIT_REG_MEM or another queue's turn): the unit within which
+// a CPU-written page is uploaded once (RegionManager::ForEachUploadRangeOnce).
+inline std::atomic<uint64_t> g_upload_epoch {1};
+
+// KYTY_UPLOAD_ONCE (default on; =0 off): read-only uploads keep a page they upload CPU-dirty and
+// writable for the rest of the slice instead of write-protecting it at once.
+inline bool g_upload_once = [] {
+	const char* value = std::getenv("KYTY_UPLOAD_ONCE");
+	return value == nullptr || value[0] != '0';
+}();
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -114,6 +127,15 @@ public:
 			}
 		}
 		auto& bits = GetBits<source>();
+		if constexpr (source == DirtySource::Cpu) {
+			// A page dirty again (or cleaned) by other means is no longer kept by an upload, and a
+			// write reported here (a fault, a host write) is uploaded again in this slice.
+			m_kept.UnsetRange(start, end);
+			if constexpr (enable) {
+				m_uploaded.UnsetRange(start, end);
+				m_complete_epoch = 0;
+			}
+		}
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 			StoreSummary<source>(true);
@@ -142,6 +164,9 @@ public:
 		}
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
+			if constexpr (source == DirtySource::Cpu) {
+				m_kept.UnsetRange(start, end);
+			}
 			bits.UnsetRange(start, end);
 			if (bits.None()) {
 				StoreSummary<source>(false);
@@ -153,6 +178,54 @@ public:
 			}
 		}
 		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// A read-only upload of the CPU-dirty pages of a range, for a game that rewrites the same pages
+	// all the time. The usual upload write-protects each page it copies, and a heap-wide binding
+	// syncs the whole heap at nearly every draw: a page the game wrote again right after was copied
+	// and protected again, and the next write faulted again, over and over within one submission
+	// (~40,000-70,000 write faults a second in the title, each an exception on a game thread plus a
+	// VirtualProtect on the GPU thread). Here a page written since its last upload is copied and
+	// left CPU-dirty and writable ("kept"); later syncs in the same slice (g_upload_epoch) skip it,
+	// as the game wrote what this submission reads before submitting it. The first sync of a kept
+	// page in a later slice copies it again and write-protects it, so a page the game stops writing
+	// is soon clean. At most one fault per written page and two copies per slice remain.
+	template <typename Func>
+	void ForEachUploadRangeOnce(uint64_t vaddr, uint64_t size, uint64_t epoch, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (m_cpu_dirty.FirstRangeFrom(start).first >= end) {
+			return;
+		}
+		if (m_uploaded_epoch != epoch) {
+			m_uploaded.Clear();
+			m_uploaded_epoch = epoch;
+		} else if (m_complete_epoch == epoch) {
+			return; // every dirty page of the region was uploaded in this slice
+		}
+		const RegionBits dirty(m_cpu_dirty, start, end);
+		const RegionBits todo = dirty & ~m_uploaded;
+		if (todo.None()) {
+			return;
+		}
+		// Kept from an earlier slice: copied once more and protected, the usual upload.
+		const RegionBits renew = todo & m_kept;
+		if (renew.Any()) {
+			m_cpu_dirty &= ~renew;
+			m_kept &= ~renew;
+			if (m_cpu_dirty.None()) {
+				StoreSummary<DirtySource::Cpu>(false);
+			}
+			UpdateProtection<true, false>();
+		}
+		// Written in this slice and not uploaded yet: copied and kept writable.
+		m_kept |= todo & ~renew;
+		m_uploaded |= todo;
+		if ((m_cpu_dirty & ~m_uploaded).None()) {
+			m_complete_epoch = epoch;
+		}
+		for (const auto [first, last]: todo) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
 	}
@@ -252,6 +325,13 @@ private:
 	uint64_t               m_cpu_summary_bit  = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// ForEachUploadRangeOnce: pages left CPU-dirty and writable by an upload, and the pages
+	// uploaded in slice m_uploaded_epoch.
+	RegionBits   m_kept;
+	RegionBits   m_uploaded;
+	uint64_t     m_uploaded_epoch = 0;
+	// The slice in which every CPU-dirty page of the region was found uploaded.
+	uint64_t     m_complete_epoch = 0;
 };
 
 } // namespace Libs::Graphics

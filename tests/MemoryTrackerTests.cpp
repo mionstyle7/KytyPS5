@@ -402,6 +402,60 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+// KYTY_UPLOAD_ONCE: a page an upload copies stays CPU-dirty and writable for the rest of the
+// slice and is skipped there; the next slice copies it again and protects it; a write reported in
+// the slice (a fault, a host write) brings it back.
+void TestUploadOnce() {
+  Libs::Graphics::g_upload_once = true;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  auto upload = [&] {
+    uint32_t ranges = 0;
+    tracker.ForEachUploadRange(
+        address + 16, 32, false,
+        [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+          Check(upload_address == address && upload_size == page_size,
+                "upload-once range was not page aligned");
+          ranges++;
+        },
+        []() noexcept {});
+    return ranges;
+  };
+  Libs::Graphics::g_upload_epoch.fetch_add(1);
+  Check(upload() == 1 && tracker.IsRegionCpuModified(address, page_size) &&
+            IsWritable(memory),
+        "upload-once did not keep the page dirty and writable");
+  Check(upload() == 0, "upload-once copied a kept page twice in one slice");
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  Check(upload() == 1, "upload-once skipped a page written again in the slice");
+  Check(upload() == 0, "upload-once copied the page again after its second copy");
+  Libs::Graphics::g_upload_epoch.fetch_add(1);
+  Check(upload() == 1 && !tracker.IsRegionCpuModified(address, page_size) &&
+            Protection(memory) == PAGE_READONLY,
+        "upload-once did not copy and protect a kept page in the next slice");
+  Libs::Graphics::g_upload_epoch.fetch_add(1);
+  Check(upload() == 0, "upload-once copied a clean page");
+  // A written sync over a kept page clears it as before, so the GPU may own it.
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  Check(upload() == 1 && tracker.IsRegionCpuModified(address, page_size),
+        "upload-once did not keep a newly written page");
+  uint32_t written_ranges = 0;
+  tracker.ForEachUploadRange(
+      address, page_size, true,
+      [&](uint64_t, uint64_t) noexcept { written_ranges++; }, []() noexcept {});
+  Check(written_ranges == 1 && !tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.IsRegionGpuModified(address, page_size),
+        "a written sync over a kept page did not hand it to the GPU");
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+  Libs::Graphics::g_upload_once = false;
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1217,6 +1271,9 @@ int main(int argc, char **argv) {
     BenchmarkCleanUploads();
     return 0;
   }
+  // The cases below test the tracker without KYTY_UPLOAD_ONCE; TestUploadOnce turns it on.
+  Libs::Graphics::g_upload_once = false;
+  TestUploadOnce();
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
