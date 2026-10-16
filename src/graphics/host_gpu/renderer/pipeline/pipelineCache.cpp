@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderWarmup.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -1250,10 +1251,20 @@ struct PipelineCache::ProgramCache {
 		if (disk_session_key.empty()) {
 			// Built at first use: the device layer has set the emitter's switches by then.
 			disk_session_key = ShaderDiskCache::SessionKey(disk_session);
+			StartWarmup();
 		}
+		BuildSourceKeyFrom(key, code, params.back_code, options, input_info);
+	}
+
+	// BuildSourceKey after the session key exists (also on the warmup workers).
+	template <typename InputInfo>
+	void BuildSourceKeyFrom(std::vector<uint8_t>& key, std::span<const uint32_t> code,
+	                        std::span<const uint32_t> back_code,
+	                        const ShaderRecompiler::CompileOptions& options,
+	                        const InputInfo& input_info) const {
 		ShaderDiskCache::ByteWriter writer;
 		writer.bytes.reserve(disk_session_key.size() + code.size_bytes() +
-		                     params.back_code.size_bytes() + 512u);
+		                     back_code.size_bytes() + 512u);
 		writer.PutBytes(disk_session_key);
 		writer.Put<uint8_t>('S');
 		writer.Put(static_cast<uint32_t>(options.stage));
@@ -1264,10 +1275,187 @@ struct PipelineCache::ProgramCache {
 		writer.Put(options.bindless_images);
 		writer.Put(options.non_fatal);
 		writer.PutWords(code);
-		writer.PutWords(params.back_code);
+		writer.PutWords(back_code);
 		ShaderDiskCache::AppendInputKey(writer, input_info);
 		key = std::move(writer.bytes);
 	}
+
+	// Shader warmup (shaderWarmup.h): records the inputs of each permutation the game uses.
+	template <typename InputInfo>
+	void RecordWarmup(std::span<const uint32_t> code, const ShaderParams& params,
+	                  const ShaderRecompiler::CompileOptions& options, const InputInfo& input_info,
+	                  const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                  uint32_t push_data_cursor, std::span<const uint8_t> permutation_key) {
+		if (!warmup_log.Enabled() || permutation_key.size() <= disk_session_key.size()) {
+			return;
+		}
+		const auto identity = WarmupIdentity(permutation_key);
+		if (warmup_log.Known(identity)) {
+			return;
+		}
+		ShaderWarmup::Record record;
+		record.stage           = options.stage;
+		record.hash            = options.shader_hash;
+		record.wave_size       = options.wave_size;
+		record.user_data_base  = options.user_data_base;
+		record.push_cursor     = push_data_cursor;
+		record.bindless_images = options.bindless_images;
+		record.non_fatal       = options.non_fatal;
+		record.code.assign(code.begin(), code.end());
+		record.back_code.assign(params.back_code.begin(), params.back_code.end());
+		record.user_data.assign(options.user_data.begin(), options.user_data.end());
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			record.vertex = input_info;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			record.pixel = input_info;
+		} else {
+			record.compute = input_info;
+		}
+		record.specialization = specialization;
+		warmup_log.Add(record, identity);
+	}
+
+	// The permutation's disk key without the session part: the same across emulator builds.
+	uint64_t WarmupIdentity(std::span<const uint8_t> permutation_key) const {
+		const auto tail = permutation_key.subspan(disk_session_key.size());
+		return XXH3_64bits(tail.data(), tail.size());
+	}
+
+	// Starts the warmup workers once the session key exists (the first shader of the session).
+	void StartWarmup() {
+		if (disk == nullptr || !ShaderWarmup::Enabled() || disk_verify) {
+			return;
+		}
+		if (!warmup_log.Open(disk->Directory() / "warmup.bin")) {
+			return;
+		}
+		auto loaded = warmup_log.TakeLoaded();
+		if (loaded.empty()) {
+			return;
+		}
+		const char* value     = std::getenv("KYTY_SHADER_WARMUP_THREADS");
+		const auto  hardware  = std::max(std::thread::hardware_concurrency(), 2u);
+		const auto  threads   = std::max<uint32_t>(
+		    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+		                     : (hardware > 6u ? hardware / 2u - 2u : 1u),
+		    1u);
+		warmup_queue = std::make_shared<WarmupQueue>();
+		warmup_queue->records = std::move(loaded);
+		warmup_queue->begin   = std::chrono::steady_clock::now();
+		PipelineCacheLog("Shader warmup: checking {} recorded permutations on {} threads",
+		                 warmup_queue->records.size(), threads);
+		for (uint32_t i = 0; i < threads; i++) {
+			warmup_threads.emplace_back([this, queue = warmup_queue] {
+				KYTY_PROFILER_THREAD("ShaderWarmup");
+				Common::LowerBelowGameThreads();
+				for (;;) {
+					const auto index = queue->next.fetch_add(1, std::memory_order_relaxed);
+					if (index >= queue->records.size() || queue->stop.load(std::memory_order_relaxed)) {
+						break;
+					}
+					ShaderWarmup::Record record;
+					if (!ShaderWarmup::Decode(queue->records[index].second, record)) {
+						queue->failed.fetch_add(1, std::memory_order_relaxed);
+					} else {
+						switch (WarmupCompile(record)) {
+							case WarmupResult::Cached: queue->cached.fetch_add(1); break;
+							case WarmupResult::Compiled: queue->compiled.fetch_add(1); break;
+							case WarmupResult::Failed: queue->failed.fetch_add(1); break;
+						}
+					}
+					if (queue->done.fetch_add(1) + 1 == queue->records.size()) {
+						const auto seconds = std::chrono::duration<double>(
+						                         std::chrono::steady_clock::now() - queue->begin)
+						                         .count();
+						PipelineCacheLog("Shader warmup: {} compiled, {} already in the disk cache, "
+						                 "{} skipped, in {:.1f} s",
+						                 queue->compiled.load(), queue->cached.load(),
+						                 queue->failed.load(), seconds);
+					}
+				}
+			});
+		}
+	}
+
+	enum class WarmupResult { Cached, Compiled, Failed };
+
+	// What Get does for a permutation missing from the disk cache, from recorded inputs: the
+	// translation, the source entry if missing, and the compiled permutation, all stored.
+	WarmupResult WarmupCompile(ShaderWarmup::Record& record) {
+		ShaderRecompiler::CompileOptions options;
+		options.stage           = record.stage;
+		options.shader_hash     = record.hash;
+		options.user_data       = record.user_data;
+		options.back_code       = record.back_code;
+		options.dump_ir         = false;
+		options.early_dump      = false;
+		options.dump_label      = "Shader warmup";
+		options.wave_size       = record.wave_size;
+		options.user_data_base  = record.user_data_base;
+		options.non_fatal       = record.non_fatal;
+		options.bindless_images = record.bindless_images;
+		std::vector<uint8_t> source_key;
+		ShaderStageInputInfo stage_input {};
+		if (record.stage == ShaderType::Pixel) {
+			record.pixel.stage = {};
+			stage_input.pixel  = &record.pixel;
+			BuildSourceKeyFrom(source_key, record.code, record.back_code, options, record.pixel);
+		} else if (record.stage == ShaderType::Compute) {
+			record.compute.stage = {};
+			stage_input.compute  = &record.compute;
+			BuildSourceKeyFrom(source_key, record.code, record.back_code, options, record.compute);
+		} else {
+			record.vertex.stage = {};
+			stage_input.vertex  = &record.vertex;
+			BuildSourceKeyFrom(source_key, record.code, record.back_code, options, record.vertex);
+		}
+		options.input_info = stage_input;
+		std::vector<uint8_t> permutation_key;
+		BuildPermutationKey(permutation_key, source_key, record.specialization, record.push_cursor);
+		if (disk->Contains(permutation_key)) {
+			return WarmupResult::Cached;
+		}
+		auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
+		if (translated.unsupported) {
+			return WarmupResult::Failed;
+		}
+		const bool uses_clock = UsesShaderClock(translated.program);
+		if (uses_clock && !shader_clock) {
+			return WarmupResult::Failed;
+		}
+		if (!disk->Contains(source_key)) {
+			const auto           plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			std::vector<uint8_t> payload;
+			if (ShaderDiskCache::EncodeSourceRecord(false, uses_clock, &plan, payload) &&
+			    ShaderDiskCache::SourceRecordRoundTrips(payload)) {
+				disk->Save(source_key, payload);
+			}
+		}
+		auto result  = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		                                                record.specialization, record.push_cursor);
+		auto program = std::move(result.program).TakeCompiledInfo();
+		if (result.spirv.empty() || !ValidateShaderSpirv("Shader warmup", record.hash, result.spirv)) {
+			return WarmupResult::Failed;
+		}
+		std::vector<uint8_t> payload;
+		ShaderDiskCache::EncodePermutationRecord(result.spirv, program, payload);
+		if (!ShaderDiskCache::PermutationRecordRoundTrips(payload)) {
+			return WarmupResult::Failed;
+		}
+		disk->Save(permutation_key, payload);
+		return WarmupResult::Compiled;
+	}
+
+	struct WarmupQueue {
+		std::vector<std::pair<uint64_t, std::vector<uint8_t>>> records;
+		std::atomic<size_t>   next {0};
+		std::atomic<size_t>   done {0};
+		std::atomic<uint64_t> compiled {0};
+		std::atomic<uint64_t> cached {0};
+		std::atomic<uint64_t> failed {0};
+		std::atomic<bool>     stop {false};
+		std::chrono::steady_clock::time_point begin;
+	};
 
 	static void BuildPermutationKey(std::vector<uint8_t>& key, std::span<const uint8_t> source_key,
 	                                const ShaderRecompiler::IR::ResourceSpecialization& specialization,
@@ -1940,6 +2128,8 @@ struct PipelineCache::ProgramCache {
 					Profiler::Message(Profiler::MessageInfo,
 					                  "Shader from the disk cache: %s 0x%016" PRIx64 ", %zu SPIR-V words",
 					                  stage_name, params.hash, record.spirv.size());
+					RecordWarmup(compile_code, params, options, input_info,
+					             entry->second.specialization, push_data_cursor, permutation_key);
 					return AddPermutation(entry->second, stage_name, options, record.spirv,
 					                      std::move(record.program), input_info, push_data_cursor);
 				}
@@ -2047,6 +2237,10 @@ struct PipelineCache::ProgramCache {
 			ShaderDiskCache::EncodePermutationRecord(compiled.spirv, compiled.program,
 			                                         permutation_payload);
 		}
+		if (disk != nullptr) {
+			RecordWarmup(compile_code, params, options, input_info, entry->second.specialization,
+			             push_data_cursor, permutation_key);
+		}
 		const auto handle = AddPermutation(entry->second, stage_name, options, compiled.spirv,
 		                                   std::move(compiled.program), input_info,
 		                                   push_data_cursor);
@@ -2108,13 +2302,25 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	void StopWarmup() {
+		if (warmup_queue != nullptr) {
+			warmup_queue->stop.store(true);
+		}
+		for (auto& thread: warmup_threads) {
+			thread.join();
+		}
+		warmup_threads.clear();
+	}
+
 	void FlushDisk() {
+		StopWarmup();
 		if (disk != nullptr) {
 			disk->Flush();
 			disk->LogTotals("saved");
 		}
 	}
 	~ProgramCache() {
+		StopWarmup();
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -2174,6 +2380,10 @@ struct PipelineCache::ProgramCache {
 	bool                                                        disk_verify  = false;
 	uint64_t                                                    disk_lookups = 0;
 	std::unique_ptr<ShaderDiskCache::Store>                     disk;
+	// Shader warmup: the record file and the startup compiles (shaderWarmup.h).
+	ShaderWarmup::Log                                           warmup_log;
+	std::shared_ptr<WarmupQueue>                                warmup_queue;
+	std::vector<std::thread>                                    warmup_threads;
 	// Graphics translations in progress on the workers (KYTY_ASYNC_TRANSLATION), by program.
 	std::unordered_map<ProgramKey, std::shared_ptr<TranslationJob>, ProgramKeyHash> translating;
 	uint64_t                                                    translation_skips = 0;

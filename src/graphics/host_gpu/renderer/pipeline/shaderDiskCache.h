@@ -194,6 +194,8 @@ public:
 	// a damaged payload counts as rejected and is a miss.
 	[[nodiscard]] bool Load(std::span<const uint8_t> key, std::vector<uint8_t>& payload);
 	void               Save(std::span<const uint8_t> key, std::span<const uint8_t> payload);
+	// An entry file exists under the key's name (no read, no counters).
+	[[nodiscard]] bool Contains(std::span<const uint8_t> key) const;
 	void               Flush();
 	void               LogTotals(std::string_view when);
 

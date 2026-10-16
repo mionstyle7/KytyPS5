@@ -149,4 +149,12 @@ void RaiseAboveGameThreads(const char* name) {
 #endif
 }
 
+// Background work (Windows: THREAD_PRIORITY_BELOW_NORMAL) that must not take time from the game's
+// threads or the GPU thread.
+void LowerBelowGameThreads() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+}
+
 } // namespace Common

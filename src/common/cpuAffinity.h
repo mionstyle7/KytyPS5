@@ -15,6 +15,9 @@ void PreferPerformanceCores(const char* name);
 // KYTY_RENDER_PRIORITY=0. For the GPU thread, which every frame waits for.
 void RaiseAboveGameThreads(const char* name);
 
+// The calling thread below the game's threads (Windows: THREAD_PRIORITY_BELOW_NORMAL).
+void LowerBelowGameThreads();
+
 } // namespace Common
 
 #endif // EMULATOR_SRC_COMMON_CPUAFFINITY_H_

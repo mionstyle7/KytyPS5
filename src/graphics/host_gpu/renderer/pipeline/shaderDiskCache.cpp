@@ -940,6 +940,11 @@ bool Store::Load(std::span<const uint8_t> key, std::vector<uint8_t>& payload) {
 	return true;
 }
 
+bool Store::Contains(std::span<const uint8_t> key) const {
+	std::error_code error;
+	return std::filesystem::exists(EntryPath(key), error);
+}
+
 void Store::Save(std::span<const uint8_t> key, std::span<const uint8_t> payload) {
 	ByteWriter file;
 	file.Put(FileMagic);
