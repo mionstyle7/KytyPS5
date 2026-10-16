@@ -209,6 +209,8 @@ void GraphicContext::LogMemoryBudget() const {
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
 	}
+	LOGF("Video memory in use (system memory blocks counted there taken off): %" PRIu64 " MB\n",
+	     GetDeviceMemoryUsage() >> 20u);
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
@@ -219,14 +221,31 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	vmaGetHeapBudgets(allocator, budgets);
 	const bool discrete =
 	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
-	uint64_t usage = 0;
+	uint64_t usage        = 0;
+	uint64_t local_blocks = 0;
+	uint64_t misplaced    = 0;
 	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
 		const bool device_local =
 		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
 		                      vk::MemoryHeapFlagBits::eDeviceLocal);
+		const uint64_t blocks = budgets[heap].statistics.blockBytes;
 		if (!discrete || device_local) {
 			usage += budgets[heap].usage;
+			local_blocks += blocks;
+		} else if (blocks > budgets[heap].usage) {
+			misplaced += blocks - budgets[heap].usage;
 		}
+	}
+	// NVIDIA on Windows reports what this process holds in system memory (the host heap's
+	// blocks: the 2.7 GB heap mirror, textures it placed there, staging) under the video memory
+	// heap's usage, and the system heap's usage stays below those blocks. Counted as video memory
+	// it read 9.4 GB of an 11.5 GB budget with 5 GB of video memory in use, declared the device
+	// short and the caches shrank to 512 MB: 23 -> 3-8 fps at that moment in every run. A system
+	// heap reporting less usage than its own blocks gives the amount to take off; video memory
+	// use never reads below this process's own video memory blocks. KYTY_RAW_DEVICE_USAGE=1 off.
+	static const bool raw = std::getenv("KYTY_RAW_DEVICE_USAGE") != nullptr;
+	if (discrete && !raw && usage > local_blocks) {
+		usage -= std::min(misplaced, usage - local_blocks);
 	}
 	return usage;
 }
