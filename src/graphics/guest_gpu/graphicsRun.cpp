@@ -26,6 +26,9 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#if !defined(__GNUC__) && !defined(__clang__)
+#include <immintrin.h>
+#endif
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -927,6 +930,97 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// From the Demon's Souls fork (1656c217): the next draw's (or dispatch's) state, asked for while this
+// one is made. It is read a few microseconds later and is cold (the game's job threads just wrote
+// it). Past this draw (and the draws right after it), up to the next one: the tables of the indirect
+// register packets, and the first lines of what each 64-bit word of a SET_SH_REG packet (user data)
+// would point at in the guest's range (the tables a draw's SRT evaluation reads first). A prefetch
+// of an address nothing maps does nothing. Fork census: a draw 1.42 -> 1.37 us.
+// KYTY_PM4_PREFETCH=0 turns it off.
+static bool Pm4PrefetchEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PM4_PREFETCH");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+static inline void PrefetchLine(const void* address) {
+#if defined(__GNUC__) || defined(__clang__)
+	__builtin_prefetch(address);
+#else
+	_mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+#endif
+}
+
+static bool PrefetchDrawsOrDispatches(uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DISPATCH_DRAW:
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT: return true;
+		default: return false;
+	}
+}
+
+static void PrefetchNextDraw(const uint32_t* packet, uint32_t remaining_dw) {
+	bool     state = false;
+	uint32_t at    = 0;
+	for (uint32_t n = 0; n < 64 && at < remaining_dw; ++n) {
+		const uint32_t header = packet[at];
+		if (header == 0x80000000u) {
+			++at;
+			continue;
+		}
+		if ((header >> 30u) != 3u) {
+			return;
+		}
+		const uint32_t len = KYTY_PM4_LEN(header);
+		if (len > remaining_dw - at) {
+			return;
+		}
+		const uint32_t  op = (header >> 8u) & 0xffu;
+		const uint32_t* p  = packet + at;
+		at += len;
+		if (PrefetchDrawsOrDispatches(op)) {
+			if (state) {
+				return;
+			}
+			continue;
+		}
+		state = true;
+		if (op == Pm4::IT_SET_SH_REG_INDIRECT || op == Pm4::IT_SET_CONTEXT_REG_INDIRECT ||
+		    op == Pm4::IT_SET_UCONFIG_REG_INDIRECT) {
+			if (len < 5) {
+				continue;
+			}
+			const auto* block = reinterpret_cast<const char*>(
+			    (uint64_t {p[1]} & 0xfffffffcu) | (uint64_t {p[2]} << 32u));
+			const uint32_t bytes = std::min<uint32_t>((p[4] & 0x3fffu) * 8u, 512u);
+			for (uint32_t offset = 0; offset < bytes; offset += 64) {
+				PrefetchLine(block + offset);
+			}
+		} else if (op == Pm4::IT_SET_SH_REG) {
+			for (uint32_t i = 2; i + 1 < len; ++i) {
+				if (p[i + 1] - 1u >= 0x20u) {
+					continue; // a guest address: 4 GiB to 128 GiB
+				}
+				const auto* table =
+				    reinterpret_cast<const char*>(uint64_t {p[i]} | (uint64_t {p[i + 1]} << 32u));
+				PrefetchLine(table);
+				PrefetchLine(table + 64);
+			}
+		}
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	const bool draw_prep = execution.m_prep_seq != 0 && DrawPrep::Enabled();
 	if (DrawPrep::Enabled() && !draw_prep) {
@@ -1022,6 +1116,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		if (PrefetchDrawsOrDispatches(opcode) && Pm4PrefetchEnabled()) {
+			PrefetchNextDraw(packet, remaining_dw);
+		}
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
