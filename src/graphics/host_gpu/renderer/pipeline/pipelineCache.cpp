@@ -627,6 +627,68 @@ static const bool g_fast_first_pipelines = [] {
 	return value == nullptr || value[0] != '0';
 }();
 
+// Shader and pipeline work, per 10 s ("Shader stalls:"): what the GPU thread spent compiling
+// (translation on the GPU thread, SPIR-V emission, pipeline builds), the disk cache's hits and
+// misses, and the draws skipped while a worker translated. A warm run (no rebuild, same route)
+// should show only hits; misses are first sightings or specializations the cache lacks.
+namespace {
+struct StallStats {
+	std::mutex mutex;
+	uint64_t   compiles[2]      = {}; // graphics, compute
+	double     compile_ms[2]    = {};
+	double     max_ms           = 0.0;
+	uint64_t   max_hash         = 0;
+	uint64_t   source_hits      = 0;
+	uint64_t   source_misses    = 0;
+	uint64_t   perm_hits        = 0;
+	uint64_t   perm_misses      = 0;
+	uint64_t   pipelines        = 0; // built on the GPU thread
+	double     pipeline_ms      = 0.0;
+	double     pipeline_max_ms  = 0.0;
+	uint64_t   pipeline_max_hash = 0;
+	uint64_t   skipped_translating = 0;
+	std::chrono::steady_clock::time_point next {};
+};
+StallStats g_stall_stats;
+
+void MaybeLogStalls(StallStats& st) {
+	const auto now = std::chrono::steady_clock::now();
+	if (st.next == std::chrono::steady_clock::time_point {}) {
+		st.next = now + std::chrono::seconds(10);
+		return;
+	}
+	if (now < st.next) {
+		return;
+	}
+	st.next = now + std::chrono::seconds(10);
+	LOGF("Shader stalls (10 s): compiles on the GPU thread %" PRIu64 " graphics %.0f ms, %" PRIu64
+	     " compute %.0f ms, max %.0f ms (0x%016" PRIx64 "); disk cache sources %" PRIu64
+	     " hit / %" PRIu64 " miss, permutations %" PRIu64 " hit / %" PRIu64
+	     " miss; pipelines built on the GPU thread %" PRIu64 " in %.0f ms, max %.0f ms (0x%016" PRIx64
+	     "); draws skipped while translating %" PRIu64 "\n",
+	     st.compiles[0], st.compile_ms[0], st.compiles[1], st.compile_ms[1], st.max_ms, st.max_hash,
+	     st.source_hits, st.source_misses, st.perm_hits, st.perm_misses, st.pipelines,
+	     st.pipeline_ms, st.pipeline_max_ms, st.pipeline_max_hash, st.skipped_translating);
+	const auto next = st.next;
+	st.compiles[0] = st.compiles[1] = 0;
+	st.compile_ms[0] = st.compile_ms[1] = 0.0;
+	st.max_ms = 0.0;
+	st.max_hash = 0;
+	st.source_hits = st.source_misses = st.perm_hits = st.perm_misses = 0;
+	st.pipelines = 0;
+	st.pipeline_ms = st.pipeline_max_ms = 0.0;
+	st.pipeline_max_hash = 0;
+	st.skipped_translating = 0;
+	st.next = next;
+}
+
+void NoteStall(void (*update)(StallStats&)) {
+	std::lock_guard lock(g_stall_stats.mutex);
+	update(g_stall_stats);
+	MaybeLogStalls(g_stall_stats);
+}
+} // namespace
+
 // Counts a finished pipeline build and puts it on the timeline (slow ones as a warning).
 static void ReportPipelineBuilt(Profiler::Counter counter, const char* kind, uint64_t first_hash,
                                 uint64_t second_hash, std::chrono::steady_clock::time_point begin) {
@@ -635,6 +697,17 @@ static void ReportPipelineBuilt(Profiler::Counter counter, const char* kind, uin
 	                                         .count());
 	Profiler::Add(counter);
 	Profiler::Add(Profiler::Counter::PipelineBuildTime, us);
+	if (GuestGpu::IsGpuThread()) {
+		std::lock_guard lock(g_stall_stats.mutex);
+		const double ms = static_cast<double>(us) / 1000.0;
+		g_stall_stats.pipelines++;
+		g_stall_stats.pipeline_ms += ms;
+		if (ms > g_stall_stats.pipeline_max_ms) {
+			g_stall_stats.pipeline_max_ms   = ms;
+			g_stall_stats.pipeline_max_hash = first_hash;
+		}
+		MaybeLogStalls(g_stall_stats);
+	}
 	Profiler::Message(us >= 100000 ? Profiler::MessageWarning : Profiler::MessageInfo,
 	                  "%s pipeline built in %.1f ms: 0x%016" PRIx64 " 0x%016" PRIx64, kind,
 	                  static_cast<double>(us) / 1000.0, first_hash, second_hash);
@@ -1366,6 +1439,7 @@ struct PipelineCache::ProgramCache {
 			if (const auto job = translating.find(lookup_key);
 			    job != translating.end() && !job->second->done.load(std::memory_order_acquire)) {
 				translation_skips++;
+				NoteStall(+[](StallStats& st) { st.skipped_translating++; });
 				Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
 				                                StageLabel(stage), params.hash);
 				return ShaderProgram {};
@@ -1435,7 +1509,10 @@ struct PipelineCache::ProgramCache {
 				CountDiskLookup();
 				std::vector<uint8_t>          payload;
 				ShaderDiskCache::SourceRecord record;
-				if (!disk->Load(source_key, payload)) {
+				const bool source_hit = disk->Load(source_key, payload);
+				NoteStall(source_hit ? +[](StallStats& st) { st.source_hits++; }
+				                     : +[](StallStats& st) { st.source_misses++; });
+				if (!source_hit) {
 					disk->counters.source_misses++;
 				} else if (disk_verify) {
 					disk->counters.source_hits++;
@@ -1472,7 +1549,10 @@ struct PipelineCache::ProgramCache {
 				                    push_data_cursor);
 				std::vector<uint8_t>               payload;
 				ShaderDiskCache::PermutationRecord record;
-				if (!disk->Load(permutation_key, payload)) {
+				const bool permutation_hit = disk->Load(permutation_key, payload);
+				NoteStall(permutation_hit ? +[](StallStats& st) { st.perm_hits++; }
+				                          : +[](StallStats& st) { st.perm_misses++; });
+				if (!permutation_hit) {
 					disk->counters.permutation_misses++;
 				} else if (disk_verify) {
 					disk->counters.permutation_hits++;
@@ -1601,6 +1681,18 @@ struct PipelineCache::ProgramCache {
 			                                         .count());
 			Profiler::Add(Profiler::Counter::ShadersCompiled);
 			Profiler::Add(Profiler::Counter::ShaderCompileTime, us);
+			{
+				std::lock_guard lock(g_stall_stats.mutex);
+				const double ms   = static_cast<double>(us) / 1000.0;
+				const int    kind = stage == ShaderType::Compute ? 1 : 0;
+				g_stall_stats.compiles[kind]++;
+				g_stall_stats.compile_ms[kind] += ms;
+				if (ms > g_stall_stats.max_ms) {
+					g_stall_stats.max_ms   = ms;
+					g_stall_stats.max_hash = params.hash;
+				}
+				MaybeLogStalls(g_stall_stats);
+			}
 			Profiler::Message(Profiler::MessageInfo,
 			                  "Shader compiled: %s 0x%016" PRIx64 " in %.1f ms, %zu SPIR-V words",
 			                  stage_name, params.hash, static_cast<double>(us) / 1000.0,
