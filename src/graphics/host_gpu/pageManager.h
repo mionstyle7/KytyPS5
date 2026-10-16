@@ -36,6 +36,24 @@ public:
 	// outside the guest address-space lock.
 	void ResyncHostProtection(uint64_t vaddr, uint64_t size);
 
+	// KYTY_ASYNC_REPROTECT (default on; =0 off), after the Demon's Souls fork: within this scope the
+	// read protection of pages that GPU work is about to write (watcher edges to no-access) is
+	// applied by a worker thread instead of the caller. The GPU writes those pages only once the
+	// command buffer runs, later than the worker applies it; every other protection change waits
+	// for the queued ones first, so their order holds. In the frames that write tracked buffers
+	// those VirtualProtect calls took a few percent of the GPU thread.
+	class DeferReadProtectScope {
+	public:
+		DeferReadProtectScope();
+		~DeferReadProtectScope();
+		KYTY_CLASS_NO_COPY(DeferReadProtectScope);
+
+	private:
+		bool m_previous;
+	};
+	// Waits until every queued protection is applied.
+	static void DrainDeferredProtection();
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

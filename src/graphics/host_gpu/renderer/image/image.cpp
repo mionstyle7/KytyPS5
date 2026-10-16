@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <fmt/format.h>
 #include <xxhash.h>
@@ -155,6 +156,25 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+// KYTY_IMAGE_BARRIER_DEDUPE (default on; =0 off), after the Demon's Souls fork: a shader write that
+// repeats the image's last transition exactly (layout, access, stage) gets no write-after-write
+// barrier. Guest work writing an image twice in a row is either ordered by the guest's own flush
+// (a global memory barrier, which covers it) or allowed to overlap, as on the console. Transfer and
+// other emulator writes keep their barriers.
+static bool RepeatedShaderWriteNeedsNoBarrier(const VulkanImageState& state, vk::ImageLayout layout,
+                                              vk::AccessFlags2 access, vk::PipelineStageFlags2 stage) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_BARRIER_DEDUPE");
+		return value == nullptr || value[0] != '0';
+	}();
+	constexpr auto shader_writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite;
+	constexpr auto other_writes  = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite |
+	                              vk::AccessFlagBits2::eColorAttachmentWrite |
+	                              vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	return enabled && state.layout == layout && state.access_mask == access && state.pl_stage == stage &&
+	       static_cast<bool>(access & shader_writes) && !static_cast<bool>(access & other_writes);
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -192,8 +212,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
-				if (subresource_state.layout != destination_layout ||
-				    subresource_state.access_mask != destination_access || repeated_write) {
+				if ((subresource_state.layout != destination_layout ||
+				     subresource_state.access_mask != destination_access || repeated_write) &&
+				    !RepeatedShaderWriteNeedsNoBarrier(subresource_state, destination_layout,
+				                                       destination_access, destination_stage)) {
 					vk::ImageMemoryBarrier2 barrier {};
 					barrier.srcStageMask                    = subresource_state.pl_stage;
 					barrier.srcAccessMask                   = subresource_state.access_mask;
@@ -223,8 +245,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		                                vk::AccessFlagBits2::eShaderWrite |
 		                                vk::AccessFlagBits2::eMemoryWrite;
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
-		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    !repeated_write) {
+		if ((state.layout == destination_layout && state.access_mask == destination_access &&
+		     !repeated_write) ||
+		    RepeatedShaderWriteNeedsNoBarrier(state, destination_layout, destination_access,
+		                                      destination_stage)) {
 			return {};
 		}
 

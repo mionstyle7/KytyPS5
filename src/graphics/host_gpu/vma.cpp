@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <mutex>
+#include <vector>
 #include <cinttypes>
 #include <cstdlib>
 
@@ -103,10 +105,13 @@ bool GraphicContext::CreateAllocator() {
 	return true;
 }
 
+static void DestroyImagePool(VmaAllocator allocator);
+
 void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	DestroyImagePool(allocator);
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -254,9 +259,91 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+// Recycling of freed images (KYTY_IMAGE_POOL, default on; =0 off), from the Demon's Souls fork. The
+// game aliases transient render targets in one heap and the texture cache frees and re-creates
+// images every frame (collector evictions revived the next frame). An image reaches DeleteImage
+// only after the GPU is done with it and its views are gone, and a new image starts in the
+// undefined layout, so reusing the VkImage and its memory for identical creation parameters is
+// equivalent to a fresh allocation. At most budget/32 (512 MB) is kept, nothing while the device
+// is short of memory, and the pool is emptied when an allocation fails.
+namespace {
+struct PooledImage {
+	std::array<uint32_t, 10> key {};
+	VkImage                  image      = VK_NULL_HANDLE;
+	VmaAllocation            allocation = nullptr;
+	uint64_t                 bytes      = 0;
+};
+std::mutex               g_image_pool_mutex;
+std::vector<PooledImage> g_image_pool;
+uint64_t                 g_image_pool_bytes = 0;
+uint64_t                 g_image_pool_hits  = 0;
+
+bool ImagePoolEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_POOL");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+std::array<uint32_t, 10> ImagePoolKey(vk::ImageCreateFlags flags, vk::ImageType type, vk::Format format,
+                                      vk::Extent3D extent, uint32_t levels, uint32_t layers,
+                                      uint32_t samples, vk::ImageUsageFlags usage) {
+	return {static_cast<uint32_t>(static_cast<VkImageCreateFlags>(flags)), static_cast<uint32_t>(type),
+	        static_cast<uint32_t>(format), extent.width, extent.height, extent.depth, levels, layers, samples,
+	        static_cast<uint32_t>(static_cast<VkImageUsageFlags>(usage))};
+}
+
+void TrimImagePoolLocked(VmaAllocator allocator, uint64_t limit) {
+	while (g_image_pool_bytes > limit && !g_image_pool.empty()) {
+		auto& oldest = g_image_pool.front();
+		vmaDestroyImage(allocator, oldest.image, oldest.allocation);
+		g_image_pool_bytes -= oldest.bytes;
+		g_image_pool.erase(g_image_pool.begin());
+	}
+}
+} // namespace
+
+static void DestroyImagePool(VmaAllocator allocator) {
+	std::scoped_lock lock(g_image_pool_mutex);
+	TrimImagePoolLocked(allocator, 0);
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
+
+	if (ImagePoolEnabled() && image_info.pNext == nullptr && image_info.tiling == vk::ImageTiling::eOptimal &&
+	    image_info.initialLayout == vk::ImageLayout::eUndefined) {
+		const auto key = ImagePoolKey(image_info.flags, image_info.imageType, image_info.format, image_info.extent,
+		                              image_info.mipLevels, image_info.arrayLayers,
+		                              static_cast<uint32_t>(image_info.samples), image_info.usage);
+		std::scoped_lock lock(g_image_pool_mutex);
+		for (auto it = g_image_pool.begin(); it != g_image_pool.end(); ++it) {
+			if (it->key != key) {
+				continue;
+			}
+			image.image      = it->image;
+			image.allocation = it->allocation;
+			g_image_pool_bytes -= it->bytes;
+			g_image_pool.erase(it);
+			if (++g_image_pool_hits % 1024u == 1u) {
+				LOGF("Image pool: %" PRIu64 " images reused, %zu kept (%" PRIu64 " MB)\n", g_image_pool_hits,
+				     g_image_pool.size(), g_image_pool_bytes >> 20u);
+			}
+			image.format     = image_info.format;
+			image.image_type = image_info.imageType;
+			image.extent     = image_info.extent;
+			image.layers     = image_info.arrayLayers;
+			image.mip_levels = image_info.mipLevels;
+			image.samples    = static_cast<uint32_t>(image_info.samples);
+			image.usage      = image_info.usage;
+			image.flags      = image_info.flags;
+			image.state      = {.layout = image_info.initialLayout};
+			image.subresource_states.clear();
+			return true;
+		}
+	}
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -265,6 +352,15 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	auto             result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	if (result != vk::Result::eSuccess && ImagePoolEnabled()) {
+		{
+			std::scoped_lock lock(g_image_pool_mutex);
+			TrimImagePoolLocked(allocator, 0);
+		}
+		result = static_cast<vk::Result>(
+		    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+		                   &alloc_info, &native_image, &image.allocation, nullptr));
+	}
 	if (result != vk::Result::eSuccess) {
 		// The device heap is full. The guest has a unified 16 GB pool, so the image is
 		// real; place it in host memory and pay in bandwidth rather than fail.
@@ -305,6 +401,25 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
+	if (ImagePoolEnabled()) {
+		const uint64_t limit =
+		    MemoryShortfall() != 0 ? 0 : std::min<uint64_t>(512ull << 20u, GetTotalMemoryBudget() / 32);
+		VmaAllocationInfo allocation_info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+		if (allocation_info.size <= limit) {
+			std::scoped_lock lock(g_image_pool_mutex);
+			g_image_pool.push_back({ImagePoolKey(image.flags, image.image_type, image.format, image.extent,
+			                                     image.mip_levels, image.layers, image.samples, image.usage),
+			                        image.image, image.allocation, allocation_info.size});
+			g_image_pool_bytes += allocation_info.size;
+			TrimImagePoolLocked(allocator, limit);
+			image.image      = nullptr;
+			image.allocation = nullptr;
+			return;
+		}
+		std::scoped_lock lock(g_image_pool_mutex);
+		TrimImagePoolLocked(allocator, limit);
+	}
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
 	image.allocation = nullptr;

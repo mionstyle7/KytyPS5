@@ -7,6 +7,7 @@
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
@@ -224,6 +225,22 @@ void CommandScheduler::CompleteDraw() {
 	const auto interval = DrawFlushInterval();
 	if (interval == 0u || ++m_recorded_draws < interval) {
 		return;
+	}
+	// KYTY_DRAW_FLUSH_ADAPTIVE (default on; =0 off), after the Demon's Souls fork's draw batches:
+	// while the GPU still runs submitted work, a flush hands it nothing it could start sooner, so
+	// the batch goes on (asked every 4 draws) up to 8 intervals; an idle GPU gets the work at once.
+	static const bool adaptive = [] {
+		const char* value = std::getenv("KYTY_DRAW_FLUSH_ADAPTIVE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (adaptive && m_recorded_draws < 8u * interval) {
+		if ((m_recorded_draws - interval) % 4u != 0u) {
+			return;
+		}
+		m_master.Refresh();
+		if (m_master.KnownGpuTick() + 1u < m_master.CurrentTick()) {
+			return;
+		}
 	}
 	CheckActive();
 	Flush();
@@ -544,6 +561,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 void CommandScheduler::QueueSubmit(SubmitJob& job) {
 	auto&      graphics = m_graphics;
 	vk::Result result;
+	// The read protection of pages this work writes is in place before it can run
+	// (PageManager::DeferReadProtectScope).
+	PageManager::DrainDeferredProtection();
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		if (!m_async_submit) {

@@ -1723,9 +1723,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		const PageManager::DeferReadProtectScope defer_protect;
+		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 		MarkGpuWritten(vaddr, size);
+	} else {
+		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -1748,6 +1751,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	// stores can reach become GPU-written.
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 	if (written_size != 0) {
+		const PageManager::DeferReadProtectScope defer_protect;
 		(void)SynchronizeBuffer(buffer, written_vaddr, written_size, true, false);
 		MarkGpuWritten(written_vaddr, written_size);
 	}
@@ -1805,6 +1809,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, ui
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
+	const PageManager::DeferReadProtectScope defer_protect;
 	(void)SynchronizeBuffer(buffer, vaddr, size, true, false);
 	MarkGpuWritten(vaddr, size, true);
 	return {&buffer, buffer.Offset(vaddr)};
@@ -2205,7 +2210,7 @@ bool KeptOutOfCollection(const Buffer& buffer) {
 			return uint64_t {0};
 		}
 		const char* value = std::getenv("KYTY_HOST_BUFFER_MB");
-		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0}) << 20u;
+		return (value != nullptr ? static_cast<uint64_t>(std::strtoull(value, nullptr, 10)) : uint64_t {0}) << 20u;
 	}();
 	return host_bytes != 0 && buffer.Size() >= host_bytes;
 }

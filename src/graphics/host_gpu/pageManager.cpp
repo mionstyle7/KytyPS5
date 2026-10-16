@@ -12,7 +12,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -78,7 +81,102 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+bool AsyncReprotectEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_REPROTECT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+thread_local bool t_defer_read_protect = false;
+
+// Applies queued no-access protections in order on its own thread.
+class ProtectWorker {
+public:
+	static ProtectWorker& Get() {
+		static ProtectWorker worker;
+		return worker;
+	}
+
+	void Enqueue(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
+		std::lock_guard lock(m_mutex);
+		// Adjacent ranges with the same mode become one call.
+		if (!m_queue.empty() && m_queue.back().mode == mode &&
+		    m_queue.back().vaddr + m_queue.back().size == vaddr) {
+			m_queue.back().size += size;
+		} else {
+			m_queue.push_back({vaddr, size, mode});
+			m_queued++;
+		}
+		m_wake.notify_one();
+	}
+
+	void Drain() {
+		std::unique_lock lock(m_mutex);
+		const uint64_t target = m_queued;
+		m_done_cv.wait(lock, [&] { return m_done >= target; });
+	}
+
+	[[nodiscard]] bool Idle() {
+		std::lock_guard lock(m_mutex);
+		return m_done >= m_queued;
+	}
+
+private:
+	struct Item {
+		uint64_t                    vaddr = 0;
+		uint64_t                    size  = 0;
+		Common::VirtualMemory::Mode mode  = Common::VirtualMemory::Mode::NoAccess;
+	};
+
+	ProtectWorker() {
+		m_thread = std::thread([this] { Run(); });
+		m_thread.detach();
+	}
+
+	void Run() {
+		std::unique_lock lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [&] { return !m_queue.empty(); });
+			const auto item = m_queue.front();
+			m_queue.pop_front();
+			lock.unlock();
+			if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(item.vaddr, item.size, item.mode)) {
+				Fatal("deferred address-space protection failed at 0x%016" PRIx64, item.vaddr);
+			}
+			lock.lock();
+			m_done++;
+			m_done_cv.notify_all();
+		}
+	}
+
+	std::mutex              m_mutex;
+	std::condition_variable m_wake;
+	std::condition_variable m_done_cv;
+	std::deque<Item>        m_queue;
+	uint64_t                m_queued = 0;
+	uint64_t                m_done   = 0;
+	std::thread             m_thread;
+};
+
+std::atomic<bool> g_protect_worker_used {false};
+
 } // namespace
+
+PageManager::DeferReadProtectScope::DeferReadProtectScope(): m_previous(t_defer_read_protect) {
+	t_defer_read_protect = AsyncReprotectEnabled();
+}
+
+PageManager::DeferReadProtectScope::~DeferReadProtectScope() {
+	t_defer_read_protect = m_previous;
+}
+
+void PageManager::DrainDeferredProtection() {
+	if (g_protect_worker_used.load(std::memory_order_acquire)) {
+		ProtectWorker::Get().Drain();
+	}
+}
 
 struct PageManager::Impl {
 	struct PageState {
@@ -191,6 +289,15 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		if (t_defer_read_protect && mode == Common::VirtualMemory::Mode::NoAccess) {
+			g_protect_worker_used.store(true, std::memory_order_release);
+			ProtectWorker::Get().Enqueue(vaddr, size, mode);
+			return;
+		}
+		// Any other change waits for the queued ones (the same pages may be among them).
+		if (g_protect_worker_used.load(std::memory_order_acquire) && !ProtectWorker::Get().Idle()) {
+			ProtectWorker::Get().Drain();
+		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
