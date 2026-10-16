@@ -3289,8 +3289,18 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		return nullptr;
 	};
-	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		auto& found = *iter->second;
+	// Consecutive draws often use the same pipeline (KYTY_PIPELINE_INDEX in the Demon's Souls fork
+	// indexed the lookup): the last key found is compared before the map is hashed.
+	Pipeline* last = nullptr;
+	if (m_last_graphics_pipeline != nullptr && m_last_graphics_key == key) {
+		last = m_last_graphics_pipeline;
+	} else if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		last                     = iter->second.get();
+		m_last_graphics_key      = key;
+		m_last_graphics_pipeline = last;
+	}
+	if (last != nullptr) {
+		auto& found = *last;
 		if (found.pending && !FinishPending(found)) {
 			return defer();
 		}

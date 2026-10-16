@@ -106,12 +106,14 @@ bool GraphicContext::CreateAllocator() {
 }
 
 static void DestroyImagePool(VmaAllocator allocator);
+void        FlushBufferReclaimer(); // streamBuffer.cpp
 
 void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
 	DestroyImagePool(allocator);
+	FlushBufferReclaimer();
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }

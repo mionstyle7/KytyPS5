@@ -56,8 +56,23 @@ public:
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Calls func(address, bytes) for each part of the range, one per tracker region, that may
 	// hold CPU-dirty pages (lock-free summaries: false is exact, true is conservative).
+	// The regions are found from their bits in the CPU summary bitmap, 64 per word, rather than by
+	// loading every region of the range (BdaDirtyRegions in the Demon's Souls fork): PrepareBda walks
+	// all of mapped guest memory, thousands of regions, once per submission that touched memory.
 	template <typename Func>
 	void ForEachMaybeCpuDirtyRegion(uint64_t vaddr, uint64_t size, Func&& func) {
+		static const bool bitmap = [] {
+			const char* value = std::getenv("KYTY_BDA_DIRTY_REGIONS");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (bitmap && size != 0 && vaddr < TRACKER_ADDRESS_SIZE && size <= TRACKER_ADDRESS_SIZE - vaddr) {
+			ForEachCpuDirtyRegion(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				if (manager != nullptr && manager->MaybeModified<DirtySource::Cpu>()) {
+					func(manager->GetCpuAddr() + offset, bytes);
+				}
+			});
+			return;
+		}
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			if (manager->MaybeModified<DirtySource::Cpu>()) {
 				func(manager->GetCpuAddr() + offset, bytes);

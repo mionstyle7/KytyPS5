@@ -276,6 +276,9 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
+	// The last graphics pipeline found and its key (entries are never erased).
+	GraphicsPipelineKey                                     m_last_graphics_key {};
+	Pipeline*                                               m_last_graphics_pipeline = nullptr;
 
 	void InitializeDriverCache();
 	// Takes a finished background compile into the pipeline; false while it still runs.

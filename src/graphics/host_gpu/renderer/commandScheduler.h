@@ -16,6 +16,7 @@
 #include <new>
 #include <type_traits>
 
+#include <atomic>
 #include <queue>
 
 #include <thread>
@@ -219,6 +220,7 @@ private:
 	uint32_t                     m_recorded_release_mem_interrupts = 0;
 	uint32_t                     m_recorded_draws                  = 0;
 	std::queue<PendingOperation> m_pending_operations;
+	std::atomic<uint32_t>        m_pending_count {0}; // m_pending_operations.size(), read unlocked
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
