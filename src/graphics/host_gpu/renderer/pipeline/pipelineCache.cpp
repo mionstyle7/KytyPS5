@@ -614,7 +614,19 @@ struct PendingGraphicsPipeline {
 	// Set for a fast-first upgrade (graphics or compute): compiles the optimized pipeline. Unset,
 	// the job compiles `build`.
 	std::function<vk::Result(vk::Pipeline*)> create;
+	// A deferred unoptimized build (a known slow shader): the optimized build queued once it is in.
+	std::function<vk::Result(vk::Pipeline*)> then_optimize;
 };
+
+// KYTY_PIPELINE_SLOW_MS (default 100; 0 off): a fast-first build on the GPU thread this slow marks
+// the pipeline's larger shader. A new pipeline with a marked shader is built on a worker (unless
+// the driver cache holds it) and its draws are skipped until it is in, instead of stopping every
+// queue: one vertex shader paired with a new pixel shader cost ~1.2 s per pipeline even
+// unoptimized, 4-9 s of every 10 s while new areas came into view (2026-10-16).
+static const uint64_t g_pipeline_slow_ms = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_SLOW_MS");
+	return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {100};
+}();
 
 // KYTY_PIPELINE_FAST_FIRST (default on; =0 off): a pipeline the driver cache does not hold is
 // built at once without driver optimization (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT, ~150x
@@ -3048,6 +3060,16 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 	}
 	EXIT_NOT_IMPLEMENTED(job.result != vk::Result::eSuccess || job.pipeline == nullptr);
 	pipeline.pipeline = job.pipeline;
+	if (job.then_optimize && m_compiler != nullptr && !m_compiler->Stopped()) {
+		auto upgrade          = std::make_shared<PendingGraphicsPipeline>();
+		upgrade->vs_hash      = job.vs_hash;
+		upgrade->ps_hash      = job.ps_hash;
+		upgrade->driver_cache = job.driver_cache;
+		upgrade->create       = std::move(job.then_optimize);
+		pipeline.upgrade      = upgrade;
+		Profiler::Add(Profiler::Counter::PipelinesPending);
+		m_compiler->Submit(std::move(upgrade));
+	}
 	pipeline.pending.reset();
 	return true;
 }
@@ -3365,6 +3387,51 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		const auto vs_hash      = vs_input_info.stage.program->shader_hash;
 		const auto ps_hash      = ps_active ? ps_input_info->stage.program->shader_hash : 0;
 		const auto build_begin  = std::chrono::steady_clock::now();
+		const auto slow_stage   = [&](uint64_t hash) {
+			return hash != 0 && m_slow_stages.contains(hash);
+		};
+		if (g_pipeline_slow_ms != 0 && may_defer && !layer_draw && m_compiler != nullptr &&
+		    !m_compiler->Stopped() && (slow_stage(vs_hash) || slow_stage(ps_hash))) {
+			const auto create = [shared_build, base_flags, driver_cache](vk::PipelineCreateFlags flags,
+			                                                             vk::Pipeline* out) {
+				shared_build->pipeline_info.flags = base_flags | flags;
+				return CreateGraphicsPipeline(*shared_build, driver_cache, out);
+			};
+			vk::Pipeline in_cache = nullptr;
+			if (m_graphics.pipeline_cache_control_enabled &&
+			    create(vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired, &in_cache) ==
+			        vk::Result::eSuccess &&
+			    in_cache != nullptr) {
+				cached->pipeline      = in_cache;
+				auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+				EXIT_IF(!inserted);
+				return iter->second.get();
+			}
+			auto job           = std::make_shared<PendingGraphicsPipeline>();
+			job->vs_hash       = vs_hash;
+			job->ps_hash       = ps_hash;
+			job->driver_cache  = driver_cache;
+			job->create        = [create](vk::Pipeline* out) {
+				return create(vk::PipelineCreateFlagBits::eDisableOptimization, out);
+			};
+			job->then_optimize = [create](vk::Pipeline* out) { return create({}, out); };
+			cached->pending    = job;
+			Profiler::Add(Profiler::Counter::PipelinesPending);
+			m_compiler->Submit(job);
+			static uint64_t deferred_slow = 0;
+			if (++deferred_slow % 16u == 1u) {
+				LOGF("Slow pipelines: %" PRIu64 " built on a worker (VS 0x%016" PRIx64
+				     " PS 0x%016" PRIx64 "), their draws skipped meanwhile\n",
+				     deferred_slow, vs_hash, ps_hash);
+			}
+			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+			EXIT_IF(!inserted);
+			auto& pending = *iter->second;
+			if (!FinishPending(pending)) {
+				return defer();
+			}
+			return &pending;
+		}
 		if (BuildFastFirst(*cached, vs_hash, ps_hash,
 		                   [shared_build, base_flags, driver_cache](vk::PipelineCreateFlags flags,
 		                                                            vk::Pipeline* out) {
@@ -3372,6 +3439,20 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			                   return CreateGraphicsPipeline(*shared_build, driver_cache, out);
 		                   })) {
 			ReportGraphicsPipelineBuilt(vs_hash, ps_hash, build_begin);
+			if (const auto ms = static_cast<uint64_t>(
+			        std::chrono::duration_cast<std::chrono::milliseconds>(
+			            std::chrono::steady_clock::now() - build_begin)
+			            .count());
+			    g_pipeline_slow_ms != 0 && ms >= g_pipeline_slow_ms) {
+				// The larger stage is the slow one (a vertex shader paired with many pixel shaders).
+				const bool vs_larger = vertex_words >= (ps_active ? pixel_program.spirv_words : 0);
+				const auto slow      = vs_larger || ps_hash == 0 ? vs_hash : ps_hash;
+				if (m_slow_stages.emplace(slow, static_cast<uint32_t>(ms)).second) {
+					LOGF("Slow pipelines: shader 0x%016" PRIx64 " marked (%" PRIu64
+					     " ms unoptimized; VS %" PRIu64 " words, PS %u words)\n",
+					     slow, ms, vertex_words, ps_active ? pixel_program.spirv_words : 0u);
+				}
+			}
 			LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 			EXIT_IF(!inserted);

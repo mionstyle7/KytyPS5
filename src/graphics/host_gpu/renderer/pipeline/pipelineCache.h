@@ -292,6 +292,9 @@ private:
 	bool BuildFastFirst(Pipeline& pipeline, uint64_t first_hash, uint64_t second_hash,
 	                    std::function<vk::Result(vk::PipelineCreateFlags, vk::Pipeline*)> create);
 	std::vector<std::pair<vk::Pipeline, uint64_t>> m_retired_pipelines;
+	// Shaders whose pipelines took long to build even without optimization (KYTY_PIPELINE_SLOW_MS):
+	// later pipelines with one of them build on a worker while their draws are skipped.
+	std::unordered_map<uint64_t, uint32_t> m_slow_stages;
 };
 
 // KYTY_DYNAMIC_RASTER_STATE (default on): cull mode and front face (and, except on macOS, the
