@@ -20,6 +20,10 @@ struct HostImageFeatures {
 	// guest float mode flushes FP32 denormals declare DenormFlushToZero instead of emulating the
 	// flush with five instructions around each legacy MAD, compare and conversion operand.
 	bool denorm_flush_f32 = false;
+	// Without host flushing (NVIDIA reports no shaderDenormFlushToZeroFloat32): the emulated
+	// flush is skipped all the same (KYTY_EXACT_DENORMS=1 keeps it). It changes results only for
+	// values below 1.2e-38, and it was half the instructions of the heaviest shaders.
+	bool approximate_denorms = false;
 };
 
 void              SetHostImageFeatures(const HostImageFeatures& features);

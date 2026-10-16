@@ -146,6 +146,8 @@ struct EmitterState {
 	// FP_DENORM bits 4-5 clear: 0xc0, which vertex, geometry and pixel shaders are required to
 	// have), when the device supports it.
 	const bool flush_f32_denorms = float_controls && HostFlushesF32Denorms(program.stage, input_info);
+	// No flush is emulated: the host flushes (above), or the approximation is on.
+	const bool skip_f32_flush = flush_f32_denorms || GetHostImageFeatures().approximate_denorms;
 	uint32_t                                         lane_count              = 1;
 	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
 	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.

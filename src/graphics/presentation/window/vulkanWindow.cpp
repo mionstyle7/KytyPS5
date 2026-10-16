@@ -646,10 +646,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    const char* value = std::getenv("KYTY_HOST_FTZ");
 		    return value == nullptr || value[0] != '0';
 	    }();
-	ShaderRecompiler::Spirv::SetHostImageFeatures(
-	    {.min_lod = shader_resource_min_lod, .denorm_flush_f32 = host_ftz});
+	const bool exact_denorms = [] {
+		const char* value = std::getenv("KYTY_EXACT_DENORMS");
+		return value != nullptr && value[0] == '1';
+	}();
+	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod             = shader_resource_min_lod,
+	                                               .denorm_flush_f32    = host_ftz,
+	                                               .approximate_denorms = !host_ftz && !exact_denorms});
 	LOGF("Vulkan FP32 denormal flush in shaders: %s (device %s, independence %d)\n",
-	     host_ftz ? "host" : "emulated",
+	     host_ftz ? "host" : exact_denorms ? "emulated" : "skipped (approximate)",
 	     float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE ? "supports it" : "does not",
 	     static_cast<int>(float_controls.denormBehaviorIndependence));
 	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
