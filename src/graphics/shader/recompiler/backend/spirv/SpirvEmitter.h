@@ -29,6 +29,15 @@ struct HostImageFeatures {
 void              SetHostImageFeatures(const HostImageFeatures& features);
 HostImageFeatures GetHostImageFeatures();
 
+// From the Demon's Souls fork: storage buffer loads the device bounds-checks the same way the
+// shader would (robustBufferAccess2 with byte-exact ranges reads zero out of bounds) need neither
+// the bounds check nor a branch on the lane mask; the load runs for every lane and the lane mask
+// selects its result. Stores and atomics keep their checks (the null buffer is a shared
+// fallback). Set with the device, before any program compiles; KYTY_ROBUST_BUFFERS=0 keeps the
+// shader checks.
+void SetDeviceStorageBufferBounds(bool enabled);
+bool DeviceStorageBufferBoundsEnabled();
+
 // S_MEMREALTIME counts at 100 MHz. The emitter reads the device clock (OpReadClockKHR, device
 // scope) and shifts it right by this many bits to approach that rate. The device layer sets it
 // from the device's clock rate: 3 for a 1 GHz clock (NVIDIA, the default), 0 for a 100 MHz one

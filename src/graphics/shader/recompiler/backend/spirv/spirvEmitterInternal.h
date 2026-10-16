@@ -661,6 +661,9 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) {
+		return fn();
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto header     = state.current_label;
 	const auto merge_label = state.builder.AllocateId();

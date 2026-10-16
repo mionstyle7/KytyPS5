@@ -513,6 +513,16 @@ uint32_t GetDeviceClockShift() {
 	return g_device_clock_shift.load(std::memory_order_relaxed);
 }
 
+static std::atomic<bool> g_device_storage_buffer_bounds {false};
+
+void SetDeviceStorageBufferBounds(bool enabled) {
+	g_device_storage_buffer_bounds.store(enabled, std::memory_order_relaxed);
+}
+
+bool DeviceStorageBufferBoundsEnabled() {
+	return g_device_storage_buffer_bounds.load(std::memory_order_relaxed);
+}
+
 static std::atomic<bool> g_denorm_flush_f32 {false};
 static std::atomic<bool> g_approximate_denorms {false};
 

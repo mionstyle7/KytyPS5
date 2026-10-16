@@ -287,28 +287,46 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 // buffer_load_dwordx3, four nested branches each) took ~210 ms a dispatch. Out-of-range and
 // inactive-lane loads are memory-safe: the device runs with robustBufferAccess, and storage
 // buffers are the only resources this applies to (not LDS, scratch or device addresses).
+// With device storage buffer bounds (Spirv::SetDeviceStorageBufferBounds, the Demon's Souls
+// fork's robustBufferAccess2 change) this is the default: an out-of-range load reads zero on the
+// device, so neither the bounds check nor the branch on the lane mask is needed (KYTY_BRANCHLESS_LOADS=0
+// keeps the branches).
 static bool BranchlessLoads() {
-	static const bool enabled = [] {
+	static const int setting = [] {
 		const char* value = std::getenv("KYTY_BRANCHLESS_LOADS");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
 	}();
-	return enabled;
+	return setting == 1 || (setting == -1 && DeviceStorageBufferBoundsEnabled());
 }
 
 static bool BranchlessLoad(const IR::MemoryInfo& mem) {
 	return BranchlessLoads() && mem.kind == IR::ResourceKind::Buffer;
 }
 
+// The bounds condition of a storage buffer load: a constant true where the device bounds it the
+// same way (stores and atomics keep EmitMemoryElementInBounds).
+static uint32_t LoadElementInBounds(EmitterState& state, const MemoryResourceAccess& resource,
+                                    uint32_t index) {
+	if (DeviceStorageBufferBoundsEnabled() && (resource.kind == IR::ResourceKind::Buffer ||
+	                                           resource.kind == IR::ResourceKind::ScalarBuffer)) {
+		return ConstantBool(state, true);
+	}
+	return EmitMemoryElementInBounds(state, resource, index);
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem);
 	if (BranchlessLoad(mem) && resource.kind == IR::ResourceKind::Buffer) {
-		const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+		const auto in_bounds = LoadElementInBounds(ctx.state, resource, index);
 		const auto value     = LoadWordInBounds(ctx, resource, index);
+		if (in_bounds == ConstantBool(ctx.state, true)) {
+			return value;
+		}
 		return Select(ctx.state, TypeU32(ctx.state), in_bounds, value, ConstantU32(ctx.state, 0));
 	}
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
+	    ctx.state, LoadElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
@@ -333,7 +351,7 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
+	    ctx.state, LoadElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend); });
 }
 
@@ -377,6 +395,12 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
                      bool sign_extend) {
+	if (BranchlessLoad(mem)) {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		const auto value    = LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
+		return Select(ctx.state, TypeU32(ctx.state), ctx.Arg(inst, inst.NumArgs() - 1), value,
+		              ConstantU32(ctx.state, 0));
+	}
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
@@ -729,7 +753,11 @@ uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& 
 }
 
 uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+	// Branchless (device bounds): loaded for every lane, the lane mask selects the result; the
+	// format's own bounds check stays (its out-of-bounds value is not always zero).
+	const auto active = BranchlessLoad(mem) ? ConstantBool(ctx.state, true)
+	                                        : ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto loaded = EmitValueOrZeroIfCondition(ctx.state, active, [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
 		if (info.type == Format::ComponentType::Unknown) {
@@ -741,6 +769,11 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 		    FormattedOutOfBoundsValue(ctx, mem, plan, 1u),
 		    [&]() { return LoadFormattedInBounds(ctx, mem, plan, 0u); });
 	});
+	if (active != ConstantBool(ctx.state, true) || !BranchlessLoad(mem)) {
+		return loaded;
+	}
+	return Select(ctx.state, TypeU32(ctx.state), ctx.Arg(inst, inst.NumArgs() - 1), loaded,
+	              ConstantU32(ctx.state, 0));
 }
 
 uint32_t EncodeFormattedStoreComponent(ValueEmitContext& ctx,
@@ -1445,7 +1478,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
-	const auto condition = EmitMemoryElementInBounds(state, access, element);
+	const auto condition = LoadElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
 		           const auto pointer = EmitMemoryElementPointer(state, access, element);
 		           if (access.memory_access == spv::MemoryAccessMaskNone) {

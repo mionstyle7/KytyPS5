@@ -695,6 +695,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
+	// Byte-exact device bounds make the shaders' own storage buffer load checks redundant
+	// (Spirv::SetDeviceStorageBufferBounds, from the Demon's Souls fork). KYTY_ROBUST_BUFFERS=0
+	// keeps them.
+	bool device_buffer_bounds = false;
+	if (robustness2_ext_enabled && robustness2.robustBufferAccess2 == VK_TRUE) {
+		vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
+		vk::PhysicalDeviceProperties2              robust_properties2 {};
+		robust_properties2.pNext = &robustness2_properties;
+		physical_device.getProperties2(&robust_properties2);
+		const char* setting  = std::getenv("KYTY_ROBUST_BUFFERS");
+		device_buffer_bounds = robustness2_properties.robustStorageBufferAccessSizeAlignment == 1 &&
+		                       !(setting != nullptr && setting[0] == '0');
+	}
+	ShaderRecompiler::Spirv::SetDeviceStorageBufferBounds(device_buffer_bounds);
+	LOGF("Vulkan storage buffer load bounds: %s\n", device_buffer_bounds ? "device" : "shader");
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 #if defined(__APPLE__)
