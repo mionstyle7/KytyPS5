@@ -1607,9 +1607,34 @@ struct PipelineCache::ProgramCache {
 		return handle;
 	}
 
+	// KYTY_DUMP_SHADER_HASHES with KYTY_DUMP_GAVE_UP: the guest code of a listed shader is written
+	// at its first use even when the disk cache spares its translation (which dumps otherwise).
+	static void DumpListedCode(const ShaderParams& params, const char* stage_name) {
+		static const char* list   = std::getenv("KYTY_DUMP_SHADER_HASHES");
+		static const char* folder = std::getenv("KYTY_DUMP_GAVE_UP");
+		if (list == nullptr || folder == nullptr ||
+		    std::string_view(list).find(fmt::format("{:016x}", params.hash)) == std::string_view::npos) {
+			return;
+		}
+		static std::mutex                   mutex;
+		static std::unordered_set<uint64_t> dumped;
+		std::lock_guard                     lock(mutex);
+		if (!dumped.insert(params.hash).second) {
+			return;
+		}
+		const auto path = fmt::format("{}/{}_{:016x}.bin", folder, stage_name, params.hash);
+		if (FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+			std::fwrite(params.code.data(), sizeof(uint32_t), params.code.size(), file);
+			std::fclose(file);
+		}
+		LOGF("Dumped guest code of %s 0x%016" PRIx64 " (%zu words) to %s\n", stage_name, params.hash,
+		     params.code.size(), path.c_str());
+	}
+
 	template <typename InputInfo>
 	ShaderProgram GetNormal(const ShaderParams& params, InputInfo& input_info,
 	                        uint32_t& push_data_cursor) {
+		DumpListedCode(params, StageLabel(StageOf(input_info)));
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;

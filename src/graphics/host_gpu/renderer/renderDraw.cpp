@@ -1029,9 +1029,13 @@ void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderSt
 	}
 	LOGF("WatchShader draw: %s count=%u instances=%u first_instance=%u index_offset=%u "
 	     "base_vertex=%d first_vertex=%u host_vertex_offset=%d host_first_instance=%u "
-	     "indirect=%d\n",
+	     "indirect=%d colors=%u depth=%d ps=0x%016" PRIx64 "\n",
 	     draw.Name(), draw.index_count, draw.instance_count, draw.first_instance, index_offset,
-	     base_vertex, first_vertex, host_vertex_offset, host_first_instance, indirect ? 1 : 0);
+	     base_vertex, first_vertex, host_vertex_offset, host_first_instance, indirect ? 1 : 0,
+	     state.color_count, state.depth_info.image_id ? 1 : 0,
+	     state.ps_active && state.ps_input_info.stage.program != nullptr
+	         ? state.ps_input_info.stage.program->shader_hash
+	         : 0);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
