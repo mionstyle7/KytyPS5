@@ -669,6 +669,10 @@ vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::Pipeli
 	const auto create_begin = std::chrono::steady_clock::now();
 	const auto result =
 	    build.device.createGraphicsPipelines(driver_cache, 1, &build.pipeline_info, nullptr, pipeline);
+	if (result == vk::Result::eSuccess && driver_cache != nullptr &&
+	    !(build.pipeline_info.flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired)) {
+		NoteDriverCacheCompile();
+	}
 	// On the GPU thread, a slow pipeline stops every queue.
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - create_begin)
@@ -763,6 +767,10 @@ vk::Result CreateComputePipelineHandle(GraphicContext& graphics, vk::PipelineLay
 	const auto create_begin = std::chrono::steady_clock::now();
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, pipeline);
+	if (result == vk::Result::eSuccess && driver_cache != nullptr &&
+	    !(info.flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired)) {
+		NoteDriverCacheCompile();
+	}
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - create_begin)
 	                               .count();

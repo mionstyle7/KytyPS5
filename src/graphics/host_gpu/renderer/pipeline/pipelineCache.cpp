@@ -2647,8 +2647,9 @@ void PipelineCache::InitializeDriverCache() {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		// Pipelines of older builds stay in the file; past 1 GiB it starts over.
-		constexpr uint64_t max_file_size = uint64_t {1} << 30u;
+		// Pipelines of older builds stay in the file; past 2 GiB it starts over (this title's cache
+		// passed 900 MB, and starting over brings every pipeline build back as a stutter).
+		constexpr uint64_t max_file_size = uint64_t {2} << 30u;
 		if (file_size >= signature.size() + sizeof(uint64_t) && file_size <= max_file_size) {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
@@ -2699,19 +2700,58 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+	m_driver_cache_saved_size = initial_data.size();
+	StartDriverCacheSaver();
 }
 
-void PipelineCache::Save() {
-	m_program_cache->FlushDisk();
-	// No worker may use the driver cache once it is destroyed below; later pipelines are
-	// compiled on the GPU thread (FinishPending).
-	if (m_compiler != nullptr) {
-		m_compiler->Stop();
-	}
-	if (m_driver_cache == nullptr) {
+namespace {
+// Pipelines compiled into the driver cache, and when the last one finished (steady clock ticks).
+std::atomic<uint64_t> g_driver_cache_compiles {0};
+std::atomic<int64_t>  g_driver_cache_last_compile {0};
+} // namespace
+
+void NoteDriverCacheCompile() {
+	g_driver_cache_last_compile.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+	                                  std::memory_order_release);
+	g_driver_cache_compiles.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// The driver cache was written only when the window closed normally: a session ended any other
+// way (closing the console, a crash, ending the process) lost every pipeline it compiled, and the
+// next run built them again on the GPU thread, the same stutters at the same places. As in the
+// Demon's Souls fork (Kyty.TableCache), a background thread writes it once no pipeline has compiled
+// for 20 s. KYTY_PIPELINE_CACHE_AUTOSAVE=0 turns it off.
+void PipelineCache::StartDriverCacheSaver() {
+	if (const char* value = std::getenv("KYTY_PIPELINE_CACHE_AUTOSAVE");
+	    value != nullptr && value[0] == '0') {
 		return;
 	}
+	m_driver_cache_saver = std::jthread([this](std::stop_token stop) {
+		KYTY_PROFILER_THREAD("PipelineCacheSaver");
+		std::mutex                  mutex;
+		std::condition_variable_any wake;
+		uint64_t saved = g_driver_cache_compiles.load(std::memory_order_acquire);
+		while (!stop.stop_requested()) {
+			{
+				std::unique_lock lock(mutex);
+				wake.wait_for(lock, stop, std::chrono::seconds(5), [] { return false; });
+			}
+			if (stop.stop_requested()) {
+				break;
+			}
+			const auto done = g_driver_cache_compiles.load(std::memory_order_acquire);
+			const auto last = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(
+			    g_driver_cache_last_compile.load(std::memory_order_acquire)));
+			if (done != saved && std::chrono::steady_clock::now() - last >= std::chrono::seconds(20)) {
+				if (WriteDriverCache()) {
+					saved = done;
+				}
+			}
+		}
+	});
+}
 
+bool PipelineCache::WriteDriverCache() {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -2721,6 +2761,9 @@ void PipelineCache::Save() {
 		if (result != vk::Result::eSuccess || size == 0 ||
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
+		}
+		if (size == m_driver_cache_saved_size) {
+			return true;
 		}
 		payload.resize(size);
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
@@ -2732,7 +2775,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -2740,7 +2783,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -2757,10 +2800,29 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
+	m_driver_cache_saved_size = payload.size();
+	return true;
+}
+
+void PipelineCache::Save() {
+	m_program_cache->FlushDisk();
+	// No worker may use the driver cache once it is destroyed below; later pipelines are
+	// compiled on the GPU thread (FinishPending).
+	if (m_compiler != nullptr) {
+		m_compiler->Stop();
+	}
+	if (m_driver_cache_saver.joinable()) {
+		m_driver_cache_saver.request_stop();
+		m_driver_cache_saver.join();
+	}
+	if (m_driver_cache == nullptr) {
+		return;
+	}
+	(void)WriteDriverCache();
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
 }

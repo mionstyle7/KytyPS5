@@ -14,11 +14,17 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <stop_token>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Called after a pipeline is compiled into the driver cache (any thread): the background saver
+// writes the cache once no compile happened for a while.
+void NoteDriverCacheCompile();
 
 struct GraphicContext;
 struct ShaderParams;
@@ -271,6 +277,10 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	// Size of the driver cache data last loaded or written (an unchanged cache is not rewritten).
+	size_t                        m_driver_cache_saved_size = 0;
+	// Writes the driver cache once its compiles settle (KYTY_PIPELINE_CACHE_AUTOSAVE=0 off).
+	std::jthread                  m_driver_cache_saver;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -281,6 +291,9 @@ private:
 	Pipeline*                                               m_last_graphics_pipeline = nullptr;
 
 	void InitializeDriverCache();
+	// Writes the driver cache to its file (through a temporary file); false on failure.
+	bool WriteDriverCache();
+	void StartDriverCacheSaver();
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
 	// Fast-first pipelines: swaps in a finished optimized build; destroys replaced pipelines once
