@@ -1048,7 +1048,10 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint32_t> static_state;
 		// Exact expanded code includes callees and their original return-PC constants.
 		// A different target/body must not reuse a program compiled for an earlier call.
-		std::vector<uint32_t> function_code;
+		// The expanded code (shader calls inlined) is identified by its size and hash; the words
+		// stay in the expander (copying and comparing them every dispatch was ~6 % of the GPU thread).
+		uint64_t              function_hash = 0;
+		uint32_t              function_size = 0;
 
 		bool operator==(const ProgramKey&) const = default;
 	};
@@ -1087,7 +1090,8 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
-			PipelineKeyHash::Mix(hash, key.function_code.size());
+			PipelineKeyHash::Mix(hash, key.function_size);
+			PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.function_hash));
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
 			// exact state comparison needed on a stable hit without hashing the full state first.
 			return hash;
@@ -1628,10 +1632,17 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
-		lookup_key.function_code.clear();
+		lookup_key.function_hash = 0;
+		lookup_key.function_size = 0;
+		const std::vector<uint32_t>* function_code = nullptr;
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			ExpandShaderFunctions(params, user_data, input_info.wave_size,
-			                      lookup_key.function_code);
+			ExpandShaderFunctions(params, user_data, input_info.wave_size, function_code,
+			                      lookup_key.function_hash);
+			if (function_code != nullptr && !function_code->empty()) {
+				lookup_key.function_size = static_cast<uint32_t>(function_code->size());
+			} else {
+				lookup_key.function_hash = 0;
+			}
 		}
 		if (unsupported.contains(lookup_key)) {
 			Profiler::Add(Profiler::Counter::SkippedGaveUp);
@@ -1803,9 +1814,9 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		options.non_fatal = ShaderFailureNonFatal();
 		options.bindless_images = bindless_images;
-		const auto compile_code = lookup_key.function_code.empty()
+		const auto compile_code = lookup_key.function_size == 0
 		                              ? params.code
-		                              : std::span<const uint32_t>(lookup_key.function_code);
+		                              : std::span<const uint32_t>(*function_code);
 		// The shader disk cache (shaderDiskCache.h): a source entry stands in for the translation
 		// of a source new to this session, a permutation entry for the compile. In verify mode
 		// both are only compared with a fresh translation. A hit is not a compile: it is not
@@ -2065,11 +2076,12 @@ struct PipelineCache::ProgramCache {
 	// Shader function expansion decodes the shader and every callee, and a shader with table
 	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
 	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
-	                           uint32_t wave_size, std::vector<uint32_t>& expanded) {
+	                           uint32_t wave_size, const std::vector<uint32_t>*& expanded,
+	                           uint64_t& expanded_hash) {
 		std::string reason;
 		// A stage record being stored keeps every word the expansion read (its proof covers the
 		// callee code and the call tables as well as the SRT).
-		if (!function_expander.Expand(
+		if (!function_expander.ExpandKept(
 		        params.code, params.Base(), user_data,
 		        [this](uint64_t address, std::span<uint32_t> words) {
 			        const bool ok = ReadShaderGuestMemoryRaw(nullptr, address, words);
@@ -2084,7 +2096,7 @@ struct PipelineCache::ProgramCache {
 			        }
 			        return ok;
 		        },
-		        expanded, reason, wave_size)) {
+		        expanded, expanded_hash, reason, wave_size)) {
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1) < 16) {
 				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
@@ -2163,7 +2175,8 @@ struct PipelineCache::ProgramCache {
 		prep_key.user_data_count = params.user_data_count;
 		prep_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, prep_key.static_state);
-		prep_key.function_code.clear();
+		prep_key.function_hash = 0;
+		prep_key.function_size = 0;
 		const auto entry = programs.find(prep_key);
 		return entry != programs.end() ? &entry->second : nullptr;
 	}
@@ -2290,7 +2303,8 @@ struct PipelineCache::ProgramCache {
 		key.user_data_count = params.user_data_count;
 		key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, key.static_state);
-		key.function_code.clear();
+		key.function_hash = 0;
+		key.function_size = 0;
 		std::shared_lock programs_lock(programs_mutex);
 		const auto       entry = programs.find(key);
 		return entry != programs.end() ? &entry->second : nullptr;

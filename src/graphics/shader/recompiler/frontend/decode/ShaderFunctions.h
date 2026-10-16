@@ -42,6 +42,14 @@ public:
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
 	            uint32_t wave_size);
 
+	// Expand without copying: `expanded` points at the expansion the expander keeps (valid until
+	// the next call; empty when the shader has no calls) and `expanded_hash` is a hash of its
+	// words, computed once when the expansion was built.
+	bool ExpandKept(std::span<const uint32_t> code, uint64_t base,
+	                std::span<const uint32_t> user_data, const ShaderCodeReader& read,
+	                const std::vector<uint32_t>*& expanded, uint64_t& expanded_hash,
+	                std::string& reason, uint32_t wave_size);
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

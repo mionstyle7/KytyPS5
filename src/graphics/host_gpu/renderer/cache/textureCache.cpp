@@ -2363,7 +2363,17 @@ void TextureCache::RunGarbageCollector() {
 		// the frame that used them, to recreate them the next (11 000 images a second at the
 		// title menu). An image used in the frame being recorded is never a candidate, at any
 		// pressure; over budget the collector reaches back only as far as the previous frame.
-		const uint64_t age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
+		// KYTY_GC_MIN_AGE_FRAMES (default 8): never closer than this. When the device is short for
+		// reasons outside this cache (buffers, targets, the driver), its thresholds drop to the
+		// 512 MB floor and freeing images cannot end the shortfall: images unused for one frame
+		// were written back (a full read and two hashes of each) and revived the next, ~100 per
+		// five frames, ~9 % of the GPU thread at 4 fps. The working set of the last frames stays.
+		static const uint64_t min_age = [] {
+			const char* value = std::getenv("KYTY_GC_MIN_AGE_FRAMES");
+			return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {8};
+		}();
+		const uint64_t age = std::min<uint64_t>(
+		    std::max<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, min_age), clock);
 		// Under pressure the work is budgeted per frame, in bytes actually freed, and in
 		// proportion to the excess, so the cache converges on its threshold instead of either
 		// churning (a per-run budget: 7 600 submissions a frame) or growing without bound (a

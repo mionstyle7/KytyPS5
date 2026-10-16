@@ -651,6 +651,7 @@ struct ShaderFunctionExpander::Impl {
 		bool                  ok = false;
 		std::string           reason;
 		std::vector<uint32_t> code;
+		uint64_t              hash = 0; // HashExpansion(code)
 	};
 	struct Shader {
 		ShaderAnalysis         analysis;
@@ -660,6 +661,7 @@ struct ShaderFunctionExpander::Impl {
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<uint32_t>                scratch;
+	std::vector<CallSite>                sites; // reused by every expansion
 
 	bool StillReads(const Expansion& expansion, const ShaderCodeReader& read) {
 		for (const auto& [address, words]: expansion.reads) {
@@ -681,7 +683,36 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
                                     std::span<const uint32_t> user_data,
                                     const ShaderCodeReader& read, std::vector<uint32_t>& expanded,
                                     std::string& reason, uint32_t wave_size) {
-	expanded.clear();
+	const std::vector<uint32_t>* kept = nullptr;
+	uint64_t                     hash = 0;
+	const bool ok = ExpandKept(code, base, user_data, read, kept, hash, reason, wave_size);
+	if (kept != nullptr) {
+		expanded = *kept;
+	} else {
+		expanded.clear();
+	}
+	return ok;
+}
+
+static uint64_t HashExpansion(const std::vector<uint32_t>& words) {
+	uint64_t hash = 0x9e3779b97f4a7c15ull ^ words.size();
+	for (const auto word: words) {
+		hash ^= word;
+		hash *= 0xff51afd7ed558ccdull;
+		hash ^= hash >> 33u;
+	}
+	hash *= 0xc4ceb9fe1a85ec53ull;
+	return hash ^ (hash >> 29u);
+}
+
+bool ShaderFunctionExpander::ExpandKept(std::span<const uint32_t> code, uint64_t base,
+                                        std::span<const uint32_t> user_data,
+                                        const ShaderCodeReader& read,
+                                        const std::vector<uint32_t>*& expanded,
+                                        uint64_t& expanded_hash, std::string& reason,
+                                        uint32_t wave_size) {
+	expanded      = nullptr;
+	expanded_hash = 0;
 	reason.clear();
 	if (wave_size != 32u && wave_size != 64u) {
 		reason = "shader calls require a known wave size";
@@ -699,17 +730,19 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		reason = "shader calls combined with indirect branches are unsupported";
 		return false;
 	}
-	std::vector<CallSite> sites;
-	std::set<uint32_t>    dependencies;
+	auto&                  sites = m_impl->sites;
+	std::set<uint32_t>     dependencies;
+	sites.clear();
 	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
 		return false;
 	}
-	for (const auto& expansion: shader.expansions) {
+	for (auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
 		    m_impl->StillReads(expansion, read)) {
-			expanded = expansion.code;
-			reason   = expansion.reason;
+			expanded      = &expansion.code;
+			expanded_hash = expansion.hash;
+			reason        = expansion.reason;
 			return expansion.ok;
 		}
 	}
@@ -717,7 +750,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	expansion.base            = base;
 	expansion.wave_size       = wave_size;
 	expansion.user_data_count = user_data.size();
-	expansion.sites           = std::move(sites);
+	expansion.sites           = sites;
 	const ShaderCodeReader recording = [&](uint64_t address, std::span<uint32_t> words) {
 		const bool ok = read(address, words);
 		(ok ? expansion.reads : expansion.failed)
@@ -727,13 +760,16 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
 	                              wave_size, expansion.code, expansion.reason);
 	MergeReads(expansion.reads);
-	expanded = expansion.code;
-	reason   = expansion.reason;
+	expansion.hash = HashExpansion(expansion.code);
 	if (shader.expansions.size() >= Impl::MaxExpansions) {
 		shader.expansions.erase(shader.expansions.begin());
 	}
 	shader.expansions.push_back(std::move(expansion));
-	return shader.expansions.back().ok;
+	const auto& kept = shader.expansions.back();
+	expanded      = &kept.code;
+	expanded_hash = kept.hash;
+	reason        = kept.reason;
+	return kept.ok;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder
