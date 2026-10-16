@@ -627,6 +627,14 @@ static const uint64_t g_pipeline_slow_ms = [] {
 	const char* value = std::getenv("KYTY_PIPELINE_SLOW_MS");
 	return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {100};
 }();
+// KYTY_PIPELINE_ASYNC_WORDS (default 120000; 0 off): a pipeline whose stages hold this many SPIR-V
+// words or more is built on a worker the same way from the start. Each material pixel shader of the
+// title is its own 200-260K words and took ~1.1-1.5 s to build unoptimized, so marking the slow
+// shader caught almost none: the next pipeline's pixel shader was always a new one (2026-10-16).
+static const uint64_t g_pipeline_async_words = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_ASYNC_WORDS");
+	return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {120000};
+}();
 
 // KYTY_PIPELINE_FAST_FIRST (default on; =0 off): a pipeline the driver cache does not hold is
 // built at once without driver optimization (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT, ~150x
@@ -744,10 +752,15 @@ public:
 	~PipelineCompiler() { Stop(); }
 	KYTY_CLASS_NO_COPY(PipelineCompiler);
 
-	void Submit(std::shared_ptr<PendingGraphicsPipeline> job) {
+	// `urgent`: a pipeline draws wait for (skipped until it is in), ahead of optimized upgrades.
+	void Submit(std::shared_ptr<PendingGraphicsPipeline> job, bool urgent = false) {
 		{
 			std::lock_guard lock(m_mutex);
-			m_queue.push_back(std::move(job));
+			if (urgent) {
+				m_queue.push_front(std::move(job));
+			} else {
+				m_queue.push_back(std::move(job));
+			}
 		}
 		m_work.notify_one();
 	}
@@ -3390,8 +3403,11 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		const auto slow_stage   = [&](uint64_t hash) {
 			return hash != 0 && m_slow_stages.contains(hash);
 		};
-		if (g_pipeline_slow_ms != 0 && may_defer && !layer_draw && m_compiler != nullptr &&
-		    !m_compiler->Stopped() && (slow_stage(vs_hash) || slow_stage(ps_hash))) {
+		if ((g_pipeline_slow_ms != 0 || g_pipeline_async_words != 0) && may_defer && !layer_draw &&
+		    m_compiler != nullptr &&
+		    !m_compiler->Stopped() &&
+		    (slow_stage(vs_hash) || slow_stage(ps_hash) ||
+		     (g_pipeline_async_words != 0 && spirv_words >= g_pipeline_async_words))) {
 			const auto create = [shared_build, base_flags, driver_cache](vk::PipelineCreateFlags flags,
 			                                                             vk::Pipeline* out) {
 				shared_build->pipeline_info.flags = base_flags | flags;
@@ -3417,7 +3433,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			job->then_optimize = [create](vk::Pipeline* out) { return create({}, out); };
 			cached->pending    = job;
 			Profiler::Add(Profiler::Counter::PipelinesPending);
-			m_compiler->Submit(job);
+			m_compiler->Submit(job, true);
 			static uint64_t deferred_slow = 0;
 			if (++deferred_slow % 16u == 1u) {
 				LOGF("Slow pipelines: %" PRIu64 " built on a worker (VS 0x%016" PRIx64
