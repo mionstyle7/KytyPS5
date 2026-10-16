@@ -2345,6 +2345,15 @@ void TextureCache::RunGarbageCollector() {
 	if (CollectableMemory() < m_trigger_gc_memory) {
 		return;
 	}
+	// A run under pressure that freed nothing (everything old enough is a glyph layer, a depth
+	// association, an image that cannot be written back) found the same candidates on every
+	// submission after it: ~1 M visits per 500 runs once the device was short, the frame rate
+	// 18 -> 7 fps. It waits KYTY_GC_FUTILE_FRAMES (default 2) presented frames before looking again.
+	if (clock < m_gc_futile_until) {
+		return;
+	}
+	const auto freed_before = g_gc_skip.freed + g_gc_skip.written_back + m_pending_evictions.size();
+	const auto visited_before = g_gc_skip.visited;
 	// The collector runs once per guest submission -- this title submits hundreds of times a
 	// frame -- so a budget counted per run is really that many evictions per frame, and every
 	// eviction is an image recreated, synchronized and submitted. Budget the work per frame
@@ -2528,6 +2537,17 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (CollectableMemory() >= m_critical_gc_memory) {
 		collect(true);
+	}
+	{
+		static const uint64_t futile_frames = [] {
+			const char* value = std::getenv("KYTY_GC_FUTILE_FRAMES");
+			return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {2};
+		}();
+		const auto freed_now = g_gc_skip.freed + g_gc_skip.written_back + m_pending_evictions.size();
+		if (futile_frames != 0 && g_gc_skip.visited != visited_before && freed_now == freed_before &&
+		    CollectableMemory() >= m_pressure_gc_memory) {
+			m_gc_futile_until = clock + futile_frames;
+		}
 	}
 	if (m_gc_tick % 500 == 0) {
 		uint64_t images = 0;

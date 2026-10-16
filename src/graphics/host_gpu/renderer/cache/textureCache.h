@@ -236,6 +236,7 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	// Evictions are budgeted per frame, not per collector run: see RunGarbageCollector.
 	uint64_t         m_gc_budget_frame        = 0;
+	uint64_t         m_gc_futile_until        = 0; // LRU clock (frames)
 	uint64_t         m_gc_freed_bytes_frame   = 0;
 	size_t           m_gc_freed_images_frame  = 0;
 	uint64_t         m_gc_written_back_bytes_frame = 0;
