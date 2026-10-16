@@ -352,6 +352,33 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	// From the Demon's Souls fork (small_video_memory): on a card whose budget cannot hold the
+	// game's working set with the driver's own share (12 GB cards: ~11.5 GB budget, ~3.4 GB of it
+	// the driver's), an image that is only sampled and copied -- a texture, not a render target,
+	// depth or storage image -- goes to the memory type without flags once half the budget is in
+	// use. The driver keeps it in video memory while there is room and in system memory after, so
+	// the targets the GPU writes every frame keep video memory, and running short no longer makes
+	// the caches evict and recreate the working set (the frame rate fell from 20 to 3-7 fps at
+	// that point in every run). KYTY_TEXTURE_HOST_PLACEMENT=0 keeps every image device-local.
+	static const bool host_placement = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_HOST_PLACEMENT");
+		return value == nullptr || value[0] != '0';
+	}();
+	const bool texture = !(image_info.usage & (vk::ImageUsageFlagBits::eColorAttachment |
+	                                           vk::ImageUsageFlagBits::eDepthStencilAttachment |
+	                                           vk::ImageUsageFlagBits::eStorage));
+	if (host_placement && texture && CanReportMemoryUsage()) {
+		const auto budget = GetTotalMemoryBudget();
+		if (budget < (uint64_t {12} << 30u) && GetDeviceMemoryUsage() >= budget / 2) {
+			alloc_info.requiredFlags = 0;
+			alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			static std::atomic<uint64_t> placed {0};
+			if (placed.fetch_add(1, std::memory_order_relaxed) % 1024u == 0u) {
+				LOGF("Textures placed by the driver (video or system memory): %" PRIu64 "\n",
+				     placed.load(std::memory_order_relaxed));
+			}
+		}
+	}
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	auto             result       = static_cast<vk::Result>(
