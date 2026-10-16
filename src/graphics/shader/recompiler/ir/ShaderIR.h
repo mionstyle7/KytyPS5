@@ -716,6 +716,10 @@ struct Program: ResourcePlan {
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
 	uint32_t                      wave_size      = 64;
+	// A wave64 compute program whose lanes' results depend on no lane outside their 32-lane half
+	// (Frontend::IsWaveLaneLocal, from the Demon's Souls fork): a host with 32-wide subgroups runs
+	// it one GCN lane per invocation instead of two.
+	bool                          lane_local     = false;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;

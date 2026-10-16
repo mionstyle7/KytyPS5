@@ -549,6 +549,20 @@ target_link_libraries(pipeline_build_timer Vulkan::Headers)
 add_executable(float_minmax_check EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FloatMinMaxCheck.cpp")
 target_link_libraries(float_minmax_check Vulkan::Headers)
 
+add_executable(lane_local_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LaneLocalTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ExportOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ImageOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/MemoryOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ScalarAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ShaderDecoder.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/translate/LaneLocal.cpp"
+)
+target_link_libraries(lane_local_tests fmt::fmt)
+target_include_directories(lane_local_tests PRIVATE ${inc_headers})
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
@@ -768,7 +782,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
-	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests lane_local_tests
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
