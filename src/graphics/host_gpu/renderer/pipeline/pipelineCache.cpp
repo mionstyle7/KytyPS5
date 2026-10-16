@@ -36,6 +36,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <tuple>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -250,7 +251,90 @@ bool SrtNoDrain() {
 	return enabled;
 }
 
+// KYTY_SRT_SPECULATE (default on; =0 off): an SRT read of bytes GPU work wrote, at a site (shader,
+// address, size) whose drained value has been the same at least 8 times in a row, takes that value
+// instead of draining the GPU; every 16th such read still drains and compares, and a different
+// value resets the site (three times: it never speculates again). In the title's menu one compute
+// shader (fb5ee753) drained the GPU about two frames in three, ~10 ms each (20% of the GPU thread),
+// to read 4 bytes that were 1 every time.
+bool SrtSpeculate() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_SPECULATE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+namespace {
+struct SrtSpeculation {
+	std::vector<uint32_t> value;
+	uint32_t              same       = 0; // drained reads in a row that gave `value`
+	uint32_t              uses       = 0; // speculated reads since the last check
+	uint32_t              mismatches = 0;
+};
+constexpr uint32_t SrtSpeculateAfter   = 8;
+constexpr uint32_t SrtSpeculateCheck   = 16;
+constexpr uint32_t SrtSpeculateGiveUp  = 3;
+
+// The drained read, with the site's speculation state updated from its result.
+bool DrainedSrtRead(uint64_t address, std::span<uint32_t> values);
+
+bool SpeculatedSrtRead(uint64_t address, std::span<uint32_t> values) {
+	static std::map<std::tuple<uint64_t, uint64_t, size_t>, SrtSpeculation> sites;
+	static uint64_t speculated = 0;
+	static uint64_t checks     = 0;
+	static uint64_t misses     = 0;
+	auto& site = sites[{t_srt_shader_hash, address, values.size()}];
+	const bool stable = site.mismatches < SrtSpeculateGiveUp && site.same >= SrtSpeculateAfter &&
+	                    site.value.size() == values.size();
+	if (stable && ++site.uses % SrtSpeculateCheck != 0) {
+		std::copy(site.value.begin(), site.value.end(), values.begin());
+		if (++speculated % 1000u == 1u) {
+			LOGF("SRT speculation: %" PRIu64 " drains skipped, %" PRIu64 " checks, %" PRIu64
+			     " mismatches (last: shader 0x%016" PRIx64 " at 0x%016" PRIx64 ")\n",
+			     speculated, checks, misses, t_srt_shader_hash, address);
+		}
+		return true;
+	}
+	const bool ok = DrainedSrtRead(address, values);
+	if (!ok) {
+		site.same = 0;
+		return false;
+	}
+	const bool equal = site.value.size() == values.size() &&
+	                   std::equal(values.begin(), values.end(), site.value.begin());
+	if (stable) {
+		checks++;
+		if (!equal) {
+			misses++;
+			site.mismatches++;
+			LOGF("SRT speculation: shader 0x%016" PRIx64 " at 0x%016" PRIx64
+			     " changed under speculation (%u of %u allowed)\n",
+			     t_srt_shader_hash, address, site.mismatches, SrtSpeculateGiveUp);
+		}
+	}
+	if (equal) {
+		site.same++;
+	} else {
+		site.value.assign(values.begin(), values.end());
+		site.same = 1;
+		site.uses = 0;
+	}
+	return true;
+}
+} // namespace
+
 bool TryReadBufferBackingLogged(uint64_t address, std::span<uint32_t> values) {
+	if (SrtSpeculate() && !SrtNoDrain() && t_srt_shader_hash != 0 && values.size() <= 16 &&
+	    Libs::Graphics::GuestGpu::IsGpuThread() &&
+	    Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes())) {
+		return SpeculatedSrtRead(address, values);
+	}
+	return DrainedSrtRead(address, values);
+}
+
+namespace {
+bool DrainedSrtRead(uint64_t address, std::span<uint32_t> values) {
 	if (SrtNoDrain() && t_srt_shader_hash != 0 &&
 	    Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes())) {
 		static uint64_t stale = 0;
@@ -330,6 +414,7 @@ bool TryReadBufferBackingLogged(uint64_t address, std::span<uint32_t> values) {
 	}
 	return ok;
 }
+} // namespace
 
 // Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
