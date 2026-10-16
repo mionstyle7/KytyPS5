@@ -11,6 +11,10 @@ namespace Common {
 // KYTY_PCORE_AFFINITY=0. `name` is for the log line.
 void PreferPerformanceCores(const char* name);
 
+// The calling thread above the game's threads (Windows: THREAD_PRIORITY_HIGHEST), unless
+// KYTY_RENDER_PRIORITY=0. For the GPU thread, which every frame waits for.
+void RaiseAboveGameThreads(const char* name);
+
 } // namespace Common
 
 #endif // EMULATOR_SRC_COMMON_CPUAFFINITY_H_

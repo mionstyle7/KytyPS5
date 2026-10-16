@@ -128,4 +128,25 @@ void PreferPerformanceCores(const char* /*name*/) {}
 
 #endif
 
+// From the Demon's Souls fork: the calling thread above the normal priority of the game's threads
+// (Windows: THREAD_PRIORITY_HIGHEST; elsewhere unchanged). Every frame waits for the GPU thread;
+// at normal priority the game's streaming threads held its CPUs for whole time slices there.
+// KYTY_RENDER_PRIORITY=0 keeps the normal priority.
+void RaiseAboveGameThreads(const char* name) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RENDER_PRIORITY");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled) {
+		return;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0) {
+		LOGF("%s: priority above the game's threads\n", name);
+	}
+#else
+	(void)name;
+#endif
+}
+
 } // namespace Common
