@@ -264,6 +264,27 @@ StageResult* Take(uint32_t stage) {
 	return nullptr;
 }
 
+void Discard() {
+	const auto* key = Current();
+	if (key == nullptr) {
+		return;
+	}
+	auto&           store   = GetStore();
+	std::lock_guard lock(store.mutex);
+	auto&           pending = store.pending[key->queue % MaxQueues];
+	bool            popped  = false;
+	while (!pending.empty() && pending.front().key.Before(*key)) {
+		if (store.recycled.size() < MaxRecycled) {
+			store.recycled.push_back(std::move(pending.front()));
+		}
+		pending.pop_front();
+		popped = true;
+	}
+	if (popped) {
+		store.space.notify_one();
+	}
+}
+
 void Add(Counter counter, uint64_t value) {
 	g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
 }

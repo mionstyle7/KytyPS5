@@ -110,6 +110,9 @@ void Recycle(PacketResult& result);
 // GPU thread: the prepared refresh of `stage` for the current packet, or null; consumed ones too
 // (a later draw of the same packet may use it again). The result stays owned by the store.
 [[nodiscard]] StageResult* Take(uint32_t stage);
+// GPU thread: the current packet needs no prepared refresh (a stage record served it); results of
+// earlier packets are released as Take would, so the scanner's queue keeps moving. Not counted.
+void Discard();
 
 // Counters (always counted; logged every 10 s while enabled).
 enum class Counter : uint32_t {

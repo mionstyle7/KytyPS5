@@ -1289,9 +1289,323 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// --- Stage records (KYTY_STAGE_RECORDS) ------------------------------------------------
+	//
+	// The method of the native draw records of the Demon's Souls fork, on this tree's proof
+	// machinery (drawPrep.h). A stage's program and resource refresh depend only on the program
+	// inputs (code, user data, shader base, the static stage state, the push-data cursor, the
+	// dispatch size) and on the guest words the evaluation reads. The first use of a set of inputs
+	// runs the normal path, then repeats the evaluation with the recording probe reader (bytes no
+	// GPU work has written, every one logged) and keeps the result when it equals the normal one:
+	// the record. A later use with the same inputs whose logged words still hold the same values
+	// and are still clean takes the record's program and resources directly: no function
+	// expansion, no program lookup, no SRT evaluation or draw-prep take, no permutation search.
+	//
+	// KYTY_STAGE_RECORDS=1 on, =2 verify (every proven record is compared with the normal path,
+	// which is used). KYTY_STAGE_RECORDS_BUDGET=<n> stores a frame (default 512),
+	// KYTY_STAGE_RECORDS_KEEP=<frames> unused records kept (default 600).
+	struct StageRecord {
+		std::vector<uint32_t>                        key;
+		SourceEntry*                                 entry       = nullptr;
+		uint32_t                                     permutation = 0;
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		DrawPrep::ReadSet                            reads;
+		uint64_t                                     last_frame = 0;
+		uint64_t                                     shader     = 0; // churn key
+	};
+	struct RecordChurn {
+		uint32_t stores      = 0;
+		uint32_t hits        = 0;
+		uint64_t first_frame = 0; // of the counting window
+		uint64_t off_until   = 0; // frame
+	};
+	struct RecordStats {
+		uint64_t hits = 0, stale = 0, misses = 0, stored = 0, store_failed = 0, store_differ = 0,
+		         budget = 0, churn = 0, collisions = 0, evicted = 0, verified = 0, verify_bad = 0;
+	};
+
+	static int StageRecordsMode() {
+		static const int mode = [] {
+			const char* value = std::getenv("KYTY_STAGE_RECORDS");
+			if (value == nullptr) return 0;
+			return std::clamp(std::atoi(value), 0, 2);
+		}();
+		return mode;
+	}
+	static uint32_t StageRecordsEnv(const char* name, uint32_t fallback) {
+		const char* value = std::getenv(name);
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : fallback;
+	}
+
+	template <typename InputInfo>
+	static ShaderType StageOf(const InputInfo& input_info) {
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			return input_info.logical_stage;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			return ShaderType::Pixel;
+		} else {
+			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
+			return ShaderType::Compute;
+		}
+	}
+
+	// A frame boundary: unused records go, shaders whose records never hit get another chance.
+	void SweepRecords() {
+		if (frame == swept_frame) {
+			return;
+		}
+		swept_frame       = frame;
+		stores_this_frame = 0;
+		static const uint32_t keep = std::max(StageRecordsEnv("KYTY_STAGE_RECORDS_KEEP", 600), 2u);
+		if (frame % 64u == 0) {
+			for (auto it = records.begin(); it != records.end();) {
+				if (it->second->last_frame + keep < frame) {
+					record_stats.evicted++;
+					it = records.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - record_log_time >= std::chrono::seconds(10)) {
+			record_log_time   = now;
+			const auto& s     = record_stats;
+			uint32_t    off   = 0;
+			for (const auto& [key, churn]: record_churn) {
+				off += churn.off_until > frame ? 1u : 0u;
+			}
+			LOGF("Stage records (10 s): hits %" PRIu64 ", stale %" PRIu64 ", misses %" PRIu64
+			     ", stored %" PRIu64 " (failed %" PRIu64 ", differ %" PRIu64 "), not stored (budget %" PRIu64
+			     ", churn %" PRIu64 "), collisions %" PRIu64 ", evicted %" PRIu64 ", verified %" PRIu64
+			     " (bad %" PRIu64 "); %zu records, %u shaders off\n",
+			     s.hits, s.stale, s.misses, s.stored, s.store_failed, s.store_differ, s.budget, s.churn,
+			     s.collisions, s.evicted, s.verified, s.verify_bad, records.size(), off);
+			record_stats = {};
+		}
+	}
+
+	// Stores are bounded per frame (a new area brings hundreds of objects at once), and a shader
+	// whose inputs are new every use (a per-frame ring in its user data) stops storing for a while:
+	// its records would never be used, and each store costs a second evaluation.
+	bool RecordStoreAllowed(uint64_t shader) {
+		static const uint32_t budget = StageRecordsEnv("KYTY_STAGE_RECORDS_BUDGET", 512);
+		auto& churn = record_churn[shader];
+		if (churn.off_until > frame) {
+			record_stats.churn++;
+			return false;
+		}
+		if (churn.stores == 0 || churn.first_frame + 600u < frame) {
+			// A new window: the counts restart.
+			churn = {.first_frame = frame};
+		} else if (churn.stores >= 64 && churn.first_frame + 4u <= frame &&
+		           churn.hits * 2u < churn.stores) {
+			// Records stored over several frames and hardly used: inputs new every time.
+			churn = {.off_until = frame + 1200u};
+			record_stats.churn++;
+			return false;
+		}
+		if (budget != 0 && stores_this_frame >= budget) {
+			record_stats.budget++;
+			return false;
+		}
+		return true;
+	}
+
+	// The record is current: every logged word holds its value and is clean, and every slot left
+	// to the GPU is still GPU-written (else the evaluation would read it).
+	static bool ProveRecord(const StageRecord& record) {
+		if (!record.reads.Validate()) {
+			return false;
+		}
+		for (const auto& fill: record.resources.gpu_fills) {
+			if (!SrtBytesGpuWritten(fill.address, sizeof(uint32_t))) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	template <typename InputInfo>
+	void BuildRecordKey(ShaderType stage, const ShaderParams& params, const InputInfo& input_info,
+	                    uint32_t push_data_cursor) {
+		auto& key = record_key;
+		key.clear();
+		const auto base = params.Base();
+		key.push_back(static_cast<uint32_t>(stage));
+		key.push_back(static_cast<uint32_t>(params.hash));
+		key.push_back(static_cast<uint32_t>(params.hash >> 32u));
+		key.push_back(static_cast<uint32_t>(base));
+		key.push_back(static_cast<uint32_t>(base >> 32u));
+		key.push_back(static_cast<uint32_t>(params.code.size()));
+		key.push_back(static_cast<uint32_t>(params.back_code.size()));
+		key.push_back(params.user_data_count);
+		key.push_back(push_data_cursor);
+		key.insert(key.end(), params.user_data.begin(),
+		           params.user_data.begin() + params.user_data_count);
+		BuildStageStaticKey(input_info, record_static);
+		key.push_back(static_cast<uint32_t>(record_static.size()));
+		key.insert(key.end(), record_static.begin(), record_static.end());
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			for (uint32_t axis = 0; axis < 3u; axis++) {
+				key.push_back(input_info.workgroup_counts[axis]);
+				key.push_back(input_info.threads_num[axis]);
+			}
+			key.push_back(SrtGpuFillEnabled() ? 1u : 0u);
+		}
+	}
+
+	// After the normal path returned `handle` for these inputs: the record of it, when the
+	// recording evaluation can read everything and finds the same.
+	template <typename InputInfo>
+	void StoreRecord(ShaderType stage, const ShaderParams& params, const InputInfo& input_info,
+	                 uint64_t key_hash, uint64_t shader) {
+		auto& churn = record_churn[shader];
+		churn.stores++;
+		stores_this_frame++;
+		auto& record = pending_record;
+		if (record == nullptr) {
+			record = std::make_unique<StageRecord>();
+		}
+		const auto entry_it = programs.find(lookup_key);
+		if (expansion_log_failed || entry_it == programs.end() ||
+		    input_info.stage.resources != &entry_it->second.resources) {
+			record_stats.store_failed++;
+			return;
+		}
+		auto& entry = entry_it->second;
+		const auto permutation = std::ranges::find_if(entry.permutations, [&](const Permutation& p) {
+			return &p.program == input_info.stage.program;
+		});
+		if (permutation == entry.permutations.end()) {
+			record_stats.store_failed++;
+			return;
+		}
+		// The expansion's reads are in record->reads already (expansion_log).
+		RecordingReader                  reader {.reads = &record->reads};
+		const auto                       user_data = std::span(params.user_data).first(params.user_data_count);
+		ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data                  = user_data,
+		    .shader_base                = params.Base(),
+		    .read_memory                = ReadRecorded,
+		    .userdata                   = &reader,
+		    .read_specialization_memory = ReadRecorded,
+		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
+		};
+		record->resources.gpu_fills.clear();
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			runtime.workgroup_counts = input_info.workgroup_counts;
+			for (uint32_t axis = 0; axis < 3u; axis++) {
+				runtime.workgroup_size[axis] = input_info.threads_num[axis];
+			}
+			if (SrtGpuFillEnabled()) {
+				runtime.gpu_written = SrtBytesGpuWritten;
+				runtime.gpu_fills   = &record->resources.gpu_fills;
+			}
+		}
+		bool ok = false;
+		{
+			std::lock_guard walk_lock(entry.walk_mutex);
+			ok = ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime,
+			                                                record->resources, record->specialization);
+		}
+		if (!ok || reader.failed) {
+			record_stats.store_failed++;
+			return;
+		}
+		if (const char* field = DiffRefresh(record->resources, record->specialization,
+		                                    entry.resources, entry.specialization);
+		    field != nullptr || !(record->specialization == permutation->specialization)) {
+			if (record_stats.store_differ++ < 4 || record_differ_logged < 16) {
+				record_differ_logged++;
+				LOGF("Stage records: %s 0x%016" PRIx64 " recording evaluation differs (%s); not stored\n",
+				     StageLabel(stage), params.hash, field != nullptr ? field : "permutation");
+			}
+			return;
+		}
+		record->key         = record_key;
+		record->entry       = &entry;
+		record->permutation = static_cast<uint32_t>(permutation - entry.permutations.begin());
+		record->last_frame  = frame;
+		record->shader      = shader;
+		auto& slot          = records[key_hash];
+		std::swap(slot, record); // the replaced record's buffers are reused by the next store
+		record_stats.stored++;
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
+		const int mode = StageRecordsMode();
+		if (mode == 0 || SkipShaderRequested(params.hash)) {
+			return GetNormal(params, input_info, push_data_cursor);
+		}
+		KYTY_PROFILER_BLOCK("StageRecords::Get");
+		SweepRecords();
+		const auto stage = StageOf(input_info);
+		BuildRecordKey(stage, params, input_info, push_data_cursor);
+		const uint64_t key_hash =
+		    XXH3_64bits(record_key.data(), record_key.size() * sizeof(uint32_t));
+		const uint64_t shader = params.hash ^ (static_cast<uint64_t>(stage) << 56u);
+		if (const auto it = records.find(key_hash); it != records.end()) {
+			auto& record = *it->second;
+			if (record.key != record_key) {
+				record_stats.collisions++;
+			} else if (ProveRecord(record)) {
+				record.last_frame = frame;
+				record_churn[shader].hits++;
+				auto& permutation = record.entry->permutations[record.permutation];
+				if (mode == 2) {
+					// Verify: the normal path decides; the record is compared with it.
+					const auto handle = GetNormal(params, input_info, push_data_cursor);
+					record_stats.verified++;
+					const char* field =
+					    !handle ? "normal path skipped"
+					    : input_info.stage.program != &permutation.program
+					        ? "program"
+					        : DiffRefresh(record.resources, record.specialization,
+					                      *input_info.stage.resources, record.entry->specialization);
+					if (field != nullptr) {
+						record_stats.verify_bad++;
+						if (record_verify_logged++ < 32) {
+							LOGF("Stage records verify: %s 0x%016" PRIx64 " record differs: %s\n",
+							     StageLabel(stage), params.hash, field);
+						}
+					}
+					return handle;
+				}
+				record_stats.hits++;
+				DrawPrep::Discard();
+				input_info.stage = {.program = &permutation.program, .resources = &record.resources};
+				permutation.program.bindings.AdvancePushData(push_data_cursor);
+				return permutation.handle;
+			} else {
+				record_stats.stale++;
+			}
+		} else {
+			record_stats.misses++;
+		}
+		const bool store = RecordStoreAllowed(shader);
+		if (store) {
+			if (pending_record == nullptr) {
+				pending_record = std::make_unique<StageRecord>();
+			}
+			pending_record->reads.Clear();
+			expansion_log        = &pending_record->reads;
+			expansion_log_failed = false;
+		}
+		const auto handle = GetNormal(params, input_info, push_data_cursor);
+		expansion_log = nullptr;
+		if (store && handle) {
+			StoreRecord(stage, params, input_info, key_hash, shader);
+		}
+		return handle;
+	}
+
+	template <typename InputInfo>
+	ShaderProgram GetNormal(const ShaderParams& params, InputInfo& input_info,
+	                        uint32_t& push_data_cursor) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -1753,10 +2067,22 @@ struct PipelineCache::ProgramCache {
 	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
 	                           uint32_t wave_size, std::vector<uint32_t>& expanded) {
 		std::string reason;
+		// A stage record being stored keeps every word the expansion read (its proof covers the
+		// callee code and the call tables as well as the SRT).
 		if (!function_expander.Expand(
 		        params.code, params.Base(), user_data,
-		        [](uint64_t address, std::span<uint32_t> words) {
-			        return ReadShaderGuestMemoryRaw(nullptr, address, words);
+		        [this](uint64_t address, std::span<uint32_t> words) {
+			        const bool ok = ReadShaderGuestMemoryRaw(nullptr, address, words);
+			        if (expansion_log != nullptr) {
+				        if (ok) {
+					        expansion_log->Add(address, words.data(),
+					                           static_cast<uint32_t>(words.size_bytes()));
+				        } else {
+					        // A read that failed cannot be proven to fail again: no record.
+					        expansion_log_failed = true;
+				        }
+			        }
+			        return ok;
 		        },
 		        expanded, reason, wave_size)) {
 			static std::atomic<uint32_t> reports {0};
@@ -1802,6 +2128,26 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    prep_declined   = 0;
 	uint64_t                                                    prep_mismatches = 0;
 	std::unique_ptr<StagePrepWorker>                            stage_prep;
+	// Stage records (KYTY_STAGE_RECORDS): by the XXH3 hash of their key words.
+	struct RecordKeyHash {
+		size_t operator()(uint64_t key) const noexcept { return static_cast<size_t>(key); }
+	};
+	std::unordered_map<uint64_t, std::unique_ptr<StageRecord>, RecordKeyHash> records;
+	std::unordered_map<uint64_t, RecordChurn>                   record_churn;
+	std::unique_ptr<StageRecord>                                pending_record;
+	std::vector<uint32_t>                                       record_key;
+	std::vector<uint32_t>                                       record_static;
+	RecordStats                                                 record_stats;
+	std::chrono::steady_clock::time_point                       record_log_time {};
+	uint32_t                                                    record_verify_logged = 0;
+	uint32_t                                                    record_differ_logged = 0;
+	uint32_t                                                    stores_this_frame    = 0;
+	uint64_t                                                    swept_frame          = UINT64_MAX;
+	// The presented frame count, set by the pipeline cache before each program lookup.
+	uint64_t                                                    frame = 0;
+	// While a record is being stored: the function expansion's reads go here.
+	DrawPrep::ReadSet*                                          expansion_log        = nullptr;
+	bool                                                        expansion_log_failed = false;
 	// Last: destroyed first, so its threads have stopped before anything else goes.
 	std::unique_ptr<TranslationWorkers>                         translators;
 
@@ -2539,6 +2885,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		ProgramCache& cache;
 		~PreparedScope() { cache.prepared = {}; }
 	} prepared_scope {*m_program_cache};
+	m_program_cache->frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	if (pixel_active && !tess_active) {
 		m_program_cache->PrepareStagesInParallel(pixel_params, pixel_info, vertex_params[0],
 		                                         vertex_info[0]);
@@ -2607,6 +2954,7 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
+	m_program_cache->frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	auto              program          = m_program_cache->Get(params, input_info, push_data_cursor);
 	if (program && DrawPrep::Enabled()) {
 		// Compute shaders join the known-good list with a vertex identity no draw has.
