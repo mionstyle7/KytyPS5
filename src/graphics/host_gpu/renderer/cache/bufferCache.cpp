@@ -329,11 +329,15 @@ static uint64_t RingBytes(const char* name, uint64_t default_mb) {
 	return std::clamp<uint64_t>(mb, 16, 2048) * 1024 * 1024;
 }
 
-// KYTY_SIDE_READBACK=1 turns side readbacks on (off by default while they are tested).
+// Side readbacks are on by default (KYTY_SIDE_READBACK=0 off): the Demon's Souls fork's readback
+// queue does the same for its ~83% of guest readbacks of data finished earlier ("sync downloads
+// 1.19 -> 0.29 ms a frame"), and in gameplay here >90% of the guest readbacks read bytes written
+// more than 10 ticks before. Such a readback no longer flushes the open recording nor waits behind
+// everything queued after its writer.
 static bool SideReadbackEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SIDE_READBACK");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
 }
@@ -445,8 +449,10 @@ bool BufferCache::TrySideReadback(Buffer& buffer, uint64_t begin, uint64_t size,
 			}
 			newest = std::max(newest, tick);
 		}
-		if (newest >= m_scheduler.CurrentTick()) {
-			// Written by the recording still open: the normal path submits it anyway.
+		if (newest >= m_scheduler.CurrentTick() || newest > m_scheduler.QueuedTick()) {
+			// Written by the recording still open, or by one the recording thread has not handed
+			// to the driver yet: a side copy would wait before the signal is submitted (Windows
+			// drivers stall other submissions and presents on that). The normal path takes it.
 			side.declined++;
 			return false;
 		}
@@ -693,7 +699,8 @@ bool BufferCache::TryDirectRead(uint64_t vaddr, void* data, uint64_t size) {
 			}
 		}
 		// Written by the recording still open: only the GPU thread can submit it.
-		if (dirty.empty() || newest >= m_scheduler.CurrentTick()) {
+		if (dirty.empty() || newest >= m_scheduler.CurrentTick() ||
+		    newest > m_scheduler.QueuedTick()) {
 			return decline();
 		}
 		const auto command = side.commands[slot];

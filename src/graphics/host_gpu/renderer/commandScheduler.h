@@ -131,6 +131,12 @@ public:
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
+	// The newest tick whose command buffer the driver has been given (vkQueueSubmit done). With the
+	// recording thread a tick is allocated before its submission: work on another queue that
+	// waits for a tick past this one would wait before the signal is submitted.
+	[[nodiscard]] uint64_t QueuedTick() const noexcept {
+		return m_queued_tick.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
@@ -221,6 +227,7 @@ private:
 	uint32_t                     m_recorded_draws                  = 0;
 	std::queue<PendingOperation> m_pending_operations;
 	std::atomic<uint32_t>        m_pending_count {0}; // m_pending_operations.size(), read unlocked
+	std::atomic<uint64_t>        m_queued_tick {0};
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;

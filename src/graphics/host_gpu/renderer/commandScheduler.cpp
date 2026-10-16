@@ -597,6 +597,9 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		if (result == vk::Result::eSuccess) {
+			m_queued_tick.store(job.tick, std::memory_order_release);
+		}
 	}
 	Timeline::Mark("vk-submit", job.tick);
 
