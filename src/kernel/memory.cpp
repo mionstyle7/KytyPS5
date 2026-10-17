@@ -231,6 +231,12 @@ static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 static bool g_test_fail_next_range_replace = false;
 #endif
 
+// The process's virtual ranges, in a tree by start (the Demon's Souls fork's baf5a37e). They were a
+// sorted vector: each map, unmap or protection change copied or shifted every range after it, and a
+// protection or name change rebuilt the whole vector and sorted it again. A streaming title maps and
+// unmaps direct memory page by page (direct ranges never merge): tens of thousands of ranges, bursts
+// of hundreds of calls, each holding the lock the GPU thread's ClampRangeSize also takes. The fork
+// measured 55.9 -> 65.7 fps and worst frames 219-391 -> 36-43 ms on a second visit to an area.
 class VirtualRanges {
 public:
 	struct Range {
@@ -253,12 +259,7 @@ public:
 		if (start == 0 || size == 0) {
 			return false;
 		}
-		auto position = LowerBound(start);
-		if ((position != m_ranges.end() &&
-		     VirtualRangesOverlap(start, size, position->start, position->size)) ||
-		    (position != m_ranges.begin() &&
-		     VirtualRangesOverlap(start, size, std::prev(position)->start,
-		                          std::prev(position)->size))) {
+		if (FindOverlap(start, size) != nullptr) {
 			return false;
 		}
 
@@ -271,9 +272,7 @@ public:
 		r.type           = type;
 		r.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(r.name, name);
-		const auto index = static_cast<size_t>(position - m_ranges.begin());
-		m_ranges.insert(position, r);
-		MergeAroundUnlocked(index);
+		MergeAroundUnlocked(m_ranges.emplace(start, r).first);
 		return true;
 	}
 
@@ -282,14 +281,11 @@ public:
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
-		auto position = LowerBound(start);
-		if (position != m_ranges.end() && position->start == start && position->size == size) {
-			m_ranges.erase(position);
+		if (auto exact = m_ranges.find(start); exact != m_ranges.end() && exact->second.size == size) {
+			m_ranges.erase(exact);
 			return true;
 		}
-		auto removed = RemoveUnlocked(start, size);
-		MergeUnlocked();
-		return removed;
+		return RemoveUnlocked(start, size);
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
@@ -315,12 +311,10 @@ public:
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
-		for (size_t index = 0; index < m_ranges.size(); index++) {
-			auto& r = m_ranges[index];
-			if (r.start == start && r.size == size && IsReservedRangeType(r.type)) {
-				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index));
-				return true;
-			}
+		if (auto found = m_ranges.find(start); found != m_ranges.end() &&
+		                                      found->second.size == size &&
+		                                      IsReservedRangeType(found->second.type)) {
+			m_ranges.erase(found);
 		}
 		return true;
 	}
@@ -339,15 +333,8 @@ public:
 		auto current = start;
 		const auto end = start + size;
 		while (current < end) {
-			const Range* candidate = nullptr;
-			for (const auto& r: m_ranges) {
-				if (r.type == expected_type && current >= r.start &&
-				    current < End(r.start, r.size)) {
-					candidate = &r;
-					break;
-				}
-			}
-			if (candidate == nullptr) {
+			const auto* candidate = Containing(current);
+			if (candidate == nullptr || candidate->type != expected_type) {
 				return false;
 			}
 			current = std::min(end, End(candidate->start, candidate->size));
@@ -369,10 +356,7 @@ public:
 		replacement.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(replacement.name, name);
 		RemoveUnlocked(start, size);
-		auto position = LowerBound(start);
-		const auto index = static_cast<size_t>(position - m_ranges.begin());
-		m_ranges.insert(position, replacement);
-		MergeAroundUnlocked(index);
+		MergeAroundUnlocked(m_ranges.emplace(start, replacement).first);
 		return true;
 	}
 
@@ -380,10 +364,9 @@ public:
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
-		auto position = LowerBound(start);
-		if (position != m_ranges.end() && position->start == start && position->size == size) {
-			CopyVirtualRangeName(position->name, name);
-			MergeAroundUnlocked(static_cast<size_t>(position - m_ranges.begin()));
+		if (auto exact = m_ranges.find(start); exact != m_ranges.end() && exact->second.size == size) {
+			CopyVirtualRangeName(exact->second.name, name);
+			MergeAroundUnlocked(exact);
 			return;
 		}
 		EditUnlocked(start, size, [name](Range* r) { CopyVirtualRangeName(r->name, name); });
@@ -408,13 +391,11 @@ public:
 
 		Common::LockGuard lock(m_mutex);
 
-		auto next = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), addr,
-		    [](uint64_t value, const Range& range) { return value < range.start; });
+		auto next = m_ranges.upper_bound(addr);
 		if (next != m_ranges.begin()) {
-			auto current = std::prev(next);
-			if (addr < End(current->start, current->size)) {
-				*out = *current;
+			const auto& current = std::prev(next)->second;
+			if (addr < End(current.start, current.size)) {
+				*out = current;
 				return true;
 			}
 		}
@@ -422,7 +403,7 @@ public:
 			return false;
 		}
 
-		*out = *next;
+		*out = next->second;
 		return true;
 	}
 
@@ -437,8 +418,9 @@ public:
 
 		const auto end     = start + size;
 		auto       current = start;
-		for (const auto& range: m_ranges) {
-			const auto range_end = End(range.start, range.size);
+		for (auto it = FirstEndingAfter(start); it != m_ranges.end(); ++it) {
+			const auto& range     = it->second;
+			const auto  range_end = End(range.start, range.size);
 			if (range_end <= current) {
 				continue;
 			}
@@ -504,17 +486,15 @@ public:
 			return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
 		}
 
-		auto vma = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), virtual_addr,
-		    [](uint64_t value, const Range& range) { return value < range.start; });
+		auto vma = m_ranges.upper_bound(virtual_addr);
 		if (vma == m_ranges.begin()) {
 			return 0;
 		}
 		--vma;
 
-		const auto vma_end = End(vma->start, vma->size);
-		if (virtual_addr < vma->start || virtual_addr >= vma_end ||
-		    !IsCommittedRangeType(vma->type)) {
+		const auto vma_end = End(vma->second.start, vma->second.size);
+		if (virtual_addr < vma->second.start || virtual_addr >= vma_end ||
+		    !IsCommittedRangeType(vma->second.type)) {
 			return 0;
 		}
 
@@ -522,9 +502,9 @@ public:
 		uint64_t expected     = virtual_addr + clamped_size;
 		++vma;
 
-		while (vma != m_ranges.end() && vma->start == expected && IsCommittedRangeType(vma->type) &&
-		       clamped_size < size) {
-			const auto chunk = std::min(size - clamped_size, vma->size);
+		while (vma != m_ranges.end() && vma->second.start == expected &&
+		       IsCommittedRangeType(vma->second.type) && clamped_size < size) {
+			const auto chunk = std::min(size - clamped_size, vma->second.size);
 			clamped_size += chunk;
 			expected += chunk;
 			++vma;
@@ -537,7 +517,8 @@ public:
 		Common::LockGuard lock(m_mutex);
 
 		uint64_t used = 0;
-		for (const auto& r: m_ranges) {
+		for (const auto& [key, r]: m_ranges) {
+			(void)key;
 			if (!IsCommittedRangeType(r.type) || r.size == 0) {
 				continue;
 			}
@@ -559,6 +540,8 @@ public:
 	}
 
 private:
+	using Map = std::map<uint64_t, Range>;
+
 	static uint64_t End(uint64_t start, uint64_t size) {
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
 	}
@@ -570,7 +553,8 @@ private:
 	};
 	void RebuildSpansUnlocked() {
 		m_spans.clear();
-		for (const auto& r: m_ranges) {
+		for (const auto& [key, r]: m_ranges) {
+			(void)key;
 			if (!IsCommittedRangeType(r.type) || r.size == 0) {
 				continue;
 			}
@@ -594,51 +578,87 @@ private:
 		       std::strncmp(left.name, right.name, KERNEL_MAXIMUM_NAME_LENGTH) == 0;
 	}
 
-	static void AddPiece(std::vector<Range>* ranges, const Range& source, uint64_t start,
-	                     uint64_t end) {
-		EXIT_IF(ranges == nullptr);
-
-		if (end <= start) {
-			return;
+	// The range holding addr, or null.
+	const Range* Containing(uint64_t addr) const {
+		auto next = m_ranges.upper_bound(addr);
+		if (next == m_ranges.begin()) {
+			return nullptr;
 		}
-
-		Range piece = source;
-		piece.start = start;
-		piece.size  = end - start;
-		if (piece.type == VirtualRangeType::Direct) {
-			piece.offset += start - source.start;
-		}
-		ranges->push_back(piece);
+		const auto& range = std::prev(next)->second;
+		return addr < End(range.start, range.size) ? &range : nullptr;
 	}
 
-	std::vector<Range>::iterator LowerBound(uint64_t start) {
-		return std::lower_bound(
-		    m_ranges.begin(), m_ranges.end(), start,
-		    [](const Range& range, uint64_t value) { return range.start < value; });
-	}
-
-	void MergeAroundUnlocked(size_t index) {
-		if (index >= m_ranges.size()) {
-			return;
-		}
-		if (index != 0) {
-			auto& previous = m_ranges[index - 1];
-			auto& current  = m_ranges[index];
-			if (End(previous.start, previous.size) == current.start &&
-			    SameMergeKey(previous, current)) {
-				previous.size += current.size;
-				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index));
-				index--;
+	// The first range that ends after addr (it may start after addr).
+	Map::iterator FirstEndingAfter(uint64_t addr) {
+		auto next = m_ranges.upper_bound(addr);
+		if (next != m_ranges.begin()) {
+			auto previous = std::prev(next);
+			if (End(previous->second.start, previous->second.size) > addr) {
+				return previous;
 			}
 		}
-		while (index + 1 < m_ranges.size()) {
-			auto& current = m_ranges[index];
-			auto& next    = m_ranges[index + 1];
-			if (End(current.start, current.size) != next.start || !SameMergeKey(current, next)) {
+		return next;
+	}
+
+	// Splits the range holding addr strictly inside it into two at addr.
+	void SplitAt(uint64_t addr) {
+		auto next = m_ranges.upper_bound(addr);
+		if (next == m_ranges.begin()) {
+			return;
+		}
+		auto  holder = std::prev(next);
+		auto& range  = holder->second;
+		const auto range_end = End(range.start, range.size);
+		if (addr <= range.start || addr >= range_end) {
+			return;
+		}
+		Range second = range;
+		second.start = addr;
+		second.size  = range_end - addr;
+		if (second.type == VirtualRangeType::Direct) {
+			second.offset += addr - range.start;
+		}
+		range.size = addr - range.start;
+		m_ranges.emplace_hint(next, addr, second);
+	}
+
+	// Merges `it` into an adjacent equal range before it, and the equal ranges after it into it.
+	Map::iterator MergeAroundUnlocked(Map::iterator it) {
+		if (it == m_ranges.end()) {
+			return it;
+		}
+		if (it != m_ranges.begin()) {
+			auto previous = std::prev(it);
+			if (End(previous->second.start, previous->second.size) == it->second.start &&
+			    SameMergeKey(previous->second, it->second)) {
+				previous->second.size += it->second.size;
+				m_ranges.erase(it);
+				it = previous;
+			}
+		}
+		for (auto next = std::next(it); next != m_ranges.end(); next = std::next(it)) {
+			if (End(it->second.start, it->second.size) != next->second.start ||
+			    !SameMergeKey(it->second, next->second)) {
 				break;
 			}
-			current.size += next.size;
-			m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index + 1));
+			it->second.size += next->second.size;
+			m_ranges.erase(next);
+		}
+		return it;
+	}
+
+	// Merges every range touching [start, end) with its neighbours.
+	void MergeSpanUnlocked(uint64_t start, uint64_t end) {
+		auto it = m_ranges.lower_bound(start);
+		if (it != m_ranges.begin()) {
+			--it;
+		}
+		while (it != m_ranges.end() && it->second.start <= end) {
+			it = MergeAroundUnlocked(it);
+			if (it == m_ranges.end()) {
+				break;
+			}
+			++it;
 		}
 	}
 
@@ -647,102 +667,49 @@ private:
 		if (size == 0) {
 			return;
 		}
-
-		std::vector<Range> out;
-		auto               edit_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			auto mid_start = std::max(start, r.start);
-			auto mid_end   = std::min(edit_end, r_end);
-
-			AddPiece(&out, r, r.start, mid_start);
-
-			Range mid = r;
-			mid.start = mid_start;
-			mid.size  = mid_end - mid_start;
-			if (mid.type == VirtualRangeType::Direct) {
-				mid.offset += mid_start - r.start;
-			}
-			edit(&mid);
-			out.push_back(mid);
-
-			AddPiece(&out, r, mid_end, r_end);
+		const auto end = End(start, size);
+		SplitAt(start);
+		SplitAt(end);
+		for (auto it = m_ranges.lower_bound(start); it != m_ranges.end() && it->second.start < end;
+		     ++it) {
+			edit(&it->second);
 		}
-
-		m_ranges = out;
-		MergeUnlocked();
+		MergeSpanUnlocked(start, end);
 	}
 
 	bool RemoveUnlocked(uint64_t start, uint64_t size) {
 		if (size == 0) {
 			return false;
 		}
-
-		std::vector<Range> out;
-		bool               removed = false;
-		auto               rem_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			removed = true;
-			AddPiece(&out, r, r.start, std::max(start, r.start));
-			AddPiece(&out, r, std::min(rem_end, r_end), r_end);
+		const auto end = End(start, size);
+		if (FirstEndingAfter(start) == m_ranges.end() ||
+		    FirstEndingAfter(start)->second.start >= end) {
+			return false;
 		}
-
-		m_ranges = out;
-		return removed;
+		SplitAt(start);
+		SplitAt(end);
+		m_ranges.erase(m_ranges.lower_bound(start), m_ranges.lower_bound(end));
+		return true;
 	}
 
-	void MergeUnlocked() {
-		if (m_ranges.size() < 2) {
-			return;
-		}
-
-		std::sort(m_ranges.begin(), m_ranges.end(),
-		          [](const Range& left, const Range& right) { return left.start < right.start; });
-
-		std::vector<Range> merged;
-		for (const auto& r: m_ranges) {
-			if (!merged.empty()) {
-				auto& last = merged[merged.size() - 1];
-				if (End(last.start, last.size) == r.start && SameMergeKey(last, r)) {
-					last.size += r.size;
-					continue;
-				}
-			}
-			merged.push_back(r);
-		}
-		m_ranges = merged;
-	}
-
+	// As before: the range starting at or after `start` first, then the one before it.
 	Range* FindOverlap(uint64_t start, uint64_t size) {
-		auto position = LowerBound(start);
+		auto position = m_ranges.lower_bound(start);
 		if (position != m_ranges.end() &&
-		    VirtualRangesOverlap(start, size, position->start, position->size)) {
-			return &*position;
+		    VirtualRangesOverlap(start, size, position->second.start, position->second.size)) {
+			return &position->second;
 		}
 		if (position != m_ranges.begin()) {
 			auto previous = std::prev(position);
-			if (VirtualRangesOverlap(start, size, previous->start, previous->size)) {
-				return &*previous;
+			if (VirtualRangesOverlap(start, size, previous->second.start, previous->second.size)) {
+				return &previous->second;
 			}
 		}
 		return nullptr;
 	}
 
-	std::vector<Range> m_ranges;
-	Common::Mutex      m_mutex;
+	Map           m_ranges;
+	Common::Mutex m_mutex;
 	// Bumped by every change of the ranges.
 	std::atomic<uint64_t> m_generation {1};
 	// Bumped by the changes of committed coverage (CoverageGeneration): TryClampRangeSize's
