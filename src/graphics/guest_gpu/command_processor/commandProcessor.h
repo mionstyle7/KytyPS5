@@ -79,6 +79,8 @@ public:
 	// See CommandScheduler::CompleteReleaseMemInterrupt -- for a RELEASE_MEM that DOES request a
 	// guest interrupt/event; uses a smaller batch bound as a hedge against delaying it.
 	void            CompleteReleaseMemInterrupt();
+	// CommandScheduler::FlushForInterrupt.
+	void            BufferFlushForInterrupt();
 	// See CommandScheduler::CompleteDraw -- called after every DrawIndex/DrawAuto.
 	void            CompleteDraw();
 	void            CompleteDispatch();

@@ -221,6 +221,23 @@ void CommandScheduler::CompleteReleaseMemInterrupt() {
 	Flush();
 }
 
+static std::chrono::microseconds InterruptFlushInterval() {
+	static const auto interval = [] {
+		const char* value = std::getenv("KYTY_INTERRUPT_FLUSH_US");
+		return std::chrono::microseconds(value != nullptr ? std::strtoll(value, nullptr, 10) : 2000);
+	}();
+	return interval;
+}
+
+void CommandScheduler::FlushForInterrupt() {
+	const auto interval = InterruptFlushInterval();
+	if (interval.count() > 0 && std::chrono::steady_clock::now() - m_last_submit < interval) {
+		return;
+	}
+	CheckActive();
+	Flush();
+}
+
 void CommandScheduler::CompleteDraw() {
 	const auto interval = DrawFlushInterval();
 	if (interval == 0u || ++m_recorded_draws < interval) {
@@ -534,6 +551,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_recorded_release_mem_writes     = 0;
 	m_recorded_release_mem_interrupts = 0;
 	m_recorded_draws                  = 0;
+	m_last_submit                     = std::chrono::steady_clock::now();
 
 	if (m_threaded) {
 		// The tick is allocated now, in order; the recording thread ends the command buffer and

@@ -48,6 +48,12 @@ public:
 	// so this uses a much smaller batch bound than CompleteReleaseMemWrite as a hedge, trading
 	// some of the possible win for less added latency. Never waits itself.
 	void           CompleteReleaseMemInterrupt();
+	// A RELEASE_MEM whose interrupt used to submit at once (KYTY_INTERRUPT_FLUSH_US, default 2000;
+	// 0 = submit every time, as before): submits only when that long has passed since the last
+	// submit; otherwise the work batches and the end of the submission slice submits it. After
+	// the Astro Bot fork's batched RELEASE_MEM submits (b63206f4: ~340 submits a frame down to
+	// ~20, GPU gaps 8.4 ms down to 0.6 ms a frame, 48.8 -> 57.9 fps).
+	void           FlushForInterrupt();
 	// Called after every DrawIndex/DrawAuto. Long chains of draws with no intervening
 	// RELEASE_MEM/wait can otherwise sit fully recorded but unsubmitted for a long time, leaving
 	// the GPU idle until something else finally forces a flush -- this periodically calls Flush()
@@ -224,6 +230,7 @@ private:
 	CommandBuffer                m_command;
 	uint32_t                     m_recorded_release_mem_writes     = 0;
 	uint32_t                     m_recorded_release_mem_interrupts = 0;
+	std::chrono::steady_clock::time_point m_last_submit {};
 	uint32_t                     m_recorded_draws                  = 0;
 	std::queue<PendingOperation> m_pending_operations;
 	std::atomic<uint32_t>        m_pending_count {0}; // m_pending_operations.size(), read unlocked

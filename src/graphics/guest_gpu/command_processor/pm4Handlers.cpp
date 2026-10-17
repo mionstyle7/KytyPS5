@@ -2328,10 +2328,10 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		} else {
 			// interrupt_selector 0x01/0x02 route through WriteAtEndOfPipe's interrupt path, which
 			// schedules a callback gated on this submission's tick actually completing on the
-			// GPU -- flush now so a guest thread that may be blocked waiting on it isn't stalled
-			// behind a batching window.
+			// GPU -- submitted at once unless the last submit was under KYTY_INTERRUPT_FLUSH_US
+			// ago; then the end of the submission slice (or the next submit) carries it.
 			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
-			cp.BufferFlush();
+			cp.BufferFlushForInterrupt();
 		}
 
 		return 7;
@@ -2351,7 +2351,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
 			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
-			cp.BufferFlush();
+			cp.BufferFlushForInterrupt();
 		}
 
 		return 7;
