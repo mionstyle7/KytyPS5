@@ -73,6 +73,13 @@ public:
 	// do not fault one page at a time. A tracked chunk holding GPU-written bytes is left alone:
 	// this never downloads.
 	void                   InvalidateMemoryNoDownload(uint64_t vaddr, uint64_t size);
+	// The same as InvalidateMemory for a range the caller is about to write whole (a file read
+	// into guest memory, a DMA copy or fill done on the CPU): the GPU-written bytes of the pages
+	// the write covers whole are dropped instead of read back, since they are about to be
+	// replaced; only the pages it covers in part are read back (the Demon's Souls fork's
+	// c4a7256f: sync downloads 0.71 -> 0 ms a frame at its busiest spot). KYTY_OVERWRITE_DROP=0
+	// reads everything back as before.
+	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	// The emulator wrote guest memory itself (a CP write, copy or fill done on the CPU): pages an
 	// upload kept writable (KYTY_UPLOAD_ONCE) took it without a fault, so they are marked here.
 	void                   NoteHostWrite(uint64_t vaddr, uint64_t size);

@@ -152,6 +152,8 @@ bool TryWriteCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, const void
 [[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// The same for a range about to be written whole: GPU-written bytes it replaces are dropped.
+void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 

@@ -2127,7 +2127,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	// lands as zeros (seen as PAGE_READONLY + ERROR_NOACCESS). Reading into a host chunk and
 	// copying takes the tracked-page fault like any CPU write, so the tracker unprotects the
 	// page and marks it dirty, and the bytes land.
-	LibKernel::Memory::InvalidateMemory(destination, readable);
+	LibKernel::Memory::InvalidateMemoryForWrite(destination, readable);
 	thread_local std::vector<uint8_t> chunk;
 	if (chunk.size() < APR_HOST_READ_CHUNK_SIZE) {
 		chunk.resize(APR_HOST_READ_CHUNK_SIZE);

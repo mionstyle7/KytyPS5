@@ -69,6 +69,8 @@ public:
 	[[nodiscard]] bool TryWriteClean(uint64_t fault_vaddr, uint64_t vaddr, const void* data,
 	                                 uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// InvalidateMemory for a range about to be written whole (BufferCache::InvalidateMemoryForWrite).
+	[[nodiscard]] bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);

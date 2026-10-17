@@ -160,7 +160,7 @@ static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
 	    file->dents_offset < file->dirents.size() ? file->dirents.size() - file->dents_offset : 0;
 	const auto bytes = std::min(count, remaining);
 	if (bytes != 0) {
-		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), bytes);
+		Memory::InvalidateMemoryForWrite(reinterpret_cast<uint64_t>(buf), bytes);
 		memcpy(buf, file->dirents.data() + file->dents_offset, bytes);
 		file->dents_offset += bytes;
 	}
@@ -632,8 +632,8 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	const auto pos        = file->f.Tell();
 	const auto file_size  = file->f.Size();
 	const auto remaining  = pos < file_size ? file_size - pos : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	Memory::InvalidateMemoryForWrite(reinterpret_cast<uint64_t>(buf),
+	                                 std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 
@@ -757,8 +757,8 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	const auto file_size  = file->f.Size();
 	const auto remaining =
 	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	Memory::InvalidateMemoryForWrite(reinterpret_cast<uint64_t>(buf),
+	                                 std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);

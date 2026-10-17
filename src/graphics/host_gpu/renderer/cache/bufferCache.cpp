@@ -936,6 +936,65 @@ void BufferCache::NoteHostWrite(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+static bool OverwriteDrop() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OVERWRITE_DROP");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+void BufferCache::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid memory-invalidation range\n");
+	}
+	const auto end         = vaddr + size;
+	const auto inner_begin = Common::AlignUp(vaddr, TRACKER_PAGE_SIZE);
+	const auto inner_end   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
+	if (!OverwriteDrop() || inner_begin >= inner_end || inner_end > TRACKER_ADDRESS_SIZE) {
+		InvalidateMemory(vaddr, size);
+		return;
+	}
+	// The pages written in part keep the bytes the write leaves: those are read back as before.
+	if (vaddr < inner_begin) {
+		InvalidateMemory(vaddr, inner_begin - vaddr);
+	}
+	if (inner_end < end) {
+		InvalidateMemory(inner_end, end - inner_end);
+	}
+	const auto bytes = inner_end - inner_begin;
+	if (!m_memory_tracker.IsRegionGpuModified(inner_begin, bytes)) {
+		InvalidateMemory(inner_begin, bytes);
+		return;
+	}
+	// The GPU-written ranges are the GPU thread's (it reads them without the lock).
+	m_scheduler.Context().GetGpu().SendCommandSync([this, inner_begin, bytes] {
+		bool busy = false;
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			busy = m_downloading_ranges.Intersects(inner_begin, bytes) ||
+			       (!m_side_ranges.Empty() && m_side_ranges.Intersects(inner_begin, bytes));
+		}
+		if (busy) {
+			// A download in flight would publish older GPU bytes over the write: take the usual
+			// path, which waits for it.
+			InvalidateMemory(inner_begin, bytes);
+			return;
+		}
+		{
+			std::unique_lock lock(m_dirty_ranges_mutex);
+			m_gpu_modified_ranges.Subtract(inner_begin, bytes);
+		}
+		m_memory_tracker.UnmarkRegionAsGpuModified(inner_begin, bytes);
+		m_memory_tracker.InvalidateRegion(inner_begin, bytes, [] {});
+		static std::atomic<uint64_t> dropped {0};
+		if (dropped.fetch_add(bytes) / (64u << 20u) != (dropped.load() / (64u << 20u))) {
+			LOGF("Overwrites: %" PRIu64 " MB of GPU-written pages dropped instead of read back\n",
+			     dropped.load() >> 20u);
+		}
+	});
+}
+
 void BufferCache::InvalidateMemoryNoDownload(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return;

@@ -33,7 +33,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_bindless_table(graphics, m_command_scheduler, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_buffer_cache.on_host_write = [this](uint64_t vaddr, uint64_t size) {
-		(void)InvalidateMemory(vaddr, size);
+		(void)InvalidateMemoryForWrite(vaddr, size);
 	};
 	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
 		m_bindless_table.OnImageUnregistered(id);
@@ -246,6 +246,16 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_bindless_table.OnCpuWrite(vaddr, size);
+	return true;
+}
+
+bool RenderContext::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size)) {
+		return false;
+	}
+	m_buffer_cache.InvalidateMemoryForWrite(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	m_bindless_table.OnCpuWrite(vaddr, size);
 	return true;
