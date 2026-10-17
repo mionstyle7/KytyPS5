@@ -438,7 +438,36 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		return false;
+		// KYTY_FILL_CLEAR (default on; =0 off), after the Demon's Souls fork (5dbb2d13): a fill
+		// over several images, each wholly inside it, is the same fill done on the buffer cache's
+		// buffer, and each image is cleared to the value. The dispatch wrote the buffer and every
+		// image over it was refreshed from the buffer at its next use: detiles of a fill value
+		// (the fork: ~113 MB a frame of zeros where the game clears targets in 4 MiB spans,
+		// 37.6 -> 43.7 fps).
+		static const bool fill_clear = [] {
+			const char* value = std::getenv("KYTY_FILL_CLEAR");
+			return value == nullptr || value[0] != '0';
+		}();
+		std::vector<TextureCache::FillClear> clears;
+		if (!fill_clear || (size & 3u) != 0 ||
+		    !cache.PlanFillClears(descriptor.Base48(), size, packed_clear, clears)) {
+			return false;
+		}
+		auto& buffers           = command.GetContext().GetBufferCache();
+		const auto [dst, offset] = buffers.ObtainBuffer(descriptor.Base48(), size, true, false);
+		if (dst == nullptr) {
+			return false;
+		}
+		dst->Fill(offset, size, packed_clear);
+		cache.ApplyFillClears(command, clears);
+		static std::atomic<uint64_t> fill_clears {0};
+		if (fill_clears.fetch_add(1, std::memory_order_relaxed) % 256 == 0) {
+			LOGF("Compute fills over several images: %" PRIu64 " (last: shader 0x%016" PRIx64
+			     " 0x%016" PRIx64 "+0x%" PRIx64 ", %zu images)\n",
+			     fill_clears.load(std::memory_order_relaxed), input.stage.program->shader_hash,
+			     descriptor.Base48(), size, clears.size());
+		}
+		return true;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {

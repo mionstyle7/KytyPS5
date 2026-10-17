@@ -69,6 +69,16 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
+	// A compute fill over several images, each wholly inside it (5dbb2d13): the clear values the
+	// images take, or false when one overlaps the fill only in part or its value has no clear.
+	struct FillClear {
+		ImageId               id;
+		vk::ImageAspectFlags  aspect;
+		vk::ClearValue        clear;
+	};
+	[[nodiscard]] bool PlanFillClears(uint64_t address, uint64_t size, uint32_t packed_clear,
+	                                  std::vector<FillClear>& clears);
+	void               ApplyFillClears(CommandBuffer& command, const std::vector<FillClear>& clears);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 

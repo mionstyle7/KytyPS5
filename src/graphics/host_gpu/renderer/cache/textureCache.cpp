@@ -2003,6 +2003,54 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	return true;
 }
 
+bool TextureCache::PlanFillClears(uint64_t address, uint64_t size, uint32_t packed_clear,
+                                  std::vector<FillClear>& clears) {
+	clears.clear();
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered) {
+			continue;
+		}
+		const auto& info = image->info;
+		if (image->depth_id || image->backing.image == nullptr || info.samples != 1 ||
+		    info.HasStencil() || info.metadata.compression != VideoOutCompression::Uncompressed ||
+		    info.resources.levels != 1 || info.IsVolume() || info.data.address < address ||
+		    info.data.End() > address + size) {
+			return false;
+		}
+		FillClear fill {.id = id};
+		if (info.IsDepth()) {
+			fill.aspect = vk::ImageAspectFlagBits::eDepth;
+			if (!DecodePackedDepthClear(info.pixel_format, packed_clear, fill.clear.depthStencil.depth)) {
+				return false;
+			}
+		} else {
+			fill.aspect = vk::ImageAspectFlagBits::eColor;
+			if (!DecodeColorDwordFill(info.pixel_format, packed_clear, fill.clear.color)) {
+				return false;
+			}
+		}
+		clears.push_back(fill);
+	}
+	return !clears.empty();
+}
+
+void TextureCache::ApplyFillClears(CommandBuffer& command, const std::vector<FillClear>& clears) {
+	std::scoped_lock lock {m_lock};
+	for (const auto& fill: clears) {
+		auto* image = m_slot_images.try_get(fill.id);
+		if (image == nullptr || !image->registered || image->backing.image == nullptr) {
+			continue;
+		}
+		ClearImage(command, fill.id, image->backing.format,
+		           {fill.aspect, 0, 1, 0, image->backing.layers}, fill.clear);
+	}
+}
+
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
 	auto& image = m_slot_images[id];
