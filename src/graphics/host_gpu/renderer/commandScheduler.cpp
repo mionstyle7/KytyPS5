@@ -11,6 +11,10 @@
 #include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -182,7 +186,35 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 	}
 }
 
+// Diagnostics: every 10 s, the render area sizes rendering passes used and how many passes each,
+// to see the resolution the game renders at (its display buffers can be 4K while it renders
+// lower and upscales).
+static void NoteRenderArea(uint32_t width, uint32_t height) {
+	static std::mutex                             mutex;
+	static std::map<std::pair<uint32_t, uint32_t>, uint64_t> areas;
+	static auto next = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	std::lock_guard lock(mutex);
+	areas[{width, height}]++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now < next) {
+		return;
+	}
+	next = now + std::chrono::seconds(10);
+	std::vector<std::pair<std::pair<uint32_t, uint32_t>, uint64_t>> top(areas.begin(), areas.end());
+	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+		return static_cast<uint64_t>(a.first.first) * a.first.second * a.second >
+		       static_cast<uint64_t>(b.first.first) * b.first.second * b.second;
+	});
+	std::string text;
+	for (size_t i = 0; i < std::min<size_t>(top.size(), 8); i++) {
+		text += fmt::format(" {}x{}:{}", top[i].first.first, top[i].first.second, top[i].second);
+	}
+	LOGF("Render areas (10 s, by pixels drawn, size:passes):%s\n", text.c_str());
+	areas.clear();
+}
+
 void CommandScheduler::BeginRendering(const RenderState& state) {
+	NoteRenderArea(state.width, state.height);
 	Current().BeginRendering(state);
 }
 

@@ -612,7 +612,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 }
 
 // Guest GPU timestamps hold the reference clock when the GPU thread parses the packet. With
-// KYTY_GPU_TIMESTAMP_SCALE=<percent> (100-300; default 100, off), the time since the last flip is
+// KYTY_GPU_TIMESTAMP_SCALE=<percent> (100-1000; default 100, off), the time since the last flip is
 // stretched by that percentage, so a game that sizes its dynamic resolution from GPU timestamps
 // measures more GPU time and renders fewer pixels. Each flip returns to the real clock. After the
 // Astro Bot fork's --gpu-timestamp-scale (b44c4ede): at 115-125 its overworld went from 58 fps at
@@ -624,7 +624,7 @@ static uint64_t GuestGpuTimestamp() {
 	static const uint64_t percent = [] {
 		const char* value = std::getenv("KYTY_GPU_TIMESTAMP_SCALE");
 		const auto  parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {100};
-		return std::clamp<uint64_t>(parsed, 100, 300);
+		return std::clamp<uint64_t>(parsed, 100, 1000);
 	}();
 	g_timestamp_writes.fetch_add(1, std::memory_order_relaxed);
 	const auto now    = Sync::ReadReferenceClock();
