@@ -1082,6 +1082,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    if (first) {
 				    first      = false;
 				    gpu_bytes = HasGpuDirtyBytes(vaddr, std::max<uint64_t>(size, 4));
+				    if (!from_gpu_thread) {
+					    NotePredictRead(vaddr, gpu_bytes);
+				    }
 				    std::lock_guard lock(g_readback_diag_mutex);
 				    if (const auto found = g_region_writes.find(vaddr >> kDiagRegionBits);
 				        found != g_region_writes.end()) {
@@ -1220,6 +1223,156 @@ static bool ReadbackRetick() {
 	return enabled;
 }
 
+static bool ReadbackPredict() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_PREDICT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+static int64_t PredictNowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+uint64_t BufferCache::LiftCurrentPages(uint64_t begin, uint64_t end) {
+	std::vector<uint64_t> current;
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		for (auto page = Common::AlignDown(begin, TRACKER_PAGE_SIZE); page < end;
+		     page += TRACKER_PAGE_SIZE) {
+			if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+			    !m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+				current.push_back(page);
+			}
+		}
+	}
+	// One lift per run of neighbouring pages: each lift is a protection change, and page by
+	// page they were most of the GPU thread's VirtualProtect calls.
+	uint64_t lifted = 0;
+	for (size_t first = 0; first < current.size();) {
+		size_t last = first + 1;
+		while (last < current.size() && current[last] == current[last - 1] + TRACKER_PAGE_SIZE) {
+			last++;
+		}
+		const auto run_begin = current[first];
+		const auto run_size  = current[last - 1] + TRACKER_PAGE_SIZE - run_begin;
+		if (m_memory_tracker.IsRegionGpuModified(run_begin, run_size)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(run_begin, run_size);
+			lifted += run_size / TRACKER_PAGE_SIZE;
+		}
+		first = last;
+	}
+	return lifted;
+}
+
+// GPU thread (the first step of a game thread's readback). A window read for GPU-written bytes
+// twice, at least 8 ms apart (two frames, not two pages of one burst), is learned; one unread
+// for 2 s is forgotten (PrefetchReadbacks).
+void BufferCache::NotePredictRead(uint64_t vaddr, bool gpu_bytes) {
+	const auto window = ReadbackWindow();
+	if (!ReadbackPredict() || window == 0) {
+		return;
+	}
+	const auto now   = PredictNowMs();
+	auto&      entry = m_predict[Common::AlignDown(vaddr, window)];
+	entry.probe      = vaddr;
+	if (entry.prefetched) {
+		entry.prefetched = false;
+		if (gpu_bytes) {
+			m_predict_stats.after_prefetch++;
+		} else {
+			m_predict_stats.served++;
+		}
+	}
+	if (gpu_bytes) {
+		m_predict_stats.downloaded++;
+		if (entry.gpu_reads++ == 0) {
+			entry.first_ms = now;
+		} else if (!entry.learned && now - entry.first_ms >= 8) {
+			entry.learned = true;
+		}
+	}
+	entry.last_ms = now;
+}
+
+void BufferCache::PrefetchReadbacks() {
+	if (!ReadbackPredict() || m_predict.empty()) {
+		return;
+	}
+	KYTY_PROFILER_FUNCTION();
+	const auto window = ReadbackWindow();
+	const auto now    = PredictNowMs();
+	// Bytes downloaded ahead per submission: more than this would cycle the download ring, whose
+	// wrap waits for the GPU.
+	static constexpr uint64_t Budget = uint64_t {32} << 20u;
+	uint64_t                  spent  = 0;
+	bool                      issued = false;
+	size_t                    learned = 0;
+	for (auto it = m_predict.begin(); it != m_predict.end();) {
+		auto& [key, entry] = *it;
+		if (now - entry.last_ms > 2000) {
+			it = m_predict.erase(it);
+			continue;
+		}
+		if (!entry.learned) {
+			++it;
+			continue;
+		}
+		learned++;
+		const auto* owner = m_page_table.Find(entry.probe >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+			++it;
+			continue;
+		}
+		auto&      buffer = m_slot_buffers[*owner];
+		const auto begin  = std::max(key, buffer.CpuAddress());
+		const auto end    = std::min(key + window, buffer.CpuAddress() + buffer.Size());
+		if (begin >= end) {
+			++it;
+			continue;
+		}
+		// A prefetch already published: the pages go unprotected before the game reads them.
+		if (m_memory_tracker.IsRegionGpuModified(begin, end - begin)) {
+			m_predict_stats.lifted_pages += LiftCurrentPages(begin, end);
+		}
+		uint64_t dirty = 0;
+		m_gpu_modified_ranges.ForEachInRange(
+		    begin, end - begin, [&](uint64_t start, uint64_t stop) { dirty += stop - start; });
+		if (dirty != 0 && spent + dirty <= Budget &&
+		    DownloadBufferMemory<true>(buffer, begin, end - begin)) {
+			spent += dirty;
+			issued           = true;
+			entry.prefetched = true;
+			m_predict_stats.prefetches++;
+			m_predict_stats.bytes += dirty;
+		}
+		++it;
+	}
+	if (issued) {
+		// Readers of these pages wait for this publication (ReadMemoryStep).
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Flush();
+		m_last_async_download_tick = tick;
+	}
+	if (now >= m_predict_stats.next_ms) {
+		if (m_predict_stats.next_ms != 0) {
+			LOGF("Readback prediction: %zu learned windows (%zu tracked), %" PRIu64
+			     " prefetches (%.1f MB), %" PRIu64 " pages unprotected ahead; game reads: %" PRIu64
+			     " served by a prefetch, %" PRIu64 " downloaded through the GPU thread (%" PRIu64
+			     " right after a prefetch)\n",
+			     learned, m_predict.size(), m_predict_stats.prefetches,
+			     static_cast<double>(m_predict_stats.bytes) / (1024.0 * 1024.0),
+			     m_predict_stats.lifted_pages, m_predict_stats.served,
+			     m_predict_stats.downloaded, m_predict_stats.after_prefetch);
+		}
+		m_predict_stats         = {};
+		m_predict_stats.next_ms = now + 10000;
+	}
+}
+
 uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
                                      bool from_gpu_thread, bool async) {
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
@@ -1309,32 +1462,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			const auto window = ReadbackWindow();
 			const auto begin  = std::max(Common::AlignDown(vaddr, window), buffer.CpuAddress());
 			const auto end    = std::min(begin + window, buffer.CpuAddress() + buffer.Size());
-			std::vector<uint64_t> current;
-			{
-				std::shared_lock lock(m_dirty_ranges_mutex);
-				for (auto page = Common::AlignDown(begin, TRACKER_PAGE_SIZE); page < end;
-				     page += TRACKER_PAGE_SIZE) {
-					if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
-					    !m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
-						current.push_back(page);
-					}
-				}
-			}
-			// One lift per run of neighbouring pages: each lift is a protection change, and
-			// page by page they were most of the GPU thread's VirtualProtect calls.
-			for (size_t first = 0; first < current.size();) {
-				size_t last = first + 1;
-				while (last < current.size() &&
-				       current[last] == current[last - 1] + TRACKER_PAGE_SIZE) {
-					last++;
-				}
-				const auto run_begin = current[first];
-				const auto run_size  = current[last - 1] + TRACKER_PAGE_SIZE - run_begin;
-				if (m_memory_tracker.IsRegionGpuModified(run_begin, run_size)) {
-					m_memory_tracker.UnmarkRegionAsGpuModified(run_begin, run_size);
-				}
-				first = last;
-			}
+			LiftCurrentPages(begin, end);
 		}
 		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
 		if (is_write) {

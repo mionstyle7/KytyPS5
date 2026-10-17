@@ -164,6 +164,11 @@ public:
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();
+	// GPU thread, at the end of each guest submission (KYTY_READBACK_PREDICT=0 off): readback
+	// windows the game threads read GPU-written bytes from again and again are downloaded ahead,
+	// asynchronously, and their pages unprotected once the copy is in guest memory, so the next
+	// read neither faults nor waits for the GPU thread and the GPU.
+	void                            PrefetchReadbacks();
 	// After the guest unmapped [vaddr, vaddr + size) (RenderContext::UnmapMemory), with `mapped` the
 	// memory still mapped: the buffers the range holds whole go, and a buffer it holds in part,
 	// mapped in no more than half of it now, is cut to its mapped runs (KYTY_UNMAP_SPLIT=0 off).
@@ -309,6 +314,27 @@ private:
 	void ApplyCleanWrite(uint64_t vaddr, uint64_t size);
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
+	// Readback prediction (PrefetchReadbacks), GPU thread only: per readback window (its aligned
+	// start) when game threads read it, and whether a prefetch landed since the last read.
+	struct PredictWindow {
+		uint64_t probe      = 0; // an address read in it, to find its buffer
+		int64_t  first_ms   = 0;
+		int64_t  last_ms    = 0;
+		uint32_t gpu_reads  = 0;
+		bool     learned    = false;
+		bool     prefetched = false;
+	};
+	std::unordered_map<uint64_t, PredictWindow>        m_predict;
+	struct PredictStats {
+		uint64_t served = 0, downloaded = 0, after_prefetch = 0, prefetches = 0, bytes = 0,
+		         lifted_pages = 0;
+		int64_t  next_ms = 0;
+	};
+	PredictStats                                       m_predict_stats;
+	void NotePredictRead(uint64_t vaddr, bool gpu_bytes);
+	// Lifts the protection of the pages of [begin, end) protected as GPU-written whose bytes are
+	// all in guest memory (none GPU-written or downloading), one change per run; the pages lifted.
+	uint64_t LiftCurrentPages(uint64_t begin, uint64_t end);
 	// Guards changes to both range sets (GPU thread and download completions) against
 	// IsCleanForConcurrentRead; the GPU thread reads them without it.
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;

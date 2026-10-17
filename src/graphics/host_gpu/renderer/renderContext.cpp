@@ -413,6 +413,7 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+	m_buffer_cache.PrefetchReadbacks();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
 }
