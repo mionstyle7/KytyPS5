@@ -27,6 +27,7 @@ struct Pair {
 	uint32_t after  = 0;
 	uint64_t key    = 0;
 	uint32_t kind   = 0;
+	uint64_t area   = 0;
 };
 
 struct Block {
@@ -52,6 +53,7 @@ struct State {
 	Block*                               current    = nullptr;
 	std::mutex                           stats_mutex;
 	std::unordered_map<uint64_t, Stat>   stats; // key 0: GPU time between timed commands
+	std::unordered_map<uint64_t, Stat>   area_stats; // draws by render area (width << 32 | height)
 	double                               total_ms = 0.0;
 };
 
@@ -97,6 +99,11 @@ void ReadBlock(State& state, Block& block) {
 					stat.ms += static_cast<double>(after - before) * state.period_ns / 1e6;
 					stat.count++;
 					stat.kind = pair.kind;
+					if (pair.area != 0) {
+						auto& area = state.area_stats[pair.area];
+						area.ms += static_cast<double>(after - before) * state.period_ns / 1e6;
+						area.count++;
+					}
 				}
 				if (previous_after != 0 && before >= previous_after) {
 					auto& gap = state.stats[0];
@@ -178,7 +185,8 @@ void BeforeSlow(RenderContext& context, CommandBuffer& buffer) {
 	block->open = block->used++;
 }
 
-void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint32_t kind) {
+void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint32_t kind,
+               uint64_t area) {
 	auto& state = GetState();
 	auto* block = state.current;
 	if (block == nullptr || block->open < 0 ||
@@ -189,7 +197,7 @@ void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint
 	const auto base = static_cast<uint32_t>(block - state.blocks.data()) * BlockQueries;
 	buffer.Handle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, state.pool,
 	                               base + block->used);
-	block->pairs.push_back({static_cast<uint32_t>(block->open), block->used, key, kind});
+	block->pairs.push_back({static_cast<uint32_t>(block->open), block->used, key, kind, area});
 	block->used++;
 	block->open = -1;
 }
@@ -204,12 +212,15 @@ void Present(uint64_t frame) {
 	auto& state = GetState();
 	if (Detail::g_active.load(std::memory_order_relaxed)) {
 		std::vector<std::pair<uint64_t, Stat>> sorted;
+		std::vector<std::pair<uint64_t, Stat>> areas;
 		double                                 timed = 0.0;
 		double                                 total = 0.0;
 		{
 			std::lock_guard lock(state.stats_mutex);
 			sorted.assign(state.stats.begin(), state.stats.end());
 			state.stats.clear();
+			areas.assign(state.area_stats.begin(), state.area_stats.end());
+			state.area_stats.clear();
 			total          = state.total_ms;
 			state.total_ms = 0.0;
 		}
@@ -226,6 +237,13 @@ void Present(uint64_t frame) {
 			LOGF("GpuTiming   %s 0x%016" PRIx64 " %7.2fms x%" PRIu64 "\n",
 			     key == 0 ? "between " : (stat.kind == Draw ? "draw    " : "dispatch"), key,
 			     stat.ms, stat.count);
+		}
+		std::sort(areas.begin(), areas.end(),
+		          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+		for (size_t i = 0; i < areas.size() && i < 8; i++) {
+			const auto& [area, stat] = areas[i];
+			LOGF("GpuTiming   area     %5" PRIu64 "x%-5" PRIu64 " %7.2fms x%" PRIu64 "\n",
+			     area >> 32u, area & 0xffffffffu, stat.ms, stat.count);
 		}
 	}
 	const bool active = frame >= window.first && frame - window.first < window.count;

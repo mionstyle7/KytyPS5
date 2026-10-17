@@ -18,7 +18,8 @@ namespace GpuTiming {
 namespace Detail {
 inline std::atomic<bool> g_active {false};
 void BeforeSlow(RenderContext& context, CommandBuffer& buffer);
-void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint32_t kind);
+void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint32_t kind,
+               uint64_t area);
 } // namespace Detail
 
 enum Kind : uint32_t { Draw = 1, Dispatch = 2 };
@@ -29,9 +30,11 @@ inline void Before(RenderContext& context, CommandBuffer& buffer) {
 	}
 }
 
-inline void After(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint32_t kind) {
+// area: a draw's render area, width << 32 | height (0 for none), also summed per area.
+inline void After(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint32_t kind,
+                  uint64_t area = 0) {
 	if (Detail::g_active.load(std::memory_order_relaxed)) {
-		Detail::AfterSlow(context, buffer, key, kind);
+		Detail::AfterSlow(context, buffer, key, kind, area);
 	}
 }
 

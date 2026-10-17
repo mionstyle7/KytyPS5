@@ -1487,7 +1487,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	GpuTiming::After(m_context, buffer,
 	                 state.ps_active ? state.ps_input_info.stage.program->shader_hash
 	                                 : vertex_stages.back().stage.program->shader_hash,
-	                 GpuTiming::Draw);
+	                 GpuTiming::Draw,
+	                 (static_cast<uint64_t>(rendering.width) << 32u) | rendering.height);
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
