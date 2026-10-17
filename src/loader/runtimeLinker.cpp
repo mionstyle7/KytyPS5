@@ -685,8 +685,13 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	if (gpu_thread && !emulated) {
 		// The GPU thread faulting on GPU-owned memory drains the whole pipeline; the first few
 		// get a full host stack so the command-processor path responsible can be named.
+		// KYTY_DIAG_STACKS=1 (see RecordSemaphoreWait): the stack is symbolised on the GPU thread.
+		static const bool stacks = [] {
+			const char* value = std::getenv("KYTY_DIAG_STACKS");
+			return value != nullptr && value[0] == '1';
+		}();
 		static std::atomic<uint32_t> traced = 0;
-		if (traced.fetch_add(1) < 48) {
+		if (stacks && traced.fetch_add(1) < 48) {
 			LOGF("TrackedFault on GPU thread: %s vaddr=0x%016" PRIx64 " pc=0x%016" PRIx64 "\n%s",
 			     is_read ? "read" : "write", guest_vaddr, host_pc,
 			     Common::HostBacktrace().c_str());

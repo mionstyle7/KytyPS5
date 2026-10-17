@@ -8,6 +8,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -36,6 +37,7 @@
 #include <mutex>
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <bit>
@@ -1437,6 +1439,10 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 	// Engine method, E2: the pages the guest wrote since the last submission, already watched
 	// again. Every entry in them is compared with the T# its key was settled from.
 	table.TakeWrittenRanges(m_bindless_written);
+	Common::Timer sync_timer;
+	sync_timer.Start();
+	double   resettle_s = 0.0, read_s = 0.0;
+	uint64_t compared = 0, overlaps = 0;
 	// T# bits that select a view of the same texture (RDNA 2 ISA 8.2.6); see LogBindlessHeapStats.
 	constexpr std::array<uint32_t, 8> ViewMask {0u,          0x000fff00u, 0u,          0x0e0fffffu,
 	                                            0x1fff0000u, 0x027fff00u, 0x000003ffu, 0u};
@@ -1454,10 +1460,15 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 			heap.eager_complete = false; // entries may have become valid
 			const auto first = static_cast<uint32_t>((from - heap_begin) / 32u);
 			const auto last  = static_cast<uint32_t>((to - heap_begin + 31u) / 32u);
+			overlaps++;
+			compared += last - first;
+			const double read_start = sync_timer.GetTimeS();
 			m_bindless_window.resize(last - first);
-			if (!Libs::LibKernel::Memory::TryReadBacking(heap_begin + uint64_t {first} * 32u,
+			const bool read_ok = Libs::LibKernel::Memory::TryReadBacking(heap_begin + uint64_t {first} * 32u,
 			                                              m_bindless_window.data(),
-			                                              uint64_t {last - first} * 32u)) {
+			                                              uint64_t {last - first} * 32u);
+			read_s += sync_timer.GetTimeS() - read_start;
+			if (!read_ok) {
 				continue;
 			}
 			for (uint32_t key = first; key < last; key++) {
@@ -1491,12 +1502,28 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 					released++;
 					continue;
 				}
+				const double resettle_start = sync_timer.GetTimeS();
 				resettled += ResettleBindlessKey(heap, key) ? 1u : 0u;
+				resettle_s += sync_timer.GetTimeS() - resettle_start;
 			}
 		}
 	}
 	uint64_t bytes = 0;
 	for (const auto& [begin, end]: m_bindless_written) bytes += end - begin;
+	// A slow sync is a visible hitch (8-15 ms on the GPU thread in gameplay, 2026-10-17, with no
+	// profiled callee): name where its time went.
+	if (const double total_s = sync_timer.GetTimeS(); total_s >= 0.004) {
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 64) {
+			LOGF("Bindless sync slow: %.1f ms (reads %.1f ms, resettles %.1f ms): %zu written "
+			     "ranges, %" PRIu64 " KB, %zu heaps, %" PRIu64 " heap overlaps, %" PRIu64
+			     " keys compared; %u view and %u resource changes, %u resettled, %u released, "
+			     "%u kept stale\n",
+			     total_s * 1000.0, read_s * 1000.0, resettle_s * 1000.0, m_bindless_written.size(),
+			     bytes / 1024u, table.Heaps().size(), overlaps, compared, view_changes,
+			     resource_changes, resettled, released, kept);
+		}
+	}
 	auto& stats = g_bindless_engine_stats;
 	stats.syncs.fetch_add(1, std::memory_order_relaxed);
 	stats.written_bytes.fetch_add(bytes, std::memory_order_relaxed);

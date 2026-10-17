@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -59,7 +60,15 @@ void RecordSemaphoreWait(double seconds, uint64_t tick, uint64_t gpu_tick) {
 	stats.count++;
 	stats.total_s += seconds;
 	stats.max_s = std::max(stats.max_s, seconds);
-	if (seconds >= 0.020 && g_slow_wait_traces.fetch_add(1) < 24) {
+	// KYTY_DIAG_STACKS=1: symbolising a host stack takes the dbghelp lock and, the first time,
+	// loads the whole PDB, which stalled the thread for tens of milliseconds right when a wait
+	// was already slow (the two worst GPU frames of a gameplay run, 244 and 265 ms, were the
+	// frames these stacks were taken in). Off unless asked for.
+	static const bool stacks = [] {
+		const char* value = std::getenv("KYTY_DIAG_STACKS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (stacks && seconds >= 0.020 && g_slow_wait_traces.fetch_add(1) < 24) {
 		LOGF("SemaphoreWait slow: %.1fms tick=%" PRIu64 " gpu_tick=%" PRIu64 " thread=%d\n%s",
 		     seconds * 1000.0, tick, gpu_tick, Common::Thread::GetThreadIdUnique(),
 		     Common::HostBacktrace().c_str());
