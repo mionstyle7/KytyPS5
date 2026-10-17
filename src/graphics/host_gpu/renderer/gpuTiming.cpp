@@ -54,6 +54,7 @@ struct State {
 	std::mutex                           stats_mutex;
 	std::unordered_map<uint64_t, Stat>   stats; // key 0: GPU time between timed commands
 	std::unordered_map<uint64_t, Stat>   area_stats; // draws by render area (width << 32 | height)
+	std::unordered_map<uint64_t, Stat>   gap_stats;  // GPU time between commands, by the next one
 	double                               total_ms = 0.0;
 };
 
@@ -106,9 +107,14 @@ void ReadBlock(State& state, Block& block) {
 					}
 				}
 				if (previous_after != 0 && before >= previous_after) {
-					auto& gap = state.stats[0];
-					gap.ms += static_cast<double>(before - previous_after) * state.period_ns / 1e6;
+					auto&      gap = state.stats[0];
+					const auto ms  = static_cast<double>(before - previous_after) * state.period_ns / 1e6;
+					gap.ms += ms;
 					gap.count++;
+					auto& next = state.gap_stats[pair.key];
+					next.ms += ms;
+					next.count++;
+					next.kind = pair.kind;
 				}
 				previous_after = after;
 			}
@@ -213,6 +219,7 @@ void Present(uint64_t frame) {
 	if (Detail::g_active.load(std::memory_order_relaxed)) {
 		std::vector<std::pair<uint64_t, Stat>> sorted;
 		std::vector<std::pair<uint64_t, Stat>> areas;
+		std::vector<std::pair<uint64_t, Stat>> gaps;
 		double                                 timed = 0.0;
 		double                                 total = 0.0;
 		{
@@ -221,6 +228,8 @@ void Present(uint64_t frame) {
 			state.stats.clear();
 			areas.assign(state.area_stats.begin(), state.area_stats.end());
 			state.area_stats.clear();
+			gaps.assign(state.gap_stats.begin(), state.gap_stats.end());
+			state.gap_stats.clear();
 			total          = state.total_ms;
 			state.total_ms = 0.0;
 		}
@@ -244,6 +253,14 @@ void Present(uint64_t frame) {
 			const auto& [area, stat] = areas[i];
 			LOGF("GpuTiming   area     %5" PRIu64 "x%-5" PRIu64 " %7.2fms x%" PRIu64 "\n",
 			     area >> 32u, area & 0xffffffffu, stat.ms, stat.count);
+		}
+		// The time between commands, by the command that came after it: where the gaps are.
+		std::sort(gaps.begin(), gaps.end(),
+		          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+		for (size_t i = 0; i < gaps.size() && i < 8; i++) {
+			const auto& [key, stat] = gaps[i];
+			LOGF("GpuTiming   gap before %s 0x%016" PRIx64 " %7.2fms x%" PRIu64 "\n",
+			     stat.kind == Draw ? "draw    " : "dispatch", key, stat.ms, stat.count);
 		}
 	}
 	const bool active = frame >= window.first && frame - window.first < window.count;
