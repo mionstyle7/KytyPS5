@@ -9,7 +9,9 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace Libs {
 
@@ -110,6 +112,15 @@ static int KYTY_SYSV_ABI SystemServiceParamGetInt(int param_id, int* value) {
 		default:
 			LOGF_COLOR(Log::Color::Yellow, " unsupported param_id %d, using 0\n", param_id);
 			break;
+	}
+	// KYTY_SYSTEM_PARAM_<id>=<value>: answer that system setting with the value instead, to see
+	// what a game does with a setting the emulator does not know (param 210, queried once at
+	// start by the title, may be the console's game preset: performance or resolution mode).
+	if (const char* override_value =
+	        std::getenv(("KYTY_SYSTEM_PARAM_" + std::to_string(param_id)).c_str());
+	    override_value != nullptr) {
+		v = static_cast<int>(std::strtol(override_value, nullptr, 0));
+		LOGF_COLOR(Log::Color::Yellow, " param_id %d overridden: %d\n", param_id, v);
 	}
 
 	LOGF(" %d = %d\n", param_id, v);
