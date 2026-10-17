@@ -138,6 +138,10 @@ public:
 				m_complete_epoch = 0;
 			}
 		}
+		if constexpr (source == DirtySource::Gpu) {
+			// A new GPU write, or the bytes current again: a stale read grant ends here.
+			m_stale_readable.UnsetRange(start, end);
+		}
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 			StoreSummary<source>(true);
@@ -168,6 +172,8 @@ public:
 		if constexpr (clear) {
 			if constexpr (source == DirtySource::Cpu) {
 				m_kept.UnsetRange(start, end);
+			} else {
+				m_stale_readable.UnsetRange(start, end);
 			}
 			bits.UnsetRange(start, end);
 			if (bits.None()) {
@@ -232,6 +238,19 @@ public:
 		}
 	}
 
+	// Relaxed readback (BufferCache): guest threads may read the GPU-dirty pages of the range with
+	// the bytes guest memory holds now (a download of the new ones already recorded), until the
+	// next GPU write to them or their unmark. Writes still fault. Caller holds lock.
+	void GrantStaleRead(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		const RegionBits dirty(m_gpu_dirty, start, end);
+		if (dirty.None()) {
+			return;
+		}
+		m_stale_readable |= dirty;
+		UpdateProtection<false, true>();
+	}
+
 	// The tracker mirrors the CPU summary in one bit per region (MemoryTracker::IsRangeCpuCleanHint).
 	// Set before the region is published.
 	void SetCpuSummaryBit(std::atomic<uint64_t>* word, uint64_t bit) noexcept {
@@ -260,7 +279,7 @@ private:
 
 	template <bool track, bool is_read>
 	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
+		const auto protection = is_read ? (~m_gpu_dirty | m_stale_readable) : m_cpu_dirty;
 		auto&      previous   = is_read ? m_readable : m_writable;
 		auto       mask       = protection ^ previous;
 		if (mask.None()) {
@@ -327,6 +346,8 @@ private:
 	uint64_t               m_cpu_summary_bit  = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// GPU-dirty pages guest threads may read with their current guest bytes (GrantStaleRead).
+	RegionBits   m_stale_readable;
 	// ForEachUploadRangeOnce: pages left CPU-dirty and writable by an upload, and the pages
 	// uploaded in slice m_uploaded_epoch.
 	RegionBits   m_kept;

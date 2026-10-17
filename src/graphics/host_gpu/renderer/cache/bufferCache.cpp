@@ -1095,6 +1095,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    steps++;
 			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
 			    m_step_ticket = nullptr;
+			    if (async && !is_write && wait_tick != 0 && wait_tick != SideIssued &&
+			        wait_tick != SideRetry && TryGrantStaleRead(vaddr, size)) {
+				    wait_tick = 0;
+			    }
 		    });
 		service_ms += (timer.GetTimeS() - request_start) * 1000.0;
 		if (wait_tick == SideIssued) {
@@ -1225,8 +1229,9 @@ static bool ReadbackRetick() {
 
 static bool ReadbackPredict() {
 	static const bool enabled = [] {
+		// Off by default: on, gameplay ran at half the frame rate (2026-10-17).
 		const char* value = std::getenv("KYTY_READBACK_PREDICT");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
 }
@@ -1271,9 +1276,51 @@ uint64_t BufferCache::LiftCurrentPages(uint64_t begin, uint64_t end) {
 // GPU thread (the first step of a game thread's readback). A window read for GPU-written bytes
 // twice, at least 8 ms apart (two frames, not two pages of one burst), is learned; one unread
 // for 2 s is forgotten (PrefetchReadbacks).
+static bool RelaxedReadback() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RELAXED_READBACK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool BufferCache::TryGrantStaleRead(uint64_t vaddr, uint64_t size) {
+	const auto window = ReadbackWindow();
+	if (!RelaxedReadback() || window == 0) {
+		return false;
+	}
+	// Only windows game threads keep reading: the GPU thread may read other GPU-written memory
+	// directly and rely on the fault.
+	const auto found = m_predict.find(Common::AlignDown(vaddr, window));
+	bool       granted = false;
+	if (found != m_predict.end() && found->second.learned) {
+		const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto last  = Common::AlignUp(vaddr + std::max<uint64_t>(size, 1), TRACKER_PAGE_SIZE);
+		// Every GPU-written byte of the pages must be on its way back already: one that is not
+		// would stay stale until the next GPU write.
+		if (!HasGpuDirtyBytes(first, last - first)) {
+			m_memory_tracker.GrantStaleRead(first, last - first);
+			granted = true;
+		}
+	}
+	(granted ? m_stale_reads : m_waited_reads)++;
+	static int64_t next_ms = 0;
+	if (const auto now = PredictNowMs(); now >= next_ms) {
+		if (next_ms != 0) {
+			LOGF("Relaxed readback: %" PRIu64 " game reads took the bytes in memory, %" PRIu64
+			     " waited for the download\n",
+			     m_stale_reads, m_waited_reads);
+		}
+		m_stale_reads  = 0;
+		m_waited_reads = 0;
+		next_ms        = now + 10000;
+	}
+	return granted;
+}
+
 void BufferCache::NotePredictRead(uint64_t vaddr, bool gpu_bytes) {
 	const auto window = ReadbackWindow();
-	if (!ReadbackPredict() || window == 0) {
+	if ((!ReadbackPredict() && !RelaxedReadback()) || window == 0) {
 		return;
 	}
 	const auto now   = PredictNowMs();
@@ -1299,7 +1346,8 @@ void BufferCache::NotePredictRead(uint64_t vaddr, bool gpu_bytes) {
 }
 
 void BufferCache::PrefetchReadbacks() {
-	if (!ReadbackPredict() || m_predict.empty()) {
+	// Relaxed readback learns windows too; this pass also forgets them.
+	if ((!ReadbackPredict() && !RelaxedReadback()) || m_predict.empty()) {
 		return;
 	}
 	KYTY_PROFILER_FUNCTION();
@@ -1322,6 +1370,10 @@ void BufferCache::PrefetchReadbacks() {
 			continue;
 		}
 		learned++;
+		if (!ReadbackPredict()) {
+			++it;
+			continue;
+		}
 		const auto* owner = m_page_table.Find(entry.probe >> PageTable::kPageBits);
 		if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
 			++it;
@@ -1357,7 +1409,7 @@ void BufferCache::PrefetchReadbacks() {
 		m_scheduler.Flush();
 		m_last_async_download_tick = tick;
 	}
-	if (now >= m_predict_stats.next_ms) {
+	if (ReadbackPredict() && now >= m_predict_stats.next_ms) {
 		if (m_predict_stats.next_ms != 0) {
 			LOGF("Readback prediction: %zu learned windows (%zu tracked), %" PRIu64
 			     " prefetches (%.1f MB), %" PRIu64 " pages unprotected ahead; game reads: %" PRIu64

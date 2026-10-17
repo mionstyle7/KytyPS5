@@ -164,7 +164,7 @@ public:
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();
-	// GPU thread, at the end of each guest submission (KYTY_READBACK_PREDICT=0 off): readback
+	// GPU thread, at the end of each guest submission (KYTY_READBACK_PREDICT=1 on; off by default): readback
 	// windows the game threads read GPU-written bytes from again and again are downloaded ahead,
 	// asynchronously, and their pages unprotected once the copy is in guest memory, so the next
 	// read neither faults nor waits for the GPU thread and the GPU.
@@ -332,6 +332,15 @@ private:
 	};
 	PredictStats                                       m_predict_stats;
 	void NotePredictRead(uint64_t vaddr, bool gpu_bytes);
+	// Relaxed readback (KYTY_RELAXED_READBACK=1, off by default; the Astro Bot fork's d23ab526):
+	// a game thread's read of a learned window whose bytes are all on their way back (a download
+	// recorded) does not wait for it: the pages open read-only with the bytes guest memory holds,
+	// as a CPU read on hardware sees memory before the GPU's write lands. The download publishes
+	// as usual, the next GPU write closes the pages again, and writes still synchronize. GPU
+	// thread; true when it granted the read.
+	bool TryGrantStaleRead(uint64_t vaddr, uint64_t size);
+	uint64_t m_stale_reads = 0;
+	uint64_t m_waited_reads = 0;
 	// Lifts the protection of the pages of [begin, end) protected as GPU-written whose bytes are
 	// all in guest memory (none GPU-written or downloading), one change per run; the pages lifted.
 	uint64_t LiftCurrentPages(uint64_t begin, uint64_t end);
