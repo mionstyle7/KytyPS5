@@ -251,16 +251,19 @@ bool SrtNoDrain() {
 	return enabled;
 }
 
-// KYTY_SRT_SPECULATE (default on; =0 off): an SRT read of bytes GPU work wrote, at a site (shader,
+// KYTY_SRT_SPECULATE=1 (default off; unsafe): an SRT read of bytes GPU work wrote, at a site (shader,
 // address, size) whose drained value has been the same at least 8 times in a row, takes that value
 // instead of draining the GPU; every 16th such read still drains and compares, and a different
 // value resets the site (three times: it never speculates again). In the title's menu one compute
 // shader (fb5ee753) drained the GPU about two frames in three, ~10 ms each (20% of the GPU thread),
-// to read 4 bytes that were 1 every time.
+// to read 4 bytes that were 1 every time. Off by default: entering the menu the values changed
+// (fb5ee753's, and a count at 0x11871f419c several shaders read), and a dispatch run with the stale
+// count lost the device (VK_ERROR_DEVICE_LOST, 2026-10-17). These values feed further reads of the
+// SRT walk, so they cannot be left to the GPU either (SrtGpuFill).
 bool SrtSpeculate() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SRT_SPECULATE");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
 }
