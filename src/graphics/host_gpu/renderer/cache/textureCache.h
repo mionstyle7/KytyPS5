@@ -175,6 +175,11 @@ private:
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	// Partial CPU writes (21cfed4a): the subresources of an image over its CPU-dirty ranges only;
+	// false when the image must be uploaded whole.
+	[[nodiscard]] bool UploadImagePartial(Image& image, Buffer& source, uint64_t source_offset);
+	[[nodiscard]] bool TryInvalidatePartial(ImageId id, Image& image, uint64_t address,
+	                                        uint64_t size);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);

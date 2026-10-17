@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <algorithm>
 #include <mutex>
 #include <compare>
 #include <limits>
@@ -80,9 +81,55 @@ public:
 			m_cpu_dirty        = true;
 			m_maybe_cpu_dirty  = false;
 			m_maybe_hash_valid = false;
+			DropPartialDirty();
 		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
 			m_maybe_cpu_dirty = true;
 		}
+	}
+
+	// Partial CPU writes (the Demon's Souls fork's KYTY_PARTIAL_IMAGE_DIRTY, 21cfed4a): while the
+	// image is dirty only in the recorded guest ranges it keeps watching its other pages, and a
+	// refresh uploads just the subresources over those ranges. A clean image or one already dirty
+	// this way can take one.
+	[[nodiscard]] bool CanTakePartialDirty() const noexcept {
+		return !m_maybe_cpu_dirty && (!m_cpu_dirty || m_partial_dirty);
+	}
+	void InvalidateCpuWritePartial(uint64_t begin, uint64_t end) {
+		if (!CanTakePartialDirty() || begin >= end) {
+			EXIT("image cannot take a partial CPU write\n");
+		}
+		if (!m_cpu_dirty) {
+			m_cpu_dirty        = true;
+			m_partial_dirty    = true;
+			m_maybe_hash_valid = false;
+			m_dirty_ranges.clear();
+		}
+		AddRange(m_dirty_ranges, begin, end);
+	}
+	[[nodiscard]] bool IsPartiallyCpuDirty() const noexcept { return m_cpu_dirty && m_partial_dirty; }
+	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& CpuDirtyRanges() const noexcept {
+		return m_dirty_ranges;
+	}
+	// The whole image must be uploaded again (it stopped watching all of its pages).
+	void DropPartialDirty() noexcept {
+		m_partial_dirty = false;
+		m_dirty_ranges.clear();
+	}
+	// Sorted, disjoint [begin, end) ranges; merges adjacent and overlapping ones.
+	static void AddRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin,
+	                     uint64_t end) {
+		auto at = ranges.begin();
+		while (at != ranges.end() && at->second < begin) {
+			++at;
+		}
+		auto last = at;
+		while (last != ranges.end() && last->first <= end) {
+			begin = std::min(begin, last->first);
+			end   = std::max(end, last->second);
+			++last;
+		}
+		at = ranges.erase(at, last);
+		ranges.insert(at, {begin, end});
 	}
 
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
@@ -120,6 +167,7 @@ public:
 		m_cpu_dirty        = false;
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
+		DropPartialDirty();
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
@@ -157,6 +205,9 @@ public:
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
+	// Page-aligned ranges inside [track_addr, track_addr_end) whose watchers a partial CPU write
+	// released (TextureCache::TryInvalidatePartial); TrackImage watches them again.
+	std::vector<std::pair<uint64_t, uint64_t>> untracked_holes;
 	ImageId          depth_id {};
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
@@ -194,6 +245,8 @@ private:
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
+	bool              m_partial_dirty    = false;
+	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;
 };
 
 // Changes of a bindless-pinned image's state that the per-draw bindless pass checks
