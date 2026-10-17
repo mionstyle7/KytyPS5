@@ -129,7 +129,19 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 
 uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& flags,
                                uint32_t exec) {
-	auto&      state      = ctx.state;
+	auto& state = ctx.state;
+	if (flags.row_mask == 0xfu && flags.bank_mask == 0xfu) {
+		// Every row and bank enabled (nearly every DPP move): the per-lane mask test is always
+		// true, and the host compiler could not prove it (13 instructions per move; a quarter of
+		// some shaders).
+		if (flags.bound_control) {
+			return exec;
+		}
+		const auto target = EmitDppTargetLane(state, flags);
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, exec, target.valid);
+		return result;
+	}
 	const auto lane       = EmitSubgroupLocalInvocationId(state);
 	const auto bank_shift = state.builder.AllocateId();
 	const auto row_shift  = state.builder.AllocateId();
