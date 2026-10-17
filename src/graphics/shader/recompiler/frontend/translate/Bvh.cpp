@@ -21,6 +21,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <array>
+#include <cstdlib>
 #include <limits>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -60,6 +61,26 @@ void Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
 	std::array<IR::U32, 4> descriptor;
 	for (uint32_t i = 0; i < 4; ++i)
 		descriptor[i] = ReadU32(OffsetOperand(inst.src1, i));
+	// KYTY_RT_MISS=1 (experiment, changes the image): every ray misses at the first node, so a
+	// game's ray traversal ends at once (box nodes return no children, triangle nodes no hit).
+	// It shows how much of the frame ray tracing costs; reflections, ray-traced shadows and AO
+	// then see nothing.
+	static const bool rt_miss = [] {
+		const char* value = std::getenv("KYTY_RT_MISS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (rt_miss) {
+		const auto type    = ir.BitwiseAnd(ray[0], u(7));
+		const auto box     = ir.LogicalOr(ir.IEqual(type, u(4)), ir.IEqual(type, u(5)));
+		const auto inf     = ir.BitCastU32(f(std::numeric_limits<float>::infinity()));
+		const auto one     = ir.BitCastU32(f(1.0f));
+		const std::array<IR::U32, 4> miss {inf, one, u(0), u(0)};
+		for (uint32_t component = 0; component < 4; ++component) {
+			WriteOperand(OffsetOperand(inst.dst, component),
+			             ir.Select(box, u(UINT32_MAX), miss[component]));
+		}
+		return;
+	}
 	const auto node_type   = ir.BitwiseAnd(ray[0], u(7));
 	const auto box16       = ir.IEqual(node_type, u(4));
 	const auto box32       = ir.IEqual(node_type, u(5));
