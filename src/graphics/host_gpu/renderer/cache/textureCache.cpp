@@ -2144,6 +2144,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
+	destination.written_serial = m_scheduler.CommandSerial();
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
 	const auto     full_slice_size  = info.data.size / layers;
@@ -2201,6 +2202,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                      uint64_t destination_size, ImageDownload transfer) {
+	destination.written_serial = m_scheduler.CommandSerial();
 	if (!transfer.valid) {
 		EXIT("TextureCache: invalid image download transfer\n");
 	}

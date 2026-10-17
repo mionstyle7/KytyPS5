@@ -130,8 +130,10 @@ public:
 	}
 
 	template <typename RangeFunc, typename UploadFunc>
+	// last_dirty: set to the newest LastDirtyClock of the regions whose pages it uploads
+	// (g_cpu_dirty_clock), read under their locks.
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
-	                        UploadFunc&& upload_func) {
+	                        UploadFunc&& upload_func, uint64_t* last_dirty = nullptr) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
@@ -176,6 +178,9 @@ public:
 			ForEachCpuDirtyRegion(vaddr, size,
 			                      [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 				                      manager->lock.lock();
+				                      if (last_dirty != nullptr) {
+					                      *last_dirty = std::max(*last_dirty, manager->LastDirtyClock());
+				                      }
 				                      if (g_upload_once) {
 					                      manager->ForEachUploadRangeOnce(
 					                          manager->GetCpuAddr() + offset, bytes, epoch, range_func);
@@ -198,6 +203,9 @@ public:
 				return;
 			}
 			manager->lock.lock();
+			if (last_dirty != nullptr) {
+				*last_dirty = std::max(*last_dirty, manager->LastDirtyClock());
+			}
 			if (summary_clean && manager->IsModified<DirtySource::Cpu>(offset, bytes)) {
 				static std::atomic<uint32_t> misses = 0;
 				if (misses.fetch_add(1) < 32) {

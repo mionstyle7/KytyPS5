@@ -69,6 +69,15 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 // all buffers for global-memory shaders, can skip its walk while this has not moved.
 inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
 
+// Upload prologue (CommandScheduler::UploadPrologue, the Demon's Souls fork's 4a979df3): a clock
+// that advances whenever pages become CPU-dirty; each region keeps the value of its last such
+// change. The CPU-dirty pages of a region whose clock is not above a value read earlier were
+// dirty all the time since (nothing made them clean in between).
+inline std::atomic<uint64_t> g_cpu_dirty_clock {1};
+[[nodiscard]] inline uint64_t NextCpuDirtyClock() noexcept {
+	return g_cpu_dirty_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
 // Bumped by the GPU thread when it starts a guest submission (its first slice).
 inline std::atomic<uint64_t> g_guest_submission_seq {1};
 
@@ -101,6 +110,10 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	// See g_cpu_dirty_clock.
+	[[nodiscard]] uint64_t LastDirtyClock() const noexcept {
+		return m_last_dirty.load(std::memory_order_acquire);
+	}
 
 	// Lock-free "any page in this region may be dirty" summaries. A binding that spans a
 	// whole heap covers hundreds of regions; without these every draw locks and walks each
@@ -147,6 +160,7 @@ public:
 			StoreSummary<source>(true);
 			if constexpr (source == DirtySource::Cpu) {
 				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+				m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
 			}
 		} else {
 			bits.UnsetRange(start, end);
@@ -339,6 +353,7 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	std::atomic<uint64_t> m_last_dirty {NextCpuDirtyClock()}; // (all pages start CPU-dirty)
 	// The constructor fills m_cpu_dirty, so the CPU summary starts true.
 	std::atomic<bool> m_cpu_maybe_dirty {true};
 	std::atomic<bool> m_gpu_maybe_dirty {false};

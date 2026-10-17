@@ -1926,6 +1926,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
+	uint64_t                    last_dirty = 0;
 	vk::Buffer                  source;
 	{
 		KYTY_PROFILER_BLOCK("Sync::Tracker");
@@ -1938,9 +1939,17 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    [&]() noexcept {
 			    KYTY_PROFILER_BLOCK("Sync::Upload");
 			    source = UploadCopies(buffer, copies, total_size);
-		    });
+		    },
+		    &last_dirty);
 	}
 	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
+	// Pages dirty since before the open command buffer began: copied ahead of all of its commands,
+	// without ending the rendering or draining the GPU (CommandScheduler::UploadPrologue).
+	if (source && !is_written && !g_upload_once &&
+	    m_scheduler.UploadPrologue(last_dirty, buffer.written_serial, source, buffer.Handle(),
+	                               copies.data(), static_cast<uint32_t>(copies.size()))) {
+		source = nullptr;
+	}
 	if (source) {
 		KYTY_PROFILER_BLOCK("Sync::Copy");
 		auto& command = m_scheduler.Current();
@@ -2082,6 +2091,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	buffer.last_use_tick = m_scheduler.CurrentTick();
 	if (is_written) {
 		const PageManager::DeferReadProtectScope defer_protect;
+		buffer.written_serial = m_scheduler.CommandSerial();
 		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 		MarkGpuWritten(vaddr, size);
 	} else {
@@ -2106,6 +2116,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	TouchBuffer(buffer);
 	// The whole binding is current on the GPU, as for a written buffer; only the bytes the
 	// stores can reach become GPU-written.
+	if (written_size != 0) {
+		buffer.written_serial = m_scheduler.CommandSerial();
+	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 	if (written_size != 0) {
 		const PageManager::DeferReadProtectScope defer_protect;
@@ -2167,6 +2180,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, ui
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
 	const PageManager::DeferReadProtectScope defer_protect;
+	buffer.written_serial = m_scheduler.CommandSerial();
 	(void)SynchronizeBuffer(buffer, vaddr, size, true, false);
 	MarkGpuWritten(vaddr, size, true);
 	return {&buffer, buffer.Offset(vaddr)};

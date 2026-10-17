@@ -8,9 +8,12 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
@@ -542,6 +545,9 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	// Ticks are allocated in submit order, so this command buffer will be submitted with the
 	// current one.
 	const auto tick = m_master.CurrentTick();
+	m_command_tick  = tick;
+	m_command_serial++;
+	m_command_clock = g_cpu_dirty_clock.load(std::memory_order_acquire);
 	if (m_threaded) {
 		m_command.m_buffer = nullptr;
 		Record([this, tick](vk::CommandBuffer) {
@@ -555,6 +561,47 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.m_buffer = m_command_pool.Commit(tick);
 	m_command.Begin();
 	return m_command;
+}
+
+static bool UploadPrologueEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UPLOAD_PROLOGUE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool CommandScheduler::UploadPrologue(uint64_t last_dirty, uint64_t written_serial,
+                                      vk::Buffer source, vk::Buffer destination,
+                                      const vk::BufferCopy* copies, uint32_t count) {
+	if (!m_threaded || !UploadPrologueEnabled() || m_command.IsInvalid() || count == 0 ||
+	    last_dirty == 0 || last_dirty > m_command_clock || written_serial == m_command_serial) {
+		return false;
+	}
+	static std::atomic<uint64_t> taken {0};
+	if (taken.fetch_add(1, std::memory_order_relaxed) % 100000 == 0) {
+		LOGF("Upload prologue: %" PRIu64 " uploads moved ahead of their command buffer\n",
+		     taken.load());
+	}
+	const auto* stashed = Stash(copies, count);
+	const auto  tick    = m_command_tick;
+	Record([this, tick, source, destination, stashed, count](vk::CommandBuffer) {
+		if (!m_worker_prologue) {
+			m_worker_prologue = m_command_pool.Commit(tick);
+			vk::CommandBufferBeginInfo begin_info {};
+			begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+			EXIT_NOT_IMPLEMENTED(m_worker_prologue.begin(&begin_info) != vk::Result::eSuccess);
+			// The copies after everything submitted before, which may use their destinations.
+			vk::MemoryBarrier before {};
+			before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+			before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+			m_worker_prologue.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                                  vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0,
+			                                  nullptr, 0, nullptr);
+		}
+		m_worker_prologue.copyBuffer(source, destination, count, stashed);
+	});
+	return true;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
@@ -593,6 +640,18 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		Record([this, job](vk::CommandBuffer command) mutable {
 			EXIT_NOT_IMPLEMENTED(command.end() != vk::Result::eSuccess);
 			job.buffer = command;
+			if (m_worker_prologue) {
+				// Everything after the copies (the open buffer's commands) sees them.
+				vk::MemoryBarrier after {};
+				after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+				after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+				m_worker_prologue.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+				                                  vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+				                                  &after, 0, nullptr, 0, nullptr);
+				EXIT_NOT_IMPLEMENTED(m_worker_prologue.end() != vk::Result::eSuccess);
+				job.prologue      = m_worker_prologue;
+				m_worker_prologue = nullptr;
+			}
 			QueueSubmit(job);
 			m_worker_buffer = nullptr;
 		});
@@ -641,8 +700,10 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &job.buffer;
+		const std::array<vk::CommandBuffer, 2> buffers {job.prologue ? job.prologue : job.buffer,
+		                                                job.buffer};
+		submit_info.commandBufferCount   = job.prologue ? 2u : 1u;
+		submit_info.pCommandBuffers      = buffers.data();
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 

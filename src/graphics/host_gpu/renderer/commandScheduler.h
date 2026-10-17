@@ -131,6 +131,22 @@ public:
 	// buffer it records into, for code that records directly.
 	vk::CommandBuffer DrainRecording();
 
+	// Upload prologue (the Demon's Souls fork's 4a979df3; KYTY_UPLOAD_PROLOGUE=0 off): an upload of
+	// pages whose regions were last made CPU-dirty at `last_dirty` (g_cpu_dirty_clock), no later
+	// than the open command buffer began, was dirty all the time since, so no command recorded into
+	// the open buffer read or wrote those bytes (every use of a CPU-dirty range synchronizes it
+	// first): its copies may run before all of that buffer's commands. They are recorded into a
+	// second command buffer submitted ahead of the open one, with one barrier each way per
+	// submission, where an upload in order ended the rendering and drained the GPU on both sides
+	// (the fork: render passes 197 -> 107 a frame, GPU busy 13.8 -> 11.6 ms). Not for a buffer the
+	// open command buffer recorded a write into (`written_serial`, Buffer::written_serial). True
+	// when the copies were taken; false: record them in order (recording thread off, switch off).
+	[[nodiscard]] bool UploadPrologue(uint64_t last_dirty, uint64_t written_serial,
+	                                  vk::Buffer source, vk::Buffer destination,
+	                                  const vk::BufferCopy* copies, uint32_t count);
+	// Advances with every command buffer begun.
+	[[nodiscard]] uint64_t CommandSerial() const noexcept { return m_command_serial; }
+
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
@@ -180,6 +196,7 @@ private:
 	// state that a fatal submit report prints.
 	struct SubmitJob {
 		vk::CommandBuffer buffer = nullptr;
+		vk::CommandBuffer prologue = nullptr; // submitted ahead of buffer (UploadPrologue)
 		SubmitInfo        submit;
 		uint64_t          tick         = 0;
 		uint32_t          debug_op     = 0;
@@ -262,6 +279,12 @@ private:
 	uint64_t                            m_chunks_executed   = 0;
 	uint64_t                            m_drains            = 0;
 	vk::CommandBuffer                   m_worker_buffer     = nullptr;
+	// The open command buffer's upload prologue (recording thread), its tick, serial and the
+	// CPU-dirty clock when it began (producer).
+	vk::CommandBuffer                   m_worker_prologue   = nullptr;
+	uint64_t                            m_command_tick      = 0;
+	uint64_t                            m_command_serial    = 1;
+	uint64_t                            m_command_clock     = 0;
 	uint64_t                            m_record_report_buffers = 0;
 	uint64_t                            m_record_report_chunks  = 0;
 	uint64_t                            m_record_report_drains  = 0;

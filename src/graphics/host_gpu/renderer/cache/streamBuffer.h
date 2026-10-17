@@ -75,6 +75,10 @@ public:
 	uint64_t last_use_tick = 0;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// The command buffer (CommandScheduler::CommandSerial) that last recorded a write into it
+	// outside a synchronization: a copy or fill into it, a shader's write, an image's bytes. Its
+	// uploads then stay in order in that command buffer (CommandScheduler::UploadPrologue).
+	uint64_t written_serial = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
