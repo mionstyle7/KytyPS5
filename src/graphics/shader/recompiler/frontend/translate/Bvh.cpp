@@ -20,13 +20,23 @@
 
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include "common/logging/log.h"
+
 #include <array>
+#include <atomic>
+#include <cinttypes>
 #include <cstdlib>
 #include <limits>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 void Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
+	// Diagnostics: whether a game's shaders use the hardware ray intersection at all.
+	static std::atomic<uint32_t> translated {0};
+	if (const auto count = translated.fetch_add(1, std::memory_order_relaxed); count < 16) {
+		LOGF("Ray tracing: IMAGE_BVH_INTERSECT_RAY translated (%u so far, pc=0x%" PRIx64 ")\n",
+		     count + 1, static_cast<uint64_t>(inst.pc));
+	}
 	using O           = IR::ValueOpcode;
 	using Vec3        = std::array<IR::F32, 3>;
 	const auto u      = [](uint32_t value) { return IR::U32(IR::Value(value)); };
