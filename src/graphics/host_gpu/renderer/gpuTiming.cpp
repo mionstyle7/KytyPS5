@@ -249,10 +249,16 @@ void Present(uint64_t frame) {
 		}
 		std::sort(areas.begin(), areas.end(),
 		          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
-		for (size_t i = 0; i < areas.size() && i < 8; i++) {
+		for (size_t i = 0; i < areas.size() && i < 14; i++) {
 			const auto& [area, stat] = areas[i];
-			LOGF("GpuTiming   area     %5" PRIu64 "x%-5" PRIu64 " %7.2fms x%" PRIu64 "\n",
-			     area >> 32u, area & 0xffffffffu, stat.ms, stat.count);
+			if ((area >> 63u) != 0) {
+				LOGF("GpuTiming   groups   %5" PRIu64 "x%" PRIu64 "x%" PRIu64 " %7.2fms x%" PRIu64 "\n",
+				     (area >> 32u) & 0x7fffffu, (area >> 16u) & 0xffffu, area & 0xffffu, stat.ms,
+				     stat.count);
+			} else {
+				LOGF("GpuTiming   area     %5" PRIu64 "x%-5" PRIu64 " %7.2fms x%" PRIu64 "\n",
+				     area >> 32u, area & 0xffffffffu, stat.ms, stat.count);
+			}
 		}
 		// The time between commands, by the command that came after it: where the gaps are.
 		std::sort(gaps.begin(), gaps.end(),

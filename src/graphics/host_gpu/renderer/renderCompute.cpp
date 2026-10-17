@@ -748,7 +748,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		Profiler::Add(Profiler::Counter::Dispatches);
 		GpuProfiler::End(buffer, gpu_zone);
-		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
+		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch,
+		                 GpuTiming::DispatchArea(thread_group_x, thread_group_y, thread_group_z));
 		Timeline::Mark("dispatch", program.shader_hash,
 		               (static_cast<uint64_t>(thread_group_x) << 32u) |
 		                   (thread_group_y << 16u) | thread_group_z);

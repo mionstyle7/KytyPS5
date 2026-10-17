@@ -24,6 +24,12 @@ void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint
 
 enum Kind : uint32_t { Draw = 1, Dispatch = 2 };
 
+// A dispatch's group counts as an "area" key (top bit set), so its time is summed by grid size.
+inline uint64_t DispatchArea(uint32_t x, uint32_t y, uint32_t z) {
+	return (uint64_t {1} << 63u) | (static_cast<uint64_t>(x & 0x7fffffu) << 32u) |
+	       (static_cast<uint64_t>(y & 0xffffu) << 16u) | (z & 0xffffu);
+}
+
 inline void Before(RenderContext& context, CommandBuffer& buffer) {
 	if (Detail::g_active.load(std::memory_order_relaxed)) {
 		Detail::BeforeSlow(context, buffer);
