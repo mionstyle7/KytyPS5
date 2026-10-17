@@ -291,7 +291,12 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
+		const bool registered = m_buffer_cache.IsRegionRegistered(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
+		if (registered && m_command_scheduler.Active()) {
+			std::shared_lock mapped_lock(m_mapped_ranges_mutex);
+			m_buffer_cache.ReleaseUnmappedBuffers(vaddr, size, m_mapped_ranges);
+		}
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_bindless_table.UnwatchRange(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);

@@ -164,6 +164,11 @@ public:
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();
+	// After the guest unmapped [vaddr, vaddr + size) (RenderContext::UnmapMemory), with `mapped` the
+	// memory still mapped: the buffers the range holds whole go, and a buffer it holds in part,
+	// mapped in no more than half of it now, is cut to its mapped runs (KYTY_UNMAP_SPLIT=0 off).
+	void                            ReleaseUnmappedBuffers(uint64_t vaddr, uint64_t size,
+	                                                       const RangeSet& mapped);
 	// Diagnostics, GPU thread: makes guest memory current for [vaddr, vaddr + size) by
 	// downloading what the GPU wrote there (drains the GPU).
 	void                            DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size);

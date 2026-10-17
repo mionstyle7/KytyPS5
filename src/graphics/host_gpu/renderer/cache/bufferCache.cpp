@@ -2419,6 +2419,148 @@ void BufferCache::RunGarbageCollector() {
 	}
 }
 
+// After the Demon's Souls fork (46defa0a and the deletion before it). The buffers over memory the
+// guest unmapped stayed, and joins with their neighbours grew them on as the title streams through
+// its heap: the fork found partly unmapped buffers holding 3.1 of 4.3 GiB of buffers after five
+// rounds of a route, one of 1.2 GiB, kept by the collector (GPU-owned bytes) and their CPU-written
+// pages synced at every BDA preparation (the route's last points 45 -> 56 fps with the cut). A buffer
+// the unmapped range holds whole goes; one it holds in part, mapped in no more than half of it, is
+// cut to its mapped runs (runs closer than a stream leap stay together): new buffers with its bytes
+// copied on the GPU, as a join copies them, so the bytes copied are at most the bytes freed. The
+// unmapped bytes are nobody's: their GPU-owned ones were read back by the invalidation before this,
+// and a buffer with GPU-owned bytes left outside its runs stays as it is.
+void BufferCache::ReleaseUnmappedBuffers(uint64_t vaddr, uint64_t size, const RangeSet& mapped) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UNMAP_SPLIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || size == 0 || UINT64_MAX - vaddr < size || m_scheduler.Current().IsInvalid()) {
+		return;
+	}
+	const auto end = vaddr + size;
+	// The buffers it holds whole.
+	std::vector<BufferId> whole;
+	std::vector<BufferId> partial;
+	auto                  it = m_buffers.lower_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		const auto  previous = std::prev(it)->second;
+		const auto& buffer   = m_slot_buffers[previous];
+		if (!buffer.is_deleted && buffer.CpuAddress() + buffer.Size() > vaddr) {
+			partial.push_back(previous);
+		}
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.is_deleted) {
+			continue;
+		}
+		(buffer.CpuAddress() + buffer.Size() > end ? partial : whole).push_back(it->second);
+	}
+	uint64_t deleted = 0;
+	for (const auto id: whole) {
+		auto& buffer = m_slot_buffers[id];
+		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
+			continue;
+		}
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		DeleteBuffer(id);
+		deleted++;
+	}
+	// Mapped runs closer than a stream leap stay one buffer (a join would make them one again).
+	constexpr uint64_t Gap   = CACHING_PAGESIZE * 128;
+	uint64_t           split = 0;
+	uint64_t           freed = 0;
+	for (const auto id: partial) {
+		const auto& old = m_slot_buffers[id];
+		if (old.is_deleted) {
+			continue;
+		}
+		const auto begin = old.CpuAddress();
+		const auto stop  = begin + old.Size();
+		RangeSet   still;
+		mapped.ForEachIntersection(begin, stop - begin, [&](const auto& range) {
+			still.Add(range.address, range.size);
+		});
+		still.Subtract(vaddr, size); // (the caller subtracts it from `mapped` after this)
+		std::vector<std::pair<uint64_t, uint64_t>> pieces;
+		still.ForEach([&](uint64_t from, uint64_t to) {
+			from = std::max(begin, Common::AlignDown(from, CACHING_PAGESIZE));
+			to   = std::min(stop, Common::AlignUp(to, CACHING_PAGESIZE));
+			if (!pieces.empty() && from <= pieces.back().second + Gap) {
+				pieces.back().second = std::max(pieces.back().second, to);
+			} else if (from < to) {
+				pieces.emplace_back(from, to);
+			}
+		});
+		uint64_t kept = 0;
+		for (const auto& [from, to]: pieces) {
+			kept += to - from;
+		}
+		if (kept * 2 > stop - begin) {
+			continue;
+		}
+		// GPU-owned bytes outside the pieces would be lost with it.
+		bool     owned_outside = false;
+		uint64_t at            = begin;
+		for (const auto& [from, to]: pieces) {
+			owned_outside = owned_outside ||
+			                (from > at && (m_gpu_modified_ranges.Intersects(at, from - at) ||
+			                               m_memory_tracker.IsRegionGpuModified(at, from - at)));
+			at = to;
+		}
+		if (owned_outside || (stop > at && (m_gpu_modified_ranges.Intersects(at, stop - at) ||
+		                                    m_memory_tracker.IsRegionGpuModified(at, stop - at)))) {
+			continue;
+		}
+		// New buffers first (inserting can move the slots: the old one is looked up again after),
+		// then the copies, the old one out and the new ones in, as CreateBuffer does.
+		std::vector<BufferId> ids;
+		for (const auto& [from, to]: pieces) {
+			ids.push_back(m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
+			                                    from,
+			                                    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+			                                    to - from));
+		}
+		const auto& source = m_slot_buffers[id];
+		for (size_t i = 0; i < ids.size(); ++i) {
+			auto&      piece      = m_slot_buffers[ids[i]];
+			const auto [from, to] = pieces[i];
+			SetVulkanObjectNameF(m_graphics.device, piece.Handle(),
+			                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", from, to - from);
+			piece.CopyFrom(m_scheduler.Current(), source, from - begin, 0, to - from);
+		}
+		// The dropped bytes' pages are no longer anybody's to watch.
+		at = begin;
+		for (const auto& [from, to]: pieces) {
+			if (from > at) {
+				m_memory_tracker.UntrackMemory(at, from - at);
+			}
+			at = to;
+		}
+		if (stop > at) {
+			m_memory_tracker.UntrackMemory(at, stop - at);
+		}
+		freed += stop - begin - kept;
+		DeleteBuffer(id);
+		for (const auto piece: ids) {
+			Register(piece);
+		}
+		split++;
+	}
+	static uint64_t total_deleted = 0;
+	static uint64_t total_split   = 0;
+	static uint64_t total_freed   = 0;
+	const auto      before        = (total_deleted + total_split) / 64;
+	total_deleted += deleted;
+	total_split += split;
+	total_freed += freed;
+	if ((total_deleted + total_split) / 64 != before) {
+		LOGF("Unmapped buffers: %" PRIu64 " deleted, %" PRIu64 " cut to their mapped runs (%" PRIu64
+		     " MB freed)\n",
+		     total_deleted, total_split, total_freed >> 20u);
+	}
+}
+
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
