@@ -1056,6 +1056,20 @@ static const bool g_async_readback = [] {
 	return value == nullptr || value[0] != '0';
 }();
 
+// Diagnostics: what the steps of game-thread readbacks answered (NoteGuestReadbackTiming).
+static struct {
+	std::atomic<uint64_t> ticks {0}, retries {0}, local_waits {0};
+} g_readback_outcomes;
+
+// KYTY_READBACK_LOCAL_WAIT=0: a readback asks the GPU thread again after every wait.
+static bool LocalDownloadWait() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_LOCAL_WAIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -1107,14 +1121,40 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			continue;
 		}
 		if (wait_tick == SideRetry) {
-			// Another thread's side readback of these pages publishes them first.
-			std::this_thread::yield();
+			// Another thread's side readback of these pages publishes them first: wait for it
+			// here, not with one more request to the GPU thread per yield.
+			g_readback_outcomes.retries.fetch_add(1, std::memory_order_relaxed);
+			WaitSideRanges(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
+			               Common::AlignUp(vaddr + std::max<uint64_t>(size, 1), TRACKER_PAGE_SIZE) -
+			                   Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
 			continue;
 		}
 		if (wait_tick == 0) {
 			break;
 		}
+		g_readback_outcomes.ticks.fetch_add(1, std::memory_order_relaxed);
 		m_scheduler.WaitPriorityOperations(wait_tick);
+		if (async && LocalDownloadWait()) {
+			// Other threads' downloads of these pages still in flight: each used to cost one more
+			// request to the GPU thread, which answered with the newest download's tick again.
+			// Wait for them here until none covers the pages, then ask once.
+			const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+			const auto bytes =
+			    Common::AlignUp(vaddr + std::max<uint64_t>(size, 1), TRACKER_PAGE_SIZE) - first;
+			for (uint32_t round = 0; round < 64; round++) {
+				bool downloading = false;
+				{
+					std::shared_lock lock(m_dirty_ranges_mutex);
+					downloading = m_downloading_ranges.Intersects(first, bytes);
+				}
+				const auto last = m_last_async_download_tick.load();
+				if (!downloading || last == 0) {
+					break;
+				}
+				g_readback_outcomes.local_waits.fetch_add(1, std::memory_order_relaxed);
+				m_scheduler.WaitPriorityOperations(last);
+			}
+		}
 	}
 	const double total_ms = timer.GetTimeS() * 1000.0;
 	NoteReadback(vaddr, total_ms, gpu_bytes, age);
@@ -1158,6 +1198,10 @@ void BufferCache::NoteGuestReadbackTiming(double total_ms, double service_ms, ui
 	     (stats.total - stats.service) / static_cast<double>(stats.calls), stats.max,
 	     static_cast<double>(stats.steps) / static_cast<double>(stats.calls), stats.age_bins[0],
 	     stats.age_bins[1], stats.age_bins[2], stats.age_bins[3]);
+	LOGF("Guest readback steps: %" PRIu64 " waits for a download, %" PRIu64
+	     " side readback retries, %" PRIu64 " waits without the GPU thread\n",
+	     g_readback_outcomes.ticks.exchange(0), g_readback_outcomes.retries.exchange(0),
+	     g_readback_outcomes.local_waits.exchange(0));
 	const auto next = stats.next;
 	stats           = {};
 	stats.next      = next;
@@ -1502,11 +1546,11 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			std::shared_lock lock(m_dirty_ranges_mutex);
 			downloading = m_downloading_ranges.Intersects(page_begin, page_end - page_begin);
 		}
-		if (downloading && m_last_async_download_tick != 0) {
+		if (const auto last = m_last_async_download_tick.load(); downloading && last != 0) {
 			if (async) {
-				return m_last_async_download_tick;
+				return last;
 			}
-			m_scheduler.WaitPriorityOperations(m_last_async_download_tick);
+			m_scheduler.WaitPriorityOperations(last);
 		}
 		if (async && ReadbackWindow() != 0) {
 			// The whole download window, as the synchronous path lifts it: page by page, each

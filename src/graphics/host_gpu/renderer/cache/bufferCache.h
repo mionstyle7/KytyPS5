@@ -313,7 +313,9 @@ private:
 	uint64_t                                           m_bitmap_written_pages = 0;
 	void ApplyCleanWrite(uint64_t vaddr, uint64_t size);
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
-	uint64_t                                           m_last_async_download_tick = 0;
+	// Written on the GPU thread, always for a submitted tick; game threads read it to wait for
+	// downloads in flight without asking the GPU thread (ReadMemory).
+	std::atomic<uint64_t>                              m_last_async_download_tick {0};
 	// Readback prediction (PrefetchReadbacks), GPU thread only: per readback window (its aligned
 	// start) when game threads read it, and whether a prefetch landed since the last read.
 	struct PredictWindow {
