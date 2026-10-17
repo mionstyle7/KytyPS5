@@ -302,6 +302,19 @@ private:
 	// window cleared the range while the second was in flight; a game thread then took the
 	// page as current, wrote it, and the second publication put older GPU bytes over that).
 	std::vector<std::pair<uint64_t, uint64_t>>         m_downloading_list;
+	// The asynchronous downloads among them, with the tick whose completion publishes each
+	// (guarded by m_dirty_ranges_mutex). A reader of a page waits for the downloads covering it,
+	// not for the newest download of any page (the Demon's Souls fork: readiness checked only
+	// over the pages actually written back, +6.5%).
+	struct DownloadTick {
+		uint64_t start = 0;
+		uint64_t bytes = 0;
+		uint64_t tick  = 0;
+	};
+	std::vector<DownloadTick>                          m_download_ticks;
+	// The newest tick among the asynchronous downloads covering [vaddr, vaddr + size), or 0 when
+	// none is known (none in flight, or only side readbacks). Any thread.
+	[[nodiscard]] uint64_t DownloadTickFor(uint64_t vaddr, uint64_t size) const;
 	// Write bitmap (WriteBitmapAddress): the buffer, the whole pages whose GPU writes all came
 	// through tracked bindings, and per 4 MiB region the last tick a tracked binding wrote it.
 	// Guarded by m_dirty_ranges_mutex, as m_gpu_modified_ranges.

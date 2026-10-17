@@ -257,6 +257,14 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
 	}
+	if constexpr (async) {
+		// The copies are recorded into the current tick (after any wrap of the ring above).
+		const auto       tick = m_scheduler.CurrentTick();
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& copy: copies) {
+			m_download_ticks.push_back({buffer_address + copy.srcOffset, copy.size, tick});
+		}
+	}
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
@@ -303,6 +311,14 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 				m_downloading_list.pop_back();
 			}
 			m_downloading_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
+			const auto start = buffer_address + copy.srcOffset;
+			for (size_t i = 0; i < m_download_ticks.size(); i++) {
+				if (m_download_ticks[i].start == start && m_download_ticks[i].bytes == copy.size) {
+					m_download_ticks[i] = m_download_ticks.back();
+					m_download_ticks.pop_back();
+					break;
+				}
+			}
 		}
 		// Ranges another download still has in flight stay marked.
 		for (const auto& [start, bytes]: m_downloading_list) {
@@ -1056,10 +1072,31 @@ static const bool g_async_readback = [] {
 	return value == nullptr || value[0] != '0';
 }();
 
+uint64_t BufferCache::DownloadTickFor(uint64_t vaddr, uint64_t size) const {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	uint64_t         tick = 0;
+	for (const auto& entry: m_download_ticks) {
+		if (entry.start < vaddr + size && vaddr < entry.start + entry.bytes) {
+			tick = std::max(tick, entry.tick);
+		}
+	}
+	return tick;
+}
+
 // Diagnostics: what the steps of game-thread readbacks answered (NoteGuestReadbackTiming).
 static struct {
 	std::atomic<uint64_t> ticks {0}, retries {0}, local_waits {0};
 } g_readback_outcomes;
+
+// KYTY_READBACK_EXACT_WAIT=0: a read of a page being downloaded waits for the newest download of
+// any page instead of the ones covering it.
+static bool ExactDownloadWait() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_EXACT_WAIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 // KYTY_READBACK_LOCAL_WAIT=0: a readback asks the GPU thread again after every wait.
 static bool LocalDownloadWait() {
@@ -1147,7 +1184,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 					std::shared_lock lock(m_dirty_ranges_mutex);
 					downloading = m_downloading_ranges.Intersects(first, bytes);
 				}
-				const auto last = m_last_async_download_tick.load();
+				auto last = ExactDownloadWait() ? DownloadTickFor(first, bytes) : 0;
+				if (last == 0) {
+					last = m_last_async_download_tick.load();
+				}
 				if (!downloading || last == 0) {
 					break;
 				}
@@ -1546,7 +1586,13 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			std::shared_lock lock(m_dirty_ranges_mutex);
 			downloading = m_downloading_ranges.Intersects(page_begin, page_end - page_begin);
 		}
-		if (const auto last = m_last_async_download_tick.load(); downloading && last != 0) {
+		auto last = downloading && ExactDownloadWait()
+		                ? DownloadTickFor(page_begin, page_end - page_begin)
+		                : uint64_t {0};
+		if (last == 0) {
+			last = m_last_async_download_tick.load();
+		}
+		if (downloading && last != 0) {
 			if (async) {
 				return last;
 			}
