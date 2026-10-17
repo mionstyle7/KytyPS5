@@ -31,6 +31,8 @@
 #endif
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -609,13 +611,53 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 }
 
+// Guest GPU timestamps hold the reference clock when the GPU thread parses the packet. With
+// KYTY_GPU_TIMESTAMP_SCALE=<percent> (100-300; default 100, off), the time since the last flip is
+// stretched by that percentage, so a game that sizes its dynamic resolution from GPU timestamps
+// measures more GPU time and renders fewer pixels. Each flip returns to the real clock. After the
+// Astro Bot fork's --gpu-timestamp-scale (b44c4ede): at 115-125 its overworld went from 58 fps at
+// about 3328x1872 to a flat 60 at about 1920x1080.
+static std::atomic<uint64_t> g_timestamp_anchor {0};
+static std::atomic<uint64_t> g_timestamp_writes {0};
+
+static uint64_t GuestGpuTimestamp() {
+	static const uint64_t percent = [] {
+		const char* value = std::getenv("KYTY_GPU_TIMESTAMP_SCALE");
+		const auto  parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {100};
+		return std::clamp<uint64_t>(parsed, 100, 300);
+	}();
+	g_timestamp_writes.fetch_add(1, std::memory_order_relaxed);
+	const auto now    = Sync::ReadReferenceClock();
+	const auto anchor = g_timestamp_anchor.load(std::memory_order_relaxed);
+	if (percent == 100 || anchor == 0 || now <= anchor) {
+		return now;
+	}
+	return anchor + (now - anchor) * percent / 100u;
+}
+
+// At each flip: the anchor of the stretch, and every 10 s how many GPU timestamps the game wrote
+// (none: its resolution does not follow them, and the scale cannot help).
+static void NoteFlipForTimestamps() {
+	const auto now = Sync::ReadReferenceClock();
+	g_timestamp_anchor.store(now, std::memory_order_relaxed);
+	static auto next   = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	static uint64_t flips = 0;
+	flips++;
+	if (const auto wall = std::chrono::steady_clock::now(); wall >= next) {
+		next = wall + std::chrono::seconds(10);
+		LOGF("GPU timestamps: %" PRIu64 " written over %" PRIu64 " flips in 10 s\n",
+		     g_timestamp_writes.exchange(0, std::memory_order_relaxed), flips);
+		flips = 0;
+	}
+}
+
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
 	if (dst_address == 0 || (num_bytes != sizeof(uint32_t) && num_bytes != sizeof(uint64_t)) ||
 	    (dst_address & (num_bytes - 1u)) != 0) {
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
-	const auto value = Sync::ReadReferenceClock();
+	const auto value = GuestGpuTimestamp();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	m_renderer.GetBufferCache().NoteHostWrite(dst_address, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
@@ -1669,7 +1711,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 			} else {
 				if (event_write_source == 0x04) {
-					value = Sync::ReadReferenceClock();
+					value = GuestGpuTimestamp();
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
@@ -1914,6 +1956,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 }
 
 void CommandProcessor::Flip() {
+	NoteFlipForTimestamps();
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
@@ -1927,6 +1970,7 @@ void CommandProcessor::Flip() {
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
+	NoteFlipForTimestamps();
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
