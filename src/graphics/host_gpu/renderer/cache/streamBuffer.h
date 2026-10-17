@@ -76,8 +76,10 @@ public:
 	int    stream_score = 0;
 	size_t lru_id       = 0;
 	// The command buffer (CommandScheduler::CommandSerial) that last recorded a write into it
-	// outside a synchronization: a copy or fill into it, a shader's write, an image's bytes. Its
-	// uploads then stay in order in that command buffer (CommandScheduler::UploadPrologue).
+	// outside a synchronization: a copy or fill into it, an image's bytes. Its uploads then stay in
+	// order in that command buffer (CommandScheduler::UploadPrologue). Not a shader's write: it
+	// synchronizes its range first, so those pages are GPU-written or clean, never among the
+	// CPU-dirty pages an upload copies (the Demon's Souls fork's 3e7b8923: +4%).
 	uint64_t written_serial = 0;
 
 protected:

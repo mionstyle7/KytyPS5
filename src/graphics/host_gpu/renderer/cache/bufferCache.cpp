@@ -2091,7 +2091,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	buffer.last_use_tick = m_scheduler.CurrentTick();
 	if (is_written) {
 		const PageManager::DeferReadProtectScope defer_protect;
-		buffer.written_serial = m_scheduler.CommandSerial();
 		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 		MarkGpuWritten(vaddr, size);
 	} else {
@@ -2116,9 +2115,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	TouchBuffer(buffer);
 	// The whole binding is current on the GPU, as for a written buffer; only the bytes the
 	// stores can reach become GPU-written.
-	if (written_size != 0) {
-		buffer.written_serial = m_scheduler.CommandSerial();
-	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 	if (written_size != 0) {
 		const PageManager::DeferReadProtectScope defer_protect;
@@ -2180,7 +2176,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, ui
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
 	const PageManager::DeferReadProtectScope defer_protect;
-	buffer.written_serial = m_scheduler.CommandSerial();
 	(void)SynchronizeBuffer(buffer, vaddr, size, true, false);
 	MarkGpuWritten(vaddr, size, true);
 	return {&buffer, buffer.Offset(vaddr)};
