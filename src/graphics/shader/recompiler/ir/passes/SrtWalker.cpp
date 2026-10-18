@@ -1575,7 +1575,14 @@ SrtTraceSession::SrtTraceSession(const ResourcePlan& program, SrtWalker& clean, 
 		CountTrace(&TraceStats::off);
 		return;
 	}
-	if (program.srt_trace != nullptr && program.srt_trace->key == key) {
+	// KYTY_TRACE_PASS_ALIAS (default 1; from Revi's Wolverine fork, 4615c716): see OnInst. A
+	// trace recorded with the other setting is recorded again.
+	static const uint8_t alias = [] {
+		const char* value = std::getenv("KYTY_TRACE_PASS_ALIAS");
+		return static_cast<uint8_t>(value == nullptr || value[0] != '0' ? 1 : 0);
+	}();
+	if (program.srt_trace != nullptr && program.srt_trace->key == key &&
+	    program.srt_trace->alias == alias) {
 		m_mode  = Mode::Serve;
 		m_trace = program.srt_trace;
 		thread_local std::vector<uint64_t> values;
@@ -1589,10 +1596,12 @@ SrtTraceSession::SrtTraceSession(const ResourcePlan& program, SrtWalker& clean, 
 	} else if (++program.srt_trace_uses >= TraceAfterUses) {
 		m_mode      = Mode::Record;
 		m_recording = std::make_unique<SrtTrace>();
-		m_recording->key = key;
+		m_recording->key   = key;
+		m_recording->alias = alias;
 		for (auto& slots: m_slots) {
 			slots.assign(program.evaluation_value_count, -1);
 		}
+		m_leaf_ops.clear();
 	} else {
 		return;
 	}
@@ -1850,6 +1859,46 @@ void SrtTraceSession::OnInst(const SrtWalker& walker, const Inst& inst, uint32_t
 		Abort("unsupported instruction");
 		return;
 	}
+	// KYTY_TRACE_PASS_ALIAS (Revi's Wolverine fork, 4615c716; -2.1 % GPU-thread time there): a
+	// Pass of an op's result (Phi, bit casts, ReadConst, ConditionRef, extract of a pair) is that
+	// op's event, with no op to replay, when it recorded the same status and value (not for
+	// immediates: slots hold op refs).
+	const bool pass_alias = m_recording->alias != 0;
+	if (pass_alias && op.kind == SrtTraceOp::Pass && frame.count == 1) {
+		const auto source = frame.events[0];
+		if (source.ref >= 0 && source.ok == ok && source.value == value) {
+			if (ok) {
+				auto& slots = m_slots[walker.m_trace_id];
+				if (index < slots.size()) {
+					slots[index] = source.ref;
+				}
+			}
+			frame.result = {source.ref, ok, value};
+			frame.have   = true;
+			return;
+		}
+	}
+	// The same user data word or shader base read through another instruction: the op already
+	// recorded for it (a leaf, its value fixed for the whole refresh), if it recorded the same.
+	uint64_t leaf_key = 0;
+	if (pass_alias && (op.kind == SrtTraceOp::UserData || op.kind == SrtTraceOp::ShaderBase)) {
+		leaf_key = (uint64_t {op.kind} << 40u) | (uint64_t {op.walker} << 32u) |
+		           static_cast<uint32_t>(op.imm);
+		for (const auto& [key, earlier_ref]: m_leaf_ops) {
+			if (key != leaf_key) continue;
+			const auto& earlier = m_recording->ops[static_cast<size_t>(earlier_ref)];
+			if (earlier.ok != ok) break;
+			if (ok) {
+				auto& slots = m_slots[walker.m_trace_id];
+				if (index < slots.size()) {
+					slots[index] = earlier_ref;
+				}
+			}
+			frame.result = {earlier_ref, ok, value};
+			frame.have   = true;
+			return;
+		}
+	}
 	auto& ops = m_recording->ops;
 	if (ops.size() >= TraceMaxOps) {
 		Abort("trace too long");
@@ -1857,6 +1906,9 @@ void SrtTraceSession::OnInst(const SrtWalker& walker, const Inst& inst, uint32_t
 	}
 	ops.push_back(op);
 	const auto ref = static_cast<int32_t>(ops.size() - 1);
+	if (leaf_key != 0) {
+		m_leaf_ops.emplace_back(leaf_key, ref);
+	}
 	if (ok) {
 		auto& slots = m_slots[walker.m_trace_id];
 		if (index < slots.size()) {

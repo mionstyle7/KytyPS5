@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <functional>
 #include <map>
@@ -279,6 +280,17 @@ private:
 	void                  MarkImageGranules(uint64_t address, uint64_t size);
 	[[nodiscard]] bool    MayHaveImages(uint64_t address, uint64_t size) const;
 	bool             m_readback_linear_images = false;
+	// FindImage's exact-backing result per request, valid while no image is registered or
+	// unregistered (m_image_set_epoch). From Revi's Wolverine fork (KYTY_FIND_IMAGE_MEMO).
+	struct FindImageMemo {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t key     = 0;
+		uint64_t epoch   = UINT64_MAX;
+		ImageId  result {};
+	};
+	uint64_t                        m_image_set_epoch = 0;
+	std::array<FindImageMemo, 4096> m_find_image_memo {};
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

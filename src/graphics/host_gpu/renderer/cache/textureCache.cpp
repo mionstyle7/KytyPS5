@@ -331,6 +331,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
+	m_image_set_epoch++;
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
@@ -354,6 +355,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		}
 	}
 	UntrackImage(id);
+	m_image_set_epoch++;
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
@@ -1669,14 +1671,55 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		// KYTY_FIND_IMAGE_MEMO (default 1; from Revi's Wolverine fork): a request whose
+		// exact-backing image was found while the registered image set is unchanged finds the same
+		// one (the candidates and their order only change with registrations); a hit is checked
+		// against SameBacking again.
+		static const bool use_memo = [] {
+			const char* value = std::getenv("KYTY_FIND_IMAGE_MEMO");
+			return value == nullptr || value[0] != '0';
+		}();
+		const auto&    req      = desc.info;
+		const uint64_t memo_key =
+		    (static_cast<uint64_t>(req.extent.width) << 48u) ^
+		    (static_cast<uint64_t>(req.extent.height) << 32u) ^
+		    (static_cast<uint64_t>(req.extent.depth) << 24u) ^
+		    (static_cast<uint64_t>(req.resources.levels) << 16u) ^
+		    (static_cast<uint64_t>(req.resources.layers) << 4u) ^
+		    (static_cast<uint64_t>(static_cast<uint32_t>(req.pixel_format)) * 0x9e3779b97f4a7c15ull) ^
+		    (static_cast<uint64_t>(req.samples) << 60u) ^
+		    (static_cast<uint64_t>(req.bytes_per_block) << 40u) ^
+		    (static_cast<uint64_t>(static_cast<uint32_t>(req.tile_mode)) << 8u) ^
+		    (static_cast<uint64_t>(static_cast<uint32_t>(req.type)) << 12u) ^
+		    (exact_format ? 0x5555000000000000ull : 0u);
+		auto& memo = m_find_image_memo[((req.data.address >> 8u) ^ (memo_key >> 7u) ^ memo_key) &
+		                               (m_find_image_memo.size() - 1u)];
+		bool  memo_hit = false;
+		if (use_memo && memo.epoch == m_image_set_epoch && memo.address == req.data.address &&
+		    memo.size == req.data.size && memo.key == memo_key) {
+			const auto* cached = m_slot_images.try_get(memo.result);
+			if (cached != nullptr && cached->registered &&
+			    SameBacking(cached->info, desc.info, exact_format)) {
+				result   = memo.result;
+				memo_hit = true;
+			}
+		}
+		const auto candidates =
+		    memo_hit ? ImageIds {}
+		             : FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
 			}
+		}
+		if (use_memo && !memo_hit && result) {
+			memo = {.address = req.data.address,
+			        .size    = req.data.size,
+			        .key     = memo_key,
+			        .epoch   = m_image_set_epoch,
+			        .result  = result};
 		}
 
 		int32_t view_mip   = -1;

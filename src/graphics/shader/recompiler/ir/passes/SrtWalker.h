@@ -7,6 +7,7 @@
 #include <array>
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -106,7 +107,8 @@ struct SrtTrace {
 	std::vector<SrtTraceOp>   ops;
 	std::vector<uint64_t>     immediates;
 	std::vector<SrtTraceCall> calls;
-	uint8_t                   key = 0;
+	uint8_t                   key   = 0;
+	uint8_t                   alias = 0; // KYTY_TRACE_PASS_ALIAS when recorded
 };
 
 
@@ -166,6 +168,9 @@ private:
 	std::unique_ptr<SrtTrace> m_recording;
 	std::vector<Frame>        m_frames;
 	std::vector<int32_t>      m_slots[2]; // evaluation index -> op, per walker
+	// KYTY_TRACE_PASS_ALIAS: the op recorded for each (walker, user data word) and the shader base,
+	// so another instruction reading the same one reuses it.
+	std::vector<std::pair<uint64_t, int32_t>> m_leaf_ops;
 	const char*               m_abort = nullptr;
 	// Serving.
 	std::shared_ptr<SrtTrace> m_trace;
