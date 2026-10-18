@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderWarmup.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineWarmup.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -1257,6 +1258,7 @@ struct PipelineCache::ProgramCache {
 		KYTY_PROFILER_PHASE(phases, "Shader: module create", profiler::colors::Blue300);
 		const auto module = CompileSPV(spirv, device);
 		EXIT_IF(module == nullptr);
+		PipelineWarmup::RegisterModule(module, spirv);
 		phases.End();
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -2913,6 +2915,13 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
           ShaderDiskCacheDirectory())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	if (PipelineWarmup::Enabled() && KYTY_BUILD == KYTY_BUILD_RELEASE) {
+		if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
+			m_warmup = std::make_unique<PipelineWarmup::Store>(
+			    m_graphics, m_driver_cache,
+			    std::filesystem::path("_PipelineCache") / (title_id + "_warmup.bin"));
+		}
+	}
 	if (g_async_pipelines) {
 		const auto threads = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
 		m_compiler         = std::make_unique<PipelineCompiler>(threads);
@@ -2922,6 +2931,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	m_warmup.reset();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -3778,6 +3788,19 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	auto build = PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input,
 	                                     vertex_info, ps_input_info, programs, static_params);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	if (m_warmup != nullptr) {
+		// Pipeline warmup: built before play from an earlier session's record, or recorded now.
+		m_warmup->Start();
+		if (const auto prebuilt = m_warmup->TakeGraphics(*build, *cached); prebuilt != nullptr) {
+			cached->pipeline = prebuilt;
+			LogPipelineTrace("CreatePipelineInternal prebuilt", vs_id, ps_id);
+			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+			EXIT_IF(!inserted);
+			m_last_graphics_key      = iter->first;
+			m_last_graphics_pipeline = iter->second.get();
+			return iter->second.get();
+		}
+	}
 	uint64_t vertex_words = 0;
 	for (const auto& program: programs.vertex) {
 		vertex_words += program.spirv_words;
@@ -3939,8 +3962,20 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		KYTY_PROFILER_PHASE(zone, "Compute pipeline build", profiler::colors::RedA100);
 		const auto begin = std::chrono::steady_clock::now();
 		bool       fast  = false;
-		if (g_fast_first_pipelines) {
+		vk::Pipeline prebuilt = nullptr;
+		if (m_warmup != nullptr) {
+			// Pipeline warmup (see TryGetGraphicsPipeline).
+			m_warmup->Start();
 			CreateComputePipelineLayout(m_graphics, *cached, input_info);
+			prebuilt = m_warmup->TakeCompute(*cached, compute_program.module,
+			                                 input_info.stage.program->wave_size, hash);
+		}
+		if (prebuilt != nullptr) {
+			cached->pipeline = prebuilt;
+		} else if (g_fast_first_pipelines) {
+			if (cached->pipeline_layout == nullptr) {
+				CreateComputePipelineLayout(m_graphics, *cached, input_info);
+			}
 			auto&      graphics     = m_graphics;
 			const auto layout       = cached->pipeline_layout;
 			const auto wave_size    = input_info.stage.program->wave_size;
@@ -3959,11 +3994,18 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 				    &cached->pipeline);
 				EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 			}
+		} else if (cached->pipeline_layout != nullptr) {
+			const auto result = CreateComputePipelineHandle(
+			    m_graphics, cached->pipeline_layout, input_info.stage.program->wave_size, hash,
+			    compute_program.module, m_driver_cache, {}, &cached->pipeline);
+			EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 		} else {
 			CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
 			                       m_driver_cache);
 		}
-		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
+		if (prebuilt == nullptr) {
+			ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
+		}
 	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);

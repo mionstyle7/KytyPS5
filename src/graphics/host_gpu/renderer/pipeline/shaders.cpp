@@ -255,6 +255,7 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 		descriptor_count += binding.descriptorCount;
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	pipeline.layout_bindings.assign(bindings.begin(), bindings.end());
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
@@ -306,7 +307,9 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	if (rect_list) {
 		const auto shaders =
 		    BuildRectListShaders(vs_input_info, ps_active ? ps_input_info : nullptr);
-		build.tess_control = CompileSPV(shaders.control, graphics.device);
+		build.tess_control_spirv = shaders.control;
+		build.tess_eval_spirv    = shaders.evaluation;
+		build.tess_control       = CompileSPV(shaders.control, graphics.device);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done module=%p\n",
 			     static_cast<void*>(build.tess_control));
@@ -537,6 +540,7 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	pipeline.push_constant_stages = graphics_stages;
 
 	std::array<vk::DescriptorSetLayout, 2> set_layouts {};
 	uint32_t                               set_layout_count = 0;
@@ -715,6 +719,7 @@ void CreateComputePipelineLayout(GraphicContext& graphics, PipelineCache::Pipeli
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	pipeline.push_constant_stages = vk::ShaderStageFlagBits::eCompute;
 
 	std::array<vk::DescriptorSetLayout, 2> set_layouts {};
 	uint32_t                               set_layout_count = 0;

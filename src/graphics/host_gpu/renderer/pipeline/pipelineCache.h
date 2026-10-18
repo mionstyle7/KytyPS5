@@ -154,7 +154,14 @@ struct GraphicsPipelineBuild {
 	vk::GraphicsPipelineCreateInfo                                        pipeline_info {};
 	uint64_t                                                              vs_hash = 0;
 	uint64_t                                                              ps_hash = 0;
+	// The SPIR-V of tess_control and tess_eval (pipeline warmup records it).
+	std::vector<uint32_t>                                                 tess_control_spirv;
+	std::vector<uint32_t>                                                 tess_eval_spirv;
 };
+
+namespace PipelineWarmup {
+class Store;
+} // namespace PipelineWarmup
 
 // A graphics pipeline a worker thread compiles (see PipelineCache::TryGetGraphicsPipeline).
 struct PendingGraphicsPipeline;
@@ -185,6 +192,9 @@ public:
 		// Fast-first pipelines (KYTY_PIPELINE_FAST_FIRST): `pipeline` was built without driver
 		// optimization; a worker compiles the optimized one, which replaces it when done.
 		std::shared_ptr<PendingGraphicsPipeline> upgrade;
+		// What the layouts were created from (pipeline warmup records it).
+		std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
+		vk::ShaderStageFlags                        push_constant_stages {};
 	};
 
 	struct GraphicsPrograms {
@@ -308,6 +318,9 @@ private:
 	// Shaders whose pipelines took long to build even without optimization (KYTY_PIPELINE_SLOW_MS):
 	// later pipelines with one of them build on a worker while their draws are skipped.
 	std::unordered_map<uint64_t, uint32_t> m_slow_stages;
+	// Pipeline warmup (pipelineWarmup.h); nullptr when off.
+	std::unique_ptr<PipelineWarmup::Store> m_warmup;
+	void                                   StartPipelineWarmup();
 };
 
 // KYTY_DYNAMIC_RASTER_STATE (default on): cull mode and front face (and, except on macOS, the
