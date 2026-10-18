@@ -25,6 +25,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -365,6 +366,7 @@ bool DrainedSrtRead(uint64_t address, std::span<uint32_t> values) {
 		double      ms      = 0.0;
 		uint32_t    bytes   = 0;
 		std::string last;
+		std::string phase; // SrtPhase of the last read
 	};
 	static std::map<std::pair<uint64_t, uint64_t>, Entry> entries;
 	static uint64_t                                       events = 0;
@@ -385,8 +387,9 @@ bool DrainedSrtRead(uint64_t address, std::span<uint32_t> values) {
 	if (ms >= 1.0 && stacks_logged < 64u && stacks_per_shader[t_srt_shader_hash] < stack_limit) {
 		stacks_per_shader[t_srt_shader_hash]++;
 		stacks_logged++;
-		LOGF("SRT drain stack: hash=0x%016" PRIx64 " addr=0x%016" PRIx64 " %.2f ms\n%s",
-		     t_srt_shader_hash, address, ms, Common::HostBacktrace().c_str());
+		LOGF("SRT drain stack: hash=0x%016" PRIx64 " addr=0x%016" PRIx64 " %.2f ms (%s %u)\n%s",
+		     t_srt_shader_hash, address, ms, ShaderRecompiler::IR::SrtPhase::Name(),
+		     ShaderRecompiler::IR::SrtPhase::Index(), Common::HostBacktrace().c_str());
 	}
 	auto& entry      = entries[{t_srt_shader_hash, address}];
 	const bool changed = entry.count != 0 && entry.last != value;
@@ -395,6 +398,8 @@ bool DrainedSrtRead(uint64_t address, std::span<uint32_t> values) {
 	entry.ms += ms;
 	entry.bytes = static_cast<uint32_t>(values.size_bytes());
 	entry.last  = value;
+	entry.phase = fmt::format("{} {}", ShaderRecompiler::IR::SrtPhase::Name(),
+	                          ShaderRecompiler::IR::SrtPhase::Index());
 	events++;
 	if (events <= 200) {
 		LOGF("SRT drain: hash=0x%016" PRIx64 " addr=0x%016" PRIx64 " bytes=%u %.2f ms %s [%s]\n",
@@ -412,8 +417,9 @@ bool DrainedSrtRead(uint64_t address, std::span<uint32_t> values) {
 		for (size_t i = 0; i < std::min<size_t>(sorted.size(), 16); i++) {
 			const auto& [key, e] = *sorted[i];
 			LOGF("\t hash=0x%016" PRIx64 " addr=0x%016" PRIx64 " bytes=%u count=%" PRIu64
-			     " changed=%" PRIu64 " total=%.1f ms last=[%s]\n",
-			     key.first, key.second, e.bytes, e.count, e.changes, e.ms, e.last.c_str());
+			     " changed=%" PRIu64 " total=%.1f ms last=[%s] in %s\n",
+			     key.first, key.second, e.bytes, e.count, e.changes, e.ms, e.last.c_str(),
+			     e.phase.c_str());
 		}
 	}
 	return ok;

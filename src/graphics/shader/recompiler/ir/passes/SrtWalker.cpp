@@ -645,6 +645,30 @@ std::mutex     g_native_stats_mutex;
 
 } // namespace
 
+namespace {
+thread_local const char* t_srt_phase_name  = "other";
+thread_local uint32_t    t_srt_phase_index = 0;
+} // namespace
+
+SrtPhase::SrtPhase(const char* name, uint32_t index) noexcept
+    : m_previous_name(t_srt_phase_name), m_previous_index(t_srt_phase_index) {
+	t_srt_phase_name  = name;
+	t_srt_phase_index = index;
+}
+
+SrtPhase::~SrtPhase() {
+	t_srt_phase_name  = m_previous_name;
+	t_srt_phase_index = m_previous_index;
+}
+
+const char* SrtPhase::Name() noexcept {
+	return t_srt_phase_name;
+}
+
+uint32_t SrtPhase::Index() noexcept {
+	return t_srt_phase_index;
+}
+
 bool TakeSrtNativeReport(SrtNativeStats& stats) {
 	std::lock_guard lock(g_native_stats_mutex);
 	if (!g_native_report) {
@@ -1195,6 +1219,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 bool SrtWalker::EvaluateDescriptorSoftRecords(uint32_t source, DescriptorValue& result,
                                               bool& soft) {
 	soft = false;
+	const SrtPhase phase("soft-descriptor", source);
 	if (m_runtime.gpu_written == nullptr || source >= m_program.descriptor_sources.size() ||
 	    m_program.descriptor_sources[source].dword_count < 3u ||
 	    m_program.descriptor_sources[source].dword_count > result.dwords.size()) {
@@ -1236,6 +1261,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	if (source >= m_program.descriptor_sources.size()) {
 		return false;
 	}
+	const SrtPhase phase("descriptor", source);
 	const auto& descriptor = m_program.descriptor_sources[source];
 	result                 = {};
 	result.dword_count     = descriptor.dword_count;
@@ -1271,8 +1297,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			return false;
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		if (read.flat_offset >= flat.size()) return false;
+		const SrtPhase phase("slot", slot);
 		if (!clean && slot < m_program.gpu_fill_slots.size() && m_program.gpu_fill_slots[slot] != 0u &&
 		    m_runtime.gpu_written != nullptr && m_runtime.gpu_fills != nullptr) {
+			const SrtPhase fill_phase("fill-slot", slot);
 			// Through the interpreter or a replay (both read through ReadRawWord), not the native
 			// tables: ReadRawWord leaves GPU-written bytes to the GPU.
 			m_fill_active    = true;
@@ -1366,6 +1394,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 				return 2u;
 			}
 		}
+		const SrtPhase phase("condition", index);
 		uint32_t condition = 0;
 		bool     known     = false;
 		if (predicate.UseNativeTables()) {

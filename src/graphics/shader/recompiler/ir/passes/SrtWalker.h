@@ -181,6 +181,23 @@ private:
 };
 
 // One memoized evaluation session shared by the entire shader resource refresh.
+// Which part of a resource refresh is evaluating, for diagnostics of reads that wait for the GPU
+// (KYTY_SRT_DRAIN_LOG): "slot" (a flat-SRT read), "fill-slot" (one the GPU may fill), "condition",
+// "descriptor", "soft-descriptor", "write-extent", "uniform-fill", or "other". Per thread.
+struct SrtPhase {
+	SrtPhase(const char* name, uint32_t index) noexcept;
+	~SrtPhase();
+	SrtPhase(const SrtPhase&)            = delete;
+	SrtPhase& operator=(const SrtPhase&) = delete;
+	// "name index" of the innermost phase on this thread ("other" outside any).
+	static const char* Name() noexcept;
+	static uint32_t    Index() noexcept;
+
+private:
+	const char* m_previous_name;
+	uint32_t    m_previous_index;
+};
+
 class SrtWalker {
 public:
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,

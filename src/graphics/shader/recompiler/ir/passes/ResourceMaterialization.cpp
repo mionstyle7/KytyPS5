@@ -1889,6 +1889,7 @@ bool EvaluateWriteInterval(const ResourcePlan& program, const SrtRuntime& runtim
 // See ResourceSnapshot::buffer_write_extents.
 void ComputeBufferWriteExtents(const ResourcePlan& program, const SrtRuntime& runtime,
                                SrtWalker& walker, ResourceSnapshot& snapshot) {
+	const SrtPhase phase("write-extent", 0);
 	snapshot.buffer_write_extents.assign(program.info.buffers.size(), {});
 	if (program.buffer_writes.empty()) {
 		return;
@@ -1982,6 +1983,7 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 	std::array<uint32_t, 4> stored {};
 	bool uniform_fill = words != 0;
 	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
+		const SrtPhase phase("uniform-fill", i);
 		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
 	}
 	if (uniform_fill) {
