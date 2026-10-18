@@ -677,6 +677,13 @@ struct FaultStats {
 	std::vector<Site>      sites;
 	uint64_t               total    = 0;
 	uint64_t               reported = 0;
+	// The last 10 s, by kind (0: write, 1: read) and outcome (emulated or not): count and time.
+	struct Window {
+		uint64_t count[2][2]  = {};
+		uint64_t micros[2][2] = {};
+		uint64_t gpu_micros   = 0;
+		int64_t  next_ms      = 0;
+	} window;
 };
 FaultStats g_fault_stats;
 
@@ -712,6 +719,32 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	it->micros += micros;
 	it->vaddr = guest_vaddr;
 	it->emulated += emulated ? 1 : 0;
+	{
+		// Every 10 s: how long guest threads spent in tracked-page faults, writes against reads,
+		// and how much of it the handler completed itself (emulated loads and stores).
+		auto&      w   = stats.window;
+		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		if (gpu_thread) {
+			w.gpu_micros += micros;
+		} else {
+			w.count[is_read ? 1 : 0][emulated ? 1 : 0]++;
+			w.micros[is_read ? 1 : 0][emulated ? 1 : 0] += micros;
+		}
+		if (w.next_ms == 0) {
+			w.next_ms = now + 10000;
+		} else if (now >= w.next_ms) {
+			LOGF("Guest faults (last 10 s): writes %" PRIu64 " in %" PRIu64 " ms (+%" PRIu64
+			     " emulated in %" PRIu64 " ms), reads %" PRIu64 " in %" PRIu64 " ms (+%" PRIu64
+			     " emulated in %" PRIu64 " ms); GPU thread %" PRIu64 " ms\n",
+			     w.count[0][0], w.micros[0][0] / 1000, w.count[0][1], w.micros[0][1] / 1000,
+			     w.count[1][0], w.micros[1][0] / 1000, w.count[1][1], w.micros[1][1] / 1000,
+			     w.gpu_micros / 1000);
+			w         = {};
+			w.next_ms = now + 10000;
+		}
+	}
 	if (stats.total - stats.reported < 5000) {
 		return;
 	}
@@ -799,7 +832,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		// A store to bytes the GPU has not written, on a page protected because it wrote others:
 		// write them without the download (RenderContext::TryWriteClean decides, and declines
-		// unless KYTY_CLEAN_WRITE_EMULATION=1).
+		// unless KYTY_CLEAN_WRITE_EMULATION=0).
 		if (access == GpuAccess::Write &&
 		    Libs::LibKernel::Memory::MayWriteCleanFaultingBytes(info->access_violation_vaddr) &&
 		    Loader::X64InstructionEmulator::TryEmulateStore(

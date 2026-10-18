@@ -159,16 +159,18 @@ bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
 	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
 }
 
-// KYTY_CLEAN_WRITE_EMULATION: 0 (default) off; 1 stores to GPU-clean bytes of GPU-written
-// pages complete without a download; 2 also stores over GPU-written bytes, through the GPU thread.
+// KYTY_CLEAN_WRITE_EMULATION: 1 (default) stores to GPU-clean bytes of GPU-written pages
+// complete without a download; 2 also stores over GPU-written bytes, through the GPU thread; 0 off.
+// On by default since gameplay logs (2026-10-18) showed one guest store site writing next to the
+// GPU's 256-byte records (region 0x1200300000) ~3,400 times at ~1 ms each, every one a window
+// download through the GPU thread: ~1 s of each 10 s of game-thread time.
 static int CleanWriteEmulationLevel() {
 	static const int level = [] {
-		const char* value = std::getenv("KYTY_CLEAN_WRITE_EMULATION");
-		const int   result = value != nullptr && value[0] >= '1' && value[0] <= '2' ? value[0] - '0'
-		                                                                           : 0;
-		if (result != 0) {
-			LOGF("Clean write emulation: level %d\n", result);
-		}
+		const char* value  = std::getenv("KYTY_CLEAN_WRITE_EMULATION");
+		const int   result = value == nullptr                         ? 1
+		                     : value[0] >= '0' && value[0] <= '2' ? value[0] - '0'
+		                                                          : 1;
+		LOGF("Clean write emulation: level %d\n", result);
 		return result;
 	}();
 	return level;
