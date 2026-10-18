@@ -2298,6 +2298,25 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return ok;
 }
 
+bool ResourceSpecializationFits(const Program& program, const ResourceSpecialization& specialization) {
+	const auto original = program.info.buffers.size();
+	if (original > specialization.buffers.size() ||
+	    program.info.images.size() > specialization.images.size()) {
+		return false;
+	}
+	const auto total = specialization.buffers.size();
+	for (size_t index = 0; index < total; ++index) {
+		const auto root = specialization.buffers[index].indirect_root;
+		if (index >= original && root >= original) {
+			return false;
+		}
+		if (root != BufferResource::NoIndirectBuffer && root >= total) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);

@@ -67,6 +67,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 int LastIndirectImageFailureLine();
 
 // Applies an already-derived specialization to native IR before layout and emission.
+// Whether ApplyResourceSpecialization accepts the specialization for this program: one recorded
+// under other translation switches (a warmup file from another run) may not fit it.
+[[nodiscard]] bool ResourceSpecializationFits(const Program&                program,
+                                              const ResourceSpecialization& specialization);
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

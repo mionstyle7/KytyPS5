@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -1518,6 +1519,12 @@ struct PipelineCache::ProgramCache {
 			    ShaderDiskCache::SourceRecordRoundTrips(payload)) {
 				disk->Save(source_key, payload);
 			}
+		}
+		// Recorded under other translation switches (KYTY_GPU_RESOURCES, ...): it does not fit
+		// this translation, and the draw that needs it records it anew.
+		if (!ShaderRecompiler::IR::ResourceSpecializationFits(translated.program,
+		                                                      record.specialization)) {
+			return WarmupResult::Failed;
 		}
 		auto result  = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                                record.specialization, record.push_cursor);
