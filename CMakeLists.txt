@@ -250,6 +250,23 @@ elseif(KYTY_PGO_USE)
 	message(STATUS "PGO: optimizing with ${KYTY_PGO_USE}")
 endif()
 
+# KYTY_HOST_ARCH=<cpu> (empty: the compiler's baseline, SSE2): Kyty's own code compiled for a
+# newer host CPU, e.g. x86-64-v3 (AVX2, FMA, BMI2: Haswell, Zen 1 and later) or native. The GPU
+# thread runs only host code here, so this is CPU time saved on every draw; the Demon's Souls fork
+# measured ~+4% from -O3 -march=native with ThinLTO. The executable then starts only on CPUs that
+# have those instructions. -ffp-contract=off keeps host float results as without FMA.
+set(KYTY_HOST_ARCH "" CACHE STRING "Host CPU to compile Kyty's code for (-march; empty: baseline)")
+if(KYTY_HOST_ARCH)
+	if(KYTY_CLANG_CL)
+		add_compile_options("/clang:-march=${KYTY_HOST_ARCH}" "/clang:-ffp-contract=off")
+	elseif(CLANG OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+		add_compile_options("-march=${KYTY_HOST_ARCH}" "-ffp-contract=off")
+	else()
+		message(FATAL_ERROR "KYTY_HOST_ARCH needs clang, clang-cl or GCC")
+	endif()
+	message(STATUS "Host code compiled for ${KYTY_HOST_ARCH}")
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
