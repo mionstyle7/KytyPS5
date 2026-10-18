@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawCensus.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -1239,6 +1240,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
+	if (DrawCensus::Enabled()) {
+		std::array<const ShaderStageRuntime*, 4> census_stages {};
+		uint32_t                                 census_count = 0;
+		for (const auto& stage: vertex_stages) {
+			census_stages[census_count++] = &stage.stage;
+		}
+		if (state.ps_active) {
+			census_stages[census_count++] = &state.ps_input_info.stage;
+		}
+		std::array<uint64_t, RENDER_COLOR_ATTACHMENTS_MAX + 1> census_targets {};
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			census_targets[i] = (uint64_t {state.color_info[i].image_id.generation} << 32u) |
+			                    state.color_info[i].image_id.index;
+		}
+		census_targets[state.color_count] =
+		    (uint64_t {state.depth_info.image_id.generation} << 32u) | state.depth_info.image_id.index;
+		DrawCensus::ClassifyDraw(std::span {census_stages.data(), census_count},
+		                         std::span {census_targets.data(), state.color_count + 1u},
+		                         static_cast<uint32_t>(topology),
+		                         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed));
+	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1515,6 +1537,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	const DrawCensus::Scope census_scope(DrawCensus::Kind::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1630,6 +1653,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	const DrawCensus::Scope census_scope(DrawCensus::Kind::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
