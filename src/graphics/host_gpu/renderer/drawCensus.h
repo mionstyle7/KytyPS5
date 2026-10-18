@@ -41,9 +41,10 @@ public:
 	Scope& operator=(const Scope&) = delete;
 
 	// Called by ClassifyDraw/ClassifyDispatch for the innermost scope.
-	void Set(uint8_t cls, bool exact) {
-		m_class = cls;
-		m_exact = exact;
+	void Set(uint8_t cls, bool exact, uint64_t shader) {
+		m_class  = cls;
+		m_exact  = exact;
+		m_shader = shader;
 	}
 
 private:
@@ -53,6 +54,7 @@ private:
 	uint8_t                               m_class  = 0; // 0: skipped
 	bool                                  m_exact  = false;
 	Scope*                                m_outer  = nullptr;
+	uint64_t                              m_shader = 0; // the pixel or compute shader
 };
 
 // A draw about to be prepared: its stages (programs and resolved resources), its render

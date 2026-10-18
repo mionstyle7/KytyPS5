@@ -1302,6 +1302,49 @@ bool RenderExecutor::ResettleBindlessKey(BindlessTable::Heap& heap, uint32_t key
 	return ResolveBindlessKey(heap, key);
 }
 
+// KYTY_BINDLESS_VIEW_BUDGET_US (default 2000; 0: no limit): the time a heap sync spends settling
+// sampled keys whose T# changed only in its view of the same texture (streaming: finer mips).
+// Each such resettle builds the finer image, ~0.4-1.3 ms in gameplay, and a sync that met 17-26 of
+// them took 7-22 ms on the GPU thread at once (2026-10-18). Past the budget a key keeps its
+// current view, which stays valid (the same texture, coarser mips), and is settled at a later
+// submission within the same budget (DrainStaleBindlessKeys).
+static double BindlessViewBudgetSeconds() {
+	static const double seconds = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_VIEW_BUDGET_US");
+		return (value != nullptr ? std::strtod(value, nullptr) : 2000.0) / 1e6;
+	}();
+	return seconds;
+}
+
+void RenderExecutor::DrainStaleBindlessKeys() {
+	const double budget = BindlessViewBudgetSeconds();
+	if (budget <= 0.0) {
+		return;
+	}
+	auto& table = m_context.GetBindlessTable();
+	if (std::ranges::all_of(table.Heaps(), [](const auto& heap) { return heap.stale_keys.empty(); })) {
+		return;
+	}
+	KYTY_PROFILER_FUNCTION();
+	Common::Timer timer;
+	timer.Start();
+	uint32_t settled = 0;
+	for (auto& heap: table.Heaps()) {
+		std::erase_if(heap.stale_keys, [&](uint32_t key) {
+			if (key >= heap.stale.size() || heap.stale[key] == 0) {
+				return true; // settled again meanwhile
+			}
+			if (timer.GetTimeS() >= budget) {
+				return false;
+			}
+			heap.stale[key] = 0;
+			settled += ResettleBindlessKey(heap, key) ? 1u : 0u;
+			return true;
+		});
+	}
+	g_bindless_engine_stats.stale_settled.fetch_add(settled, std::memory_order_relaxed);
+}
+
 void RenderExecutor::SyncBindlessHeaps() {
 	auto& table = m_context.GetBindlessTable();
 	if (!BindlessEngineEnabled() || !table.Enabled()) {
@@ -1312,6 +1355,8 @@ void RenderExecutor::SyncBindlessHeaps() {
 	}
 	if (BindlessEngineEager()) {
 		SettleBindlessHeaps();
+	} else {
+		DrainStaleBindlessKeys();
 	}
 }
 
@@ -1443,6 +1488,7 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 	sync_timer.Start();
 	double   resettle_s = 0.0, read_s = 0.0;
 	uint64_t compared = 0, overlaps = 0;
+	uint32_t deferred = 0;
 	// T# bits that select a view of the same texture (RDNA 2 ISA 8.2.6); see LogBindlessHeapStats.
 	constexpr std::array<uint32_t, 8> ViewMask {0u,          0x000fff00u, 0u,          0x0e0fffffu,
 	                                            0x1fff0000u, 0x027fff00u, 0x000003ffu, 0u};
@@ -1502,6 +1548,16 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 					released++;
 					continue;
 				}
+				if (!resource && !BindlessEngineEager() && BindlessViewBudgetSeconds() > 0.0 &&
+				    resettle_s >= BindlessViewBudgetSeconds()) {
+					// Past this sync's budget: the current view stays (DrainStaleBindlessKeys).
+					if (heap.stale[key] == 0) {
+						heap.stale[key] = 1;
+						heap.stale_keys.push_back(key);
+					}
+					deferred++;
+					continue;
+				}
 				const double resettle_start = sync_timer.GetTimeS();
 				resettled += ResettleBindlessKey(heap, key) ? 1u : 0u;
 				resettle_s += sync_timer.GetTimeS() - resettle_start;
@@ -1518,10 +1574,10 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 			LOGF("Bindless sync slow: %.1f ms (reads %.1f ms, resettles %.1f ms): %zu written "
 			     "ranges, %" PRIu64 " KB, %zu heaps, %" PRIu64 " heap overlaps, %" PRIu64
 			     " keys compared; %u view and %u resource changes, %u resettled, %u released, "
-			     "%u kept stale\n",
+			     "%u kept stale, %u deferred\n",
 			     total_s * 1000.0, read_s * 1000.0, resettle_s * 1000.0, m_bindless_written.size(),
 			     bytes / 1024u, table.Heaps().size(), overlaps, compared, view_changes,
-			     resource_changes, resettled, released, kept);
+			     resource_changes, resettled, released, kept, deferred);
 		}
 	}
 	auto& stats = g_bindless_engine_stats;

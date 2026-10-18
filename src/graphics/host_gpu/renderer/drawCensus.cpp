@@ -49,6 +49,13 @@ struct Totals {
 	uint64_t new_shape = 0;
 };
 
+// Normal-path time per shader and class, for the costliest shaders of each report.
+struct ShaderTime {
+	uint64_t count[ClassCount] {};
+	double   seconds[ClassCount] {};
+	double   max = 0.0;
+};
+
 struct ShaderMisses {
 	uint64_t count = 0;
 	uint32_t changed_bits = 0; // union of the parts that differed
@@ -59,6 +66,7 @@ struct State {
 	std::unordered_map<uint64_t, ShapeParts> shapes[2];
 	Totals                                   totals[2];
 	std::unordered_map<uint64_t, ShaderMisses> misses[2]; // by program pair hash
+	std::unordered_map<uint64_t, ShaderTime>   times[2];  // by pixel or compute shader
 	std::chrono::steady_clock::time_point    next_log {};
 	uint64_t                                 pruned_frame = 0;
 };
@@ -164,8 +172,26 @@ void Log(State& state) {
 			     top[i].first, top[i].second.count, (bits & 1u) != 0 ? "buffers " : "",
 			     (bits & 2u) != 0 ? "images " : "", (bits & 4u) != 0 ? "samplers" : "");
 		}
+		std::vector<std::pair<uint64_t, ShaderTime>> costly(state.times[kind].begin(),
+		                                                    state.times[kind].end());
+		const auto total_of = [](const ShaderTime& time) {
+			return time.seconds[Repeat] + time.seconds[SameFrame] + time.seconds[New];
+		};
+		std::sort(costly.begin(), costly.end(),
+		          [&](const auto& a, const auto& b) { return total_of(a.second) > total_of(b.second); });
+		for (size_t i = 0; i < std::min<size_t>(costly.size(), 10); i++) {
+			const auto& time  = costly[i].second;
+			const auto  count = time.count[Repeat] + time.count[SameFrame] + time.count[New];
+			LOGF("\t costliest: shader %016" PRIx64 " %.0f ms x%" PRIu64 " (avg %.1f us, max %.1f "
+			     "ms; repeat x%" PRIu64 " %.0f ms, new x%" PRIu64 " %.0f ms)\n",
+			     costly[i].first, total_of(time) * 1000.0, count,
+			     count == 0 ? 0.0 : total_of(time) * 1e6 / static_cast<double>(count),
+			     time.max * 1000.0, time.count[Repeat], time.seconds[Repeat] * 1000.0,
+			     time.count[New], time.seconds[New] * 1000.0);
+		}
 		t = {};
 		state.misses[kind].clear();
+		state.times[kind].clear();
 	}
 }
 
@@ -225,7 +251,7 @@ void Classify(uint32_t kind, uint64_t key, uint64_t exact_key, uint64_t shape, u
 	known.samplers   = parts.samplers;
 	known.last_frame = frame;
 	if (t_scope != nullptr) {
-		t_scope->Set(cls, exact);
+		t_scope->Set(cls, exact, shape_name);
 	}
 }
 
@@ -265,6 +291,12 @@ Scope::~Scope() {
 	auto& t     = state.totals[m_kind == Kind::Draw ? 0 : 1];
 	t.count[m_class]++;
 	t.seconds[m_class] += seconds;
+	if (m_class != Skipped) {
+		auto& time = state.times[m_kind == Kind::Draw ? 0 : 1][m_shader];
+		time.count[m_class]++;
+		time.seconds[m_class] += seconds;
+		time.max = std::max(time.max, seconds);
+	}
 	if (m_outer == nullptr) {
 		Log(state);
 	}

@@ -188,6 +188,8 @@ public:
 	// Engine method (engine-method.md, E2), at the start of a guest submission: the heap entries
 	// the guest wrote since the last one are compared and their keys settled again.
 	void SyncBindlessHeaps();
+	// Sampled keys whose view change waited past a sync's budget, settled within one.
+	void DrainStaleBindlessKeys();
 	void SyncWrittenBindlessEntries();
 	// E3: settle entries no draw has asked for yet, within the per-submission budget.
 	void SettleBindlessHeaps();
