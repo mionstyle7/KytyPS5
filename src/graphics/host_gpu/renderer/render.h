@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <source_location>
 #include <unordered_set>
 #include <array>
 #include <memory>
@@ -124,7 +125,10 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0,
 	                  uint64_t arg5 = 0);
 	void BeginRendering(const RenderState& state) const;
-	void EndRendering() const;
+	// loc: who ended the pass (counted per call site, logged every 10 s as "Render passes").
+	void EndRendering(std::source_location loc = std::source_location::current()) const;
+	static void NoteRenderPassStart();
+	static void NoteRenderPassEnd(std::source_location loc);
 
 	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
 	// this first waits until the thread has run everything queued; hot paths use Recorder().

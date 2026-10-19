@@ -13,6 +13,7 @@
 #include <limits>
 #include <atomic>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <utility>
 #include <vector>
@@ -65,7 +66,8 @@ public:
 	// Records through the recording thread when given a threaded CommandBuffer::Recorder(); a raw
 	// command buffer converts.
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	             std::optional<ImageSubresourceRange> range, const CommandRecorder& command_buffer);
+	             std::optional<ImageSubresourceRange> range, const CommandRecorder& command_buffer,
+	             std::source_location loc = std::source_location::current());
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

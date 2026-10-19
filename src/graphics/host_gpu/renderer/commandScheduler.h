@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <source_location>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -32,7 +33,7 @@ public:
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
-	void           EndRendering();
+	void           EndRendering(std::source_location loc = std::source_location::current());
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();

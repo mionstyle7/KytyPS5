@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/common.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -13,6 +14,14 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cinttypes>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <fmt/format.h>
 #include <bit>
 #include <cstring>
 namespace Libs::Graphics {
@@ -88,6 +97,60 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	}
 }
 
+// Diagnostics: render passes really started, and which call sites ended them, every 10 s. A
+// pass ended between draws of the same targets is begun again, and every restart stores and
+// loads the attachments ("Render areas" counts draws per target size, not passes).
+namespace {
+struct RenderPassStats {
+	std::mutex                                                   mutex;
+	uint64_t                                                     started = 0;
+	std::map<std::pair<const char*, uint32_t>, uint64_t>         ended;
+	std::chrono::steady_clock::time_point next = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+};
+RenderPassStats g_render_pass_stats;
+
+void LogRenderPassStatsLocked(RenderPassStats& stats) {
+	const auto now = std::chrono::steady_clock::now();
+	if (now < stats.next) {
+		return;
+	}
+	stats.next = now + std::chrono::seconds(10);
+	std::vector<std::pair<std::pair<const char*, uint32_t>, uint64_t>> top(stats.ended.begin(),
+	                                                                       stats.ended.end());
+	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+	uint64_t ended = 0;
+	for (const auto& entry: top) {
+		ended += entry.second;
+	}
+	std::string text;
+	for (size_t i = 0; i < std::min<size_t>(top.size(), 12); i++) {
+		const char* file  = top[i].first.first;
+		const char* slash = file;
+		for (const char* c = file; *c != 0; c++) {
+			if (*c == '/' || *c == '\\') {
+				slash = c + 1;
+			}
+		}
+		text += fmt::format(" {}:{}={}", slash, top[i].first.second, top[i].second);
+	}
+	LOGF("Render passes (10 s): %" PRIu64 " started, %" PRIu64 " ended by:%s\n", stats.started, ended,
+	     text.c_str());
+	stats.started = 0;
+	stats.ended.clear();
+}
+} // namespace
+
+void CommandBuffer::NoteRenderPassStart() {
+	std::lock_guard lock(g_render_pass_stats.mutex);
+	g_render_pass_stats.started++;
+	LogRenderPassStatsLocked(g_render_pass_stats);
+}
+
+void CommandBuffer::NoteRenderPassEnd(std::source_location loc) {
+	std::lock_guard lock(g_render_pass_stats.mutex);
+	g_render_pass_stats.ended[{loc.file_name(), loc.line()}]++;
+}
+
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	if (m_rendering && m_render_state == state) {
 		return;
@@ -95,6 +158,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	NoteRenderPassStart();
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -136,10 +200,11 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_rendering    = true;
 }
 
-void CommandBuffer::EndRendering() const {
+void CommandBuffer::EndRendering(std::source_location loc) const {
 	if (!m_rendering) {
 		return;
 	}
+	NoteRenderPassEnd(loc);
 	Recorder().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
