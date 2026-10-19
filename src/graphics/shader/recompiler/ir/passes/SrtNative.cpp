@@ -91,6 +91,11 @@ struct SrtNativeHelpers {
 	// SrtWalker::EvaluateRawRead's read, after the address computation.
 	static bool Read(SrtNativeFrame* frame, uint64_t address, uint64_t base, uint64_t* result) {
 		auto&    walker = *frame->walker;
+		if (walker.m_fill_active || walker.m_soft_active) {
+			// As the interpreter: GPU-written bytes of a GPU-filled slot or a soft NumRecords
+			// source are left to the GPU instead of read (and drained) here.
+			return walker.ReadRawWord(address, base, *result);
+		}
 		uint32_t word   = 0;
 		if (walker.m_runtime.read_memory != nullptr) {
 			if (!walker.m_runtime.read_memory(walker.m_runtime.userdata, address, {&word, 1})) {

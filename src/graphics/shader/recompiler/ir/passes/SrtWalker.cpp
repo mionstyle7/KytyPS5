@@ -1111,6 +1111,13 @@ bool SrtWalker::EvaluateBufferRead(const Inst& inst, uint64_t& result) {
 	if ((base & 3u) != 0u || aligned > descriptor.GetSize() ||
 	    descriptor.GetSize() - aligned < 4u || aligned > AddressMask - base)
 		return false;
+	if (m_fill_active || m_soft_active) {
+		// A scalar buffer load is a raw read too: GPU-written bytes of a slot left to the GPU
+		// (SrtGpuFill) or of a soft NumRecords source must not be read here. This path read them
+		// through read_memory, and each such read drained the GPU (48ba2226's fill slots, ~40
+		// drains a frame in gameplay, 2026-10-18).
+		return ReadRawWord(base + aligned, base, result);
+	}
 	uint32_t word = 0;
 	if (m_runtime.read_memory == nullptr ||
 	    !m_runtime.read_memory(m_runtime.userdata, base + aligned, {&word, 1}))
