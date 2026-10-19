@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -59,7 +60,33 @@ void DumpGaveUpCode(const CompileOptions& options, std::span<const uint32_t> cod
 }
 
 // A shader that gives up: the current compile phase turns red, and the timeline gets the reason.
+// Shaders that gave up in this session, by stage and hash (KYTY_GAVE_UP_MEMO=0 off). A give-up
+// is not stored in the disk cache, so each new input of the same shader translated it again: the
+// compute shader 0xe6d76d24f59f8015 spent 10-58 s in resource tracking every time a cutscene used
+// it, on the GPU thread, before giving up again (2026-10-19). Its draws and dispatches are
+// skipped either way; now only the first attempt pays.
+struct GaveUpMemo {
+	std::mutex                                   mutex;
+	std::set<std::pair<uint32_t, uint64_t>>      shaders;
+};
+GaveUpMemo& GetGaveUpMemo() {
+	static GaveUpMemo memo;
+	return memo;
+}
+bool GaveUpMemoEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GAVE_UP_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void ReportGaveUp(const CompileOptions& options, Profiler::Phases& phases, const char* reason) {
+	if (GaveUpMemoEnabled() && options.shader_hash != 0) {
+		auto&           memo = GetGaveUpMemo();
+		std::lock_guard lock(memo.mutex);
+		memo.shaders.emplace(static_cast<uint32_t>(options.stage), options.shader_hash);
+	}
 	phases.Color(Profiler::MessageFailure);
 	Profiler::Add(Profiler::Counter::ShadersGaveUp);
 	Profiler::Message(Profiler::MessageFailure, "Shader gave up: %s 0x%016" PRIx64 ": %s",
@@ -525,6 +552,25 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    options.stage != ShaderType::TessellationEvaluation) {
 		EXIT("shader recompiler received unsupported stage %u\n",
 		     static_cast<unsigned>(options.stage));
+	}
+
+	if (GaveUpMemoEnabled() && options.shader_hash != 0 && options.non_fatal) {
+		auto&      memo  = GetGaveUpMemo();
+		bool       known = false;
+		{
+			std::lock_guard lock(memo.mutex);
+			known = memo.shaders.contains({static_cast<uint32_t>(options.stage), options.shader_hash});
+		}
+		if (known) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1) < 32) {
+				LOGF("%s gave up hash=0x%016" PRIx64 ": gave up earlier in this session\n",
+				     GetDumpLabel(options), options.shader_hash);
+			}
+			TranslateResult unsupported_result;
+			unsupported_result.unsupported = true;
+			return unsupported_result;
+		}
 	}
 
 	// The phases as Tracy zones, each with the stage and hash as its text.
