@@ -184,6 +184,16 @@ struct GraphicContext {
 		const auto budget = GetTotalMemoryBudget();
 		return budget != 0 && GetDeviceMemoryUsage() / 100 >= budget / 100 * percent / 100;
 	}
+	// The share of the budget in use from which new textures go to system memory
+	// (KYTY_TEXTURE_HOST_MARK_PCT, default 80).
+	[[nodiscard]] static uint32_t TextureHostMarkPercent();
+	// The device use that arms the bindless usage probe and lets the texture cache free the heap
+	// textures it finds unsampled (KYTY_BINDLESS_EVICT_PERCENT, default 65).
+	[[nodiscard]] static uint32_t BindlessEvictPercent();
+	// Whether video memory has room again for textures placed in system memory: device use 15
+	// points under the mark. The texture cache then frees them a few at a time, and they are
+	// created anew in video memory when next used.
+	[[nodiscard]] bool RoomForHostPlacedImages() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 
@@ -222,6 +232,9 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// Its memory is not device-local: a texture placed in system memory while video memory was
+	// short (CreateImage). The texture cache moves such images back once there is room.
+	bool                         host_placed = false;
 };
 
 

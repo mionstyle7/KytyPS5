@@ -24,11 +24,22 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <vector>
 #include <cinttypes>
 #include <cstdlib>
+#include <cstdio>
+#include <chrono>
 
 namespace Libs::Graphics {
+
+namespace {
+// Textures placed in system memory (CreateImage) that still exist.
+std::atomic<uint64_t> g_host_placed_bytes {0};
+std::atomic<uint64_t> g_host_placed_images {0};
+std::atomic<uint64_t> g_host_placed_total {0};
+
+} // namespace
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -178,6 +189,47 @@ uint64_t GraphicContext::MemoryShortfall() const {
 		}
 		const uint64_t value    = std::max(commit, device);
 		const auto     previous = shortfall.exchange(value, std::memory_order_relaxed);
+		// Every 10 s, where video memory is: per heap, the driver's count, VMA's blocks and what
+		// is allocated in them (blocks much larger than their allocations: freed images whose
+		// blocks other images keep alive), and the textures placed in system memory.
+		static int64_t next_log_ms = 0;
+		if (now >= next_log_ms && allocator != nullptr) {
+			next_log_ms = now + 10000;
+			const auto& properties = GetPhysicalDeviceMemoryProperties();
+			VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
+			vmaGetHeapBudgets(allocator, budgets);
+			std::string heaps;
+			for (uint32_t heap = 0; heap < properties.memoryHeapCount; heap++) {
+				const auto& b = budgets[heap];
+				if (b.statistics.blockCount == 0 && b.usage == 0) {
+					continue;
+				}
+				char line[256];
+				std::snprintf(line, sizeof(line),
+				              " heap%u(%s): usage=%" PRIu64 " budget=%" PRIu64 " blocks=%" PRIu64
+				              "MB/%u allocated=%" PRIu64 "MB/%u;",
+				              heap,
+				              (properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+				                  ? "video"
+				                  : "system",
+				              static_cast<uint64_t>(b.usage >> 20u),
+				              static_cast<uint64_t>(b.budget >> 20u),
+				              static_cast<uint64_t>(b.statistics.blockBytes >> 20u),
+				              b.statistics.blockCount,
+				              static_cast<uint64_t>(b.statistics.allocationBytes >> 20u),
+				              b.statistics.allocationCount);
+				heaps += line;
+			}
+			LOGF("VRAM (10 s): device %" PRIu64 " MB of %" PRIu64 " MB budget (%" PRIu64
+			     " %%);%s textures in system memory %" PRIu64 " MB (%" PRIu64 " images, %" PRIu64
+			     " placed so far)\n",
+			     GetDeviceMemoryUsage() >> 20u, GetTotalMemoryBudget() >> 20u,
+			     GetTotalMemoryBudget() != 0 ? GetDeviceMemoryUsage() * 100 / GetTotalMemoryBudget()
+			                                 : uint64_t {0},
+			     heaps.c_str(), g_host_placed_bytes.load(std::memory_order_relaxed) >> 20u,
+			     g_host_placed_images.load(std::memory_order_relaxed),
+			     g_host_placed_total.load(std::memory_order_relaxed));
+		}
 		static std::atomic<uint32_t> reported {0};
 		if ((previous == 0) != (value == 0) && reported.fetch_add(1) < 64) {
 			LOGF("Memory: %s (commit %" PRIu64 " MB free of %" PRIu64 " MB, reserve %" PRIu64
@@ -333,6 +385,47 @@ static void DestroyImagePool(VmaAllocator allocator) {
 	TrimImagePoolLocked(allocator, 0);
 }
 
+// KYTY_TEXTURE_HOST_MARK_PCT (default 80): the share of the budget in use from which textures
+// go to system memory. It was half the budget: on a 12 GB card (10.1 GB budget) every texture
+// past 5 GB went to system memory while ~4.5 GB of video memory stayed unused, and an area
+// sampling those textures over PCIe took ~350 ms a frame on the GPU (Wolverine, 15 -> 3 fps
+// for over a minute, 2026-10-19). 80 % leaves ~2 GB for render targets and the driver; the
+// caches start collecting at 90 % (MemoryShortfall).
+uint32_t GraphicContext::TextureHostMarkPercent() {
+	static const uint32_t pct = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_HOST_MARK_PCT");
+		const auto  parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {80};
+		return static_cast<uint32_t>(std::clamp<uint64_t>(parsed, 10, 100));
+	}();
+	return pct;
+}
+
+// 65 (80 before, 90 before that): under the placement mark (80), so unsampled heap textures leave
+// video memory before new ones are sent to system memory. At 80 the probe never ran in a run
+// where device use stayed at 55 % because textures were placed in system memory past 50 %.
+uint32_t GraphicContext::BindlessEvictPercent() {
+	static const uint32_t pct = [] {
+		const char* value  = std::getenv("KYTY_BINDLESS_EVICT_PERCENT");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 65ul;
+		return static_cast<uint32_t>(std::clamp<unsigned long>(parsed, 10ul, 100ul));
+	}();
+	return pct;
+}
+
+// A texture placed in system memory stays there for its life, however much video memory is
+// freed later: after a return to the title menu (2026-10-19) the menu's textures were all
+// placed there and it ran at 5 fps instead of 36. Once device use is 15 points under the mark the
+// texture cache frees them, a few a frame, and they are created anew here, in video memory.
+bool GraphicContext::RoomForHostPlacedImages() const {
+	if (g_host_placed_images.load(std::memory_order_relaxed) == 0 || !CanReportMemoryUsage() ||
+	    MemoryShortfall() != 0) {
+		return false;
+	}
+	const auto mark   = TextureHostMarkPercent();
+	const auto budget = GetTotalMemoryBudget();
+	return mark > 15 && budget != 0 && GetDeviceMemoryUsage() < budget / 100 * (mark - 15);
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
@@ -347,8 +440,9 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			if (it->key != key) {
 				continue;
 			}
-			image.image      = it->image;
-			image.allocation = it->allocation;
+			image.image       = it->image;
+			image.allocation  = it->allocation;
+			image.host_placed = false; // the pool keeps only video-memory images
 			g_image_pool_bytes -= it->bytes;
 			g_image_pool.erase(it);
 			if (++g_image_pool_hits % 1024u == 1u) {
@@ -393,17 +487,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	    !(image_info.usage & (vk::ImageUsageFlagBits::eColorAttachment |
 	                          vk::ImageUsageFlagBits::eDepthStencilAttachment)) &&
 	    (block || !(image_info.usage & vk::ImageUsageFlagBits::eStorage));
-	// KYTY_TEXTURE_HOST_MARK_PCT (default 80): the share of the budget in use from which textures
-	// go to system memory. It was half the budget: on a 12 GB card (10.1 GB budget) every texture
-	// past 5 GB went to system memory while ~4.5 GB of video memory stayed unused, and an area
-	// sampling those textures over PCIe took ~350 ms a frame on the GPU (Wolverine, 15 -> 3 fps
-	// for over a minute, 2026-10-19). 80 % leaves ~2 GB for render targets and the driver; the
-	// caches start collecting at 90 % (MemoryShortfall).
-	static const uint64_t host_mark_pct = [] {
-		const char* value = std::getenv("KYTY_TEXTURE_HOST_MARK_PCT");
-		const auto  pct   = value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {80};
-		return std::clamp<uint64_t>(pct, 10, 100);
-	}();
+	const uint64_t host_mark_pct = TextureHostMarkPercent();
 	if (host_placement && texture && CanReportMemoryUsage()) {
 		const auto budget = GetTotalMemoryBudget();
 		if (budget < (uint64_t {12} << 30u) &&
@@ -415,6 +499,23 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 				LOGF("Textures placed by the driver (video or system memory): %" PRIu64 "\n",
 				     placed.load(std::memory_order_relaxed));
 			}
+		}
+	}
+
+	// KYTY_IMAGE_DEDICATED_MB (default 16; 0 = off): an image of at least this size gets its own
+	// memory allocation instead of a share of a VMA block. Freed images left their blocks alive
+	// while any other image in them lived: after a return to the title menu the cache had
+	// dropped 3 GB of textures and video memory use fell by 0.36 GB.
+	static const uint64_t dedicated_bytes = [] {
+		const char* value = std::getenv("KYTY_IMAGE_DEDICATED_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {16}) << 20u;
+	}();
+	if (dedicated_bytes != 0 && image_info.pNext == nullptr) {
+		vk::DeviceImageMemoryRequirements requirements_info {};
+		requirements_info.pCreateInfo = &image_info;
+		const auto requirements = device.getImageMemoryRequirements(requirements_info);
+		if (requirements.memoryRequirements.size >= dedicated_bytes) {
+			alloc_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
 		}
 	}
 
@@ -452,6 +553,20 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		LogMemoryBudget();
 		return false;
 	}
+	{
+		VmaAllocationInfo allocation_info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+		const auto& properties = GetPhysicalDeviceMemoryProperties();
+		image.host_placed =
+		    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu &&
+		    !(properties.memoryTypes[allocation_info.memoryType].propertyFlags &
+		      vk::MemoryPropertyFlagBits::eDeviceLocal);
+		if (image.host_placed) {
+			g_host_placed_bytes.fetch_add(allocation_info.size, std::memory_order_relaxed);
+			g_host_placed_images.fetch_add(1, std::memory_order_relaxed);
+			g_host_placed_total.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
@@ -471,6 +586,20 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
+	if (image.host_placed) {
+		// Never pooled: a new image of the same shape belongs in video memory if there is room.
+		VmaAllocationInfo allocation_info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+		g_host_placed_bytes.fetch_sub(std::min(allocation_info.size,
+		                                       g_host_placed_bytes.load(std::memory_order_relaxed)),
+		                              std::memory_order_relaxed);
+		g_host_placed_images.fetch_sub(1, std::memory_order_relaxed);
+		vmaDestroyImage(allocator, image.image, image.allocation);
+		image.image       = nullptr;
+		image.allocation  = nullptr;
+		image.host_placed = false;
+		return;
+	}
 	if (ImagePoolEnabled()) {
 		const uint64_t limit =
 		    MemoryShortfall() != 0 ? 0 : std::min<uint64_t>(512ull << 20u, GetTotalMemoryBudget() / 32);

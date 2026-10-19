@@ -99,6 +99,9 @@ public:
 	// them like any other image; a key that samples one again asks for it anew. Replaces the
 	// previous set.
 	void SetBindlessEvictable(std::span<const ImageId> ids);
+	// Frees unsampled heap textures and textures placed in system memory by device use, not by the
+	// cache's own thresholds (RunGarbageCollector, once a frame).
+	void RelieveDeviceMemory(uint64_t clock);
 	// Whether the cache's images are above the collector's pressure threshold.
 	// All images, pinned ones included, against the bound: eager settling pauses on it. Settling
 	// ahead while the collector freed other images under the bound lost the device at ~57 s into
@@ -246,6 +249,13 @@ private:
 	uint64_t                                          m_pinned_bytes = 0;
 	uint64_t                                          m_pinned_frame = UINT64_MAX;
 	std::vector<ImageId>                              m_guest_dropped;
+	// RelieveDeviceMemory: the frame it last ran in, and what it freed.
+	uint64_t                                          m_relief_clock           = UINT64_MAX;
+	uint64_t                                          m_relief_log_frame       = 0;
+	uint64_t                                          m_relief_bindless_images = 0;
+	uint64_t                                          m_relief_bindless_bytes  = 0;
+	uint64_t                                          m_relief_moved_images    = 0;
+	uint64_t                                          m_relief_moved_bytes     = 0;
 	uint64_t                                          m_guest_dropped_freed       = 0;
 	uint64_t                                          m_guest_dropped_freed_bytes = 0;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;

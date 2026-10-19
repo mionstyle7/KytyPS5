@@ -2683,6 +2683,7 @@ void TextureCache::RunGarbageCollector() {
 			}
 		});
 	}
+	RelieveDeviceMemory(clock);
 	if (CollectableMemory() < m_trigger_gc_memory) {
 		return;
 	}
@@ -2913,6 +2914,82 @@ void TextureCache::RunGarbageCollector() {
 		     g_gc_skip.gpu_download, g_gc_skip.young, g_gc_skip.bindless, g_gc_skip.small_target,
 		     g_gc_skip.pending, g_gc_skip.revived);
 		g_gc_skip = {};
+	}
+}
+
+// Video memory relief, once a frame, whatever this cache's own thresholds say. Device use is what
+// decides where new textures go (GraphicContext::CreateImage places them in system memory past
+// the mark), and the cache's thresholds count only its own bytes: in a run (2026-10-19) the probe
+// found 388 heap textures (1.3 GB) no draw sampled, the cache sat at 4.5 GB under its 5.3 GB
+// bound, so none was freed, device use stayed past the mark and the title menu's textures all went
+// to system memory (5 fps instead of 36).
+// - Device use at the probe's mark (KYTY_BINDLESS_EVICT_PERCENT, default 65): the heap textures
+//   the last usage probe found unsampled are freed, up to 256 MB a frame. A key that samples one
+//   again asks for it anew.
+// - Device use 15 points under the placement mark (RoomForHostPlacedImages): textures placed in
+//   system memory are freed, up to 64 MB a frame, and come back in video memory when next used.
+// KYTY_VRAM_RELIEF=0 disables both.
+void TextureCache::RelieveDeviceMemory(uint64_t clock) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VRAM_RELIEF");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || m_relief_clock == clock || !m_graphics.CanReportMemoryUsage()) {
+		return;
+	}
+	m_relief_clock = clock;
+	constexpr uint64_t MiB   = 1024 * 1024;
+	const auto         frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	// Never an image used in the last few frames, a depth association, an image whose contents
+	// exist only on the GPU, one being written back, or a small render target (glyphs, cached UI).
+	const auto can_free = [&](ImageId id, const Image& image) {
+		return image.registered && !image.depth_id && !image.IsGpuModified() &&
+		       !m_evicting.contains(id) && !image.binding.is_target &&
+		       !(image.usage.render_target && image.info.extent.width <= 1024 &&
+		         image.info.extent.height <= 1024) &&
+		       image.frame_accessed_last + 4 <= frame;
+	};
+	if (!m_bindless_evictable.empty() &&
+	    m_graphics.DeviceMemoryAtLeast(GraphicContext::BindlessEvictPercent())) {
+		uint64_t freed  = 0;
+		uint64_t images = 0;
+		for (auto it = m_bindless_evictable.begin();
+		     it != m_bindless_evictable.end() && freed < 256 * MiB;) {
+			const auto id = *it;
+			it            = m_bindless_evictable.erase(it);
+			auto* image   = m_slot_images.try_get(id);
+			if (image == nullptr || !can_free(id, *image)) {
+				continue;
+			}
+			freed += image->AccountedSize();
+			images++;
+			FreeImage(id);
+		}
+		m_relief_bindless_images += images;
+		m_relief_bindless_bytes += freed;
+	}
+	if (m_graphics.RoomForHostPlacedImages()) {
+		std::vector<ImageId> moving;
+		uint64_t             bytes = 0;
+		m_slot_images.ForEach([&](ImageId id, const Image& image) {
+			if (bytes < 64 * MiB && image.backing.host_placed && can_free(id, image)) {
+				moving.push_back(id);
+				bytes += image.AccountedSize();
+			}
+		});
+		for (const auto id: moving) {
+			FreeImage(id);
+		}
+		m_relief_moved_images += moving.size();
+		m_relief_moved_bytes += bytes;
+	}
+	if (frame >= m_relief_log_frame + 300 &&
+	    (m_relief_bindless_images != 0 || m_relief_moved_images != 0)) {
+		m_relief_log_frame = frame;
+		LOGF("VRAM relief: %" PRIu64 " unsampled heap textures freed (%" PRIu64
+		     " MB), %" PRIu64 " textures moved back from system memory (%" PRIu64 " MB) so far\n",
+		     m_relief_bindless_images, m_relief_bindless_bytes >> 20u, m_relief_moved_images,
+		     m_relief_moved_bytes >> 20u);
 	}
 }
 
