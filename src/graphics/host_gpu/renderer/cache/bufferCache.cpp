@@ -1198,13 +1198,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	uint64_t age        = 0;
 	double   service_ms = 0.0; // inside requests to the GPU thread (its queue wait + the step)
 	uint32_t steps      = 0;
+	uint8_t  last_reason = StepDone;
 	for (;;) {
 		uint64_t   wait_tick = 0;
 		SideTicket ticket;
 		const double request_start = timer.GetTimeS();
 		m_scheduler.Context().GetGpu().SendCommandSync(
 		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &first, &gpu_bytes,
-		     &age, &ticket, &steps] {
+		     &age, &ticket, &steps, &last_reason] {
 			    if (first) {
 				    first      = false;
 				    gpu_bytes = HasGpuDirtyBytes(vaddr, std::max<uint64_t>(size, 4));
@@ -1223,6 +1224,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
 			    m_step_ticket = nullptr;
 			    const auto reason = std::min<uint8_t>(m_step_reason, StepReasonCount - 1);
+			    last_reason       = reason;
 			    g_readback_outcomes.reasons[reason].fetch_add(1, std::memory_order_relaxed);
 			    if (wait_tick != 0 && wait_tick != SideIssued && wait_tick != SideRetry &&
 			        m_scheduler.IsFree(wait_tick)) {
@@ -1252,6 +1254,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			break;
 		}
 		g_readback_outcomes.ticks.fetch_add(1, std::memory_order_relaxed);
+		if (last_reason == StepBitmap) {
+			// Tracked writes, not a download: no priority operation marks their end, and
+			// WaitPriorityOperations returned at once, so the next step asked again right away.
+			m_scheduler.GetMasterSemaphore().Wait(wait_tick);
+		}
 		m_scheduler.WaitPriorityOperations(wait_tick);
 		if (async && LocalDownloadWait()) {
 			// Other threads' downloads of these pages still in flight: each used to cost one more
@@ -2223,6 +2230,15 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, ui
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+// KYTY_BITMAP_NO_WAIT=0: a refinement waits for every tracked write to its regions, as before.
+static bool BitmapNoWait() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BITMAP_NO_WAIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, uint64_t size,
                                         bool async, uint64_t& wait_tick) {
 	if (m_write_bitmap == nullptr) {
@@ -2250,7 +2266,29 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 			tick = std::max(tick, found->second);
 		}
 	}
-	if (tick != 0 && !m_scheduler.IsFree(tick)) {
+	// Pages of tracked writes still in flight (KYTY_BITMAP_NO_WAIT, default on): they stay
+	// GPU-written and their bitmap words are not cleared, so the refinement needs no wait. Waiting
+	// for the region's newest tracked write instead chased the writes of each new frame: ~20
+	// requests to the GPU thread per guest readback, 300-570 K each 10 s in gameplay (2026-10-19),
+	// each forcing a submission when the write was still being recorded.
+	RangeSet in_flight;
+	bool     no_wait = false;
+	if (tick != 0 && !m_scheduler.IsFree(tick) && BitmapNoWait()) {
+		no_wait = true;
+		for (auto it = m_bitmap_inflight.begin(); it != m_bitmap_inflight.end();) {
+			const auto first = it->first;
+			const auto [last, write_tick] = it->second;
+			if (m_scheduler.IsFree(write_tick)) {
+				it = m_bitmap_inflight.erase(it);
+				continue;
+			}
+			if (first < end && begin < last) {
+				in_flight.Add(first, last - first);
+			}
+			++it;
+		}
+	}
+	if (tick != 0 && !no_wait && !m_scheduler.IsFree(tick)) {
 		if (!async) {
 			return false; // the GPU thread downloads the window as before
 		}
@@ -2277,11 +2315,13 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 	uint64_t cached_index = UINT64_MAX;
 	uint32_t cached_word  = 0;
 	bool     cached_dirty = false;
+	bool     cached_keep  = false; // a page of the word is in flight: the GPU may still OR bits in
 	const auto flush_word = [&] {
-		if (cached_dirty) {
+		if (cached_dirty && !cached_keep) {
 			words[cached_index] = cached_word;
-			cached_dirty        = false;
 		}
+		cached_dirty = false;
+		cached_keep  = false;
 	};
 	for (const auto [from, to]: pieces) {
 		m_bitmap_tracked.ForEachInRange(from, to - from, [&](uint64_t tb, uint64_t te) {
@@ -2296,6 +2336,10 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 					cached_word  = words[word_index];
 				}
 				const auto bit = uint32_t {1} << (index & 31u);
+				if (no_wait && in_flight.Intersects(page, WriteBitmapPage)) {
+					cached_keep = true; // written by a write still running: downloaded as is
+					continue;
+				}
 				if ((cached_word & bit) == 0) {
 					if (!unwritten.empty() && unwritten.back().second == page) {
 						unwritten.back().second = page + WriteBitmapPage;
@@ -2376,6 +2420,16 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			for (auto region = first >> WriteBitmapRegionBits;
 			     region <= (last - 1) >> WriteBitmapRegionBits; region++) {
 				m_bitmap_ticks[region] = tick;
+			}
+			if (BitmapNoWait() && last > first) {
+				auto& entry  = m_bitmap_inflight[first];
+				entry.first  = std::max(entry.first, last);
+				entry.second = tick;
+				if (m_bitmap_inflight.size() > 8192) {
+					std::erase_if(m_bitmap_inflight, [this](const auto& item) {
+						return m_scheduler.IsFree(item.second.second);
+					});
+				}
 			}
 		} else if (!m_bitmap_tracked.Empty()) {
 			m_bitmap_tracked.Subtract(first, last - first);

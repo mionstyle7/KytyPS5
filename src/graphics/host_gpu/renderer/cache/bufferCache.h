@@ -330,6 +330,9 @@ private:
 	bool                                               m_write_bitmap_failed = false;
 	RangeSet                                           m_bitmap_tracked;
 	std::unordered_map<uint64_t, uint64_t>             m_bitmap_ticks;
+	// Tracked writes the GPU may still be running: first byte -> {end, tick} (page-aligned).
+	// RefineWithWriteBitmap leaves their pages GPU-written instead of waiting for them.
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>>  m_bitmap_inflight;
 	uint64_t                                           m_bitmap_dropped_pages = 0;
 	uint64_t                                           m_bitmap_written_pages = 0;
 	void ApplyCleanWrite(uint64_t vaddr, uint64_t size);
