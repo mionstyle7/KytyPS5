@@ -36,24 +36,33 @@ bool SrtRawReadsOnGpu() {
 	return on_gpu;
 }
 
-// KYTY_GPU_RESOURCES=<hash>[,<hash>...] (hex) or "all": the listed shaders read their buffers
-// through the descriptor words in the shader (BDA), as GPU-selected buffers do, instead of a
-// binding the host refreshes for every draw.
-bool GpuResources(uint64_t shader_hash) {
+// KYTY_GPU_RESOURCES=<hash>[,<hash>...] (hex), "all" or "draws": the listed shaders (every
+// shader; every vertex, pixel and other graphics stage) read their buffers through the descriptor
+// words in the shader (BDA), as GPU-selected buffers do, instead of a binding the host refreshes
+// for every draw. "draws" is the buffer half of the Demon's Souls fork's table mode, without the
+// compute culling chain whose GPU reads stalled the menu (2026-10-18).
+bool GpuResources(uint64_t shader_hash, ShaderType stage) {
+	struct List {
+		bool                         all   = false;
+		bool                         draws = false;
+		std::unordered_set<uint64_t> hashes;
+	};
 	static const auto list = [] {
-		std::pair<bool, std::unordered_set<uint64_t>> result {false, {}};
+		List        result;
 		const char* value = std::getenv("KYTY_GPU_RESOURCES");
 		if (value == nullptr) return result;
 		const std::string_view text(value);
-		result.first = text == "all";
-		for (size_t begin = 0; !result.first && begin < text.size();) {
+		result.all   = text == "all";
+		result.draws = text == "draws";
+		for (size_t begin = 0; !result.all && !result.draws && begin < text.size();) {
 			const auto end = std::min(text.find(',', begin), text.size());
-			if (end > begin) result.second.insert(std::strtoull(std::string(text.substr(begin, end - begin)).c_str(), nullptr, 16));
+			if (end > begin) result.hashes.insert(std::strtoull(std::string(text.substr(begin, end - begin)).c_str(), nullptr, 16));
 			begin = end + 1;
 		}
 		return result;
 	}();
-	return list.first || list.second.contains(shader_hash);
+	return list.all || (list.draws && stage != ShaderType::Compute) ||
+	       list.hashes.contains(shader_hash);
 }
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
@@ -3144,7 +3153,7 @@ private:
 			                                                       : ResourceKind::Buffer) &&
 			    memory.SupportsIndirectBufferLoad(op) && handle != nullptr &&
 			    handle->GetOpcode() == ValueOpcode::GetBufferResource && handle->NumArgs() == 4 &&
-			    GpuResources(m_program.shader_hash) &&
+			    GpuResources(m_program.shader_hash, m_program.stage) &&
 			    std::ranges::all_of(handle->Uses(), [&](const Use& use) {
 				    const auto use_op = use.user->GetOpcode();
 				    const auto index  = use.user->Flags<MemoryFlags>().index;
