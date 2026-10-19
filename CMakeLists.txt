@@ -267,6 +267,16 @@ if(KYTY_HOST_ARCH)
 	message(STATUS "Host code compiled for ${KYTY_HOST_ARCH}")
 endif()
 
+# KYTY_LINE_TABLES (default ON): Kyty's own code is compiled with line tables (function names,
+# inlined frames and lines in the PDB; no change to the generated code). Without them the PDB held
+# only the linker's public symbols, so profiler samples and crash stacks named the nearest exported
+# function instead: a sampled gameplay capture blamed the texture garbage collector for 93% of the
+# GPU thread (2026-10-19).
+option(KYTY_LINE_TABLES "Compile Kyty's code with line tables for profiling and crash stacks" ON)
+if(KYTY_LINE_TABLES AND KYTY_CLANG_CL)
+	add_compile_options("/clang:-gline-tables-only" "/clang:-gcodeview")
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
