@@ -280,6 +280,7 @@ private:
 	std::unordered_map<uint64_t, uint64_t> m_region_write_ticks;
 	std::vector<BigWrite>                  m_big_writes;
 	SideTicket*                            m_step_ticket = nullptr; // GPU thread, set per step
+	uint8_t                                m_step_reason = 0;       // GPU thread: why the step returned
 
 	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
 	                                      bool from_gpu_thread, bool async);

@@ -104,7 +104,7 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
-// KYTY_WRITE_FAULT_WINDOW_KB=<n> (default 0 = off, a power of two of at least 8): a guest write
+// KYTY_WRITE_FAULT_WINDOW_KB=<n> (default 64; 0 = off; a power of two of at least 8): a guest write
 // fault on a tracked page also marks the other pages of its aligned n KB window CPU-modified in
 // the buffer cache, so a guest loop filling a buffer page by page takes one fault per window
 // instead of one per 4 KB page. Pages with GPU-written bytes are never touched (no download);
@@ -113,7 +113,9 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 static uint64_t WriteFaultWindow() {
 	static const uint64_t window = []() -> uint64_t {
 		const char*    value = std::getenv("KYTY_WRITE_FAULT_WINDOW_KB");
-		const uint64_t kb    = value != nullptr ? std::strtoull(value, nullptr, 10) : 0u;
+		// On by default since gameplay (2026-10-19): guest fill loops took 1-1.9 M write faults
+		// each 10 s (5-10 s of guest thread time); with 64 KB windows 8-10x fewer.
+		const uint64_t kb    = value != nullptr ? std::strtoull(value, nullptr, 10) : 64u;
 		const uint64_t bytes = kb * 1024u;
 		if (bytes <= TRACKER_PAGE_SIZE || (bytes & (bytes - 1u)) != 0) {
 			return uint64_t {0};

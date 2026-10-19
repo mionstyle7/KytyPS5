@@ -1145,7 +1145,23 @@ uint64_t BufferCache::DownloadTickFor(uint64_t vaddr, uint64_t size) const {
 // Diagnostics: what the steps of game-thread readbacks answered (NoteGuestReadbackTiming).
 static struct {
 	std::atomic<uint64_t> ticks {0}, retries {0}, local_waits {0};
+	// Why ReadMemoryStep returned (StepReason), and how many of those steps asked for a tick
+	// that had already completed (the caller then asks again at once).
+	std::atomic<uint64_t> reasons[8] {};
+	std::atomic<uint64_t> done_ticks[8] {};
 } g_readback_outcomes;
+
+// ReadMemoryStep's outcome, for the step statistics.
+enum StepReason : uint8_t {
+	StepDone = 0,      // nothing left to wait for
+	StepBitmap,        // the write bitmap's tracked writes are still running
+	StepPublishing,    // the page's bytes are being downloaded by another readback
+	StepDownload,      // a download of the window was issued
+	StepSide,          // a side readback was issued
+	StepSideRetry,     // another thread's side readback covers the pages
+	StepLifted,        // no GPU-written bytes: the page's protection was lifted
+	StepReasonCount
+};
 
 // KYTY_READBACK_EXACT_WAIT=0: a read of a page being downloaded waits for the newest download of
 // any page instead of the ones covering it.
@@ -1202,9 +1218,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				    }
 			    }
 			    m_step_ticket = &ticket;
+			    m_step_reason = StepDone;
 			    steps++;
 			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
 			    m_step_ticket = nullptr;
+			    const auto reason = std::min<uint8_t>(m_step_reason, StepReasonCount - 1);
+			    g_readback_outcomes.reasons[reason].fetch_add(1, std::memory_order_relaxed);
+			    if (wait_tick != 0 && wait_tick != SideIssued && wait_tick != SideRetry &&
+			        m_scheduler.IsFree(wait_tick)) {
+				    g_readback_outcomes.done_ticks[reason].fetch_add(1, std::memory_order_relaxed);
+			    }
 			    if (async && !is_write && wait_tick != 0 && wait_tick != SideIssued &&
 			        wait_tick != SideRetry && TryGrantStaleRead(vaddr, size)) {
 				    wait_tick = 0;
@@ -1301,6 +1324,19 @@ void BufferCache::NoteGuestReadbackTiming(double total_ms, double service_ms, ui
 	     " side readback retries, %" PRIu64 " waits without the GPU thread\n",
 	     g_readback_outcomes.ticks.exchange(0), g_readback_outcomes.retries.exchange(0),
 	     g_readback_outcomes.local_waits.exchange(0));
+	{
+		static constexpr const char* names[StepReasonCount] = {
+		    "done", "bitmap", "publishing", "download", "side", "side-retry", "lifted"};
+		std::string text;
+		for (uint32_t i = 0; i < StepReasonCount; i++) {
+			const auto count = g_readback_outcomes.reasons[i].exchange(0);
+			const auto done  = g_readback_outcomes.done_ticks[i].exchange(0);
+			if (count != 0) {
+				text += fmt::format(" {} {} ({} already done)", names[i], count, done);
+			}
+		}
+		LOGF("Guest readback step outcomes:%s\n", text.c_str());
+	}
 	const auto next = stats.next;
 	stats           = {};
 	stats.next      = next;
@@ -1583,6 +1619,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		}
 		if (side) {
 			if (async) {
+				m_step_reason = StepSideRetry;
 				return SideRetry;
 			}
 			WaitSideRanges(first, last - first);
@@ -1632,6 +1669,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	// GPU write bitmap: pages of tracked bindings the GPU did not write lose their GPU-written
 	// bytes here, so the window below downloads only what was written, or nothing.
 	if (uint64_t wait_tick = 0; RefineWithWriteBitmap(buffer, vaddr, size, async, wait_tick)) {
+		m_step_reason = wait_tick != 0 ? StepBitmap : StepDone;
 		return wait_tick;
 	}
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
@@ -1653,6 +1691,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		}
 		if (downloading && last != 0) {
 			if (async) {
+				m_step_reason = StepPublishing;
 				return last;
 			}
 			m_scheduler.WaitPriorityOperations(last);
@@ -1675,6 +1714,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			     "bytes\n",
 			     lifted);
 		}
+		m_step_reason = StepLifted;
 		return 0;
 	}
 
@@ -1712,6 +1752,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
 	if (async && !is_write && m_step_ticket != nullptr &&
 	    TrySideReadback(buffer, window_begin, window_end - window_begin, *m_step_ticket)) {
+		m_step_reason = StepSide;
 		return SideIssued;
 	}
 	if (async) {
@@ -1730,6 +1771,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			}
 			m_scheduler.Flush();
 			m_last_async_download_tick = tick;
+			m_step_reason              = StepDownload;
 			return tick;
 		}
 	} else if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
