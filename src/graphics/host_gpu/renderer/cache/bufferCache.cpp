@@ -2336,7 +2336,7 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 					cached_word  = words[word_index];
 				}
 				const auto bit = uint32_t {1} << (index & 31u);
-				if (no_wait && in_flight.Intersects(page, WriteBitmapPage)) {
+				if (no_wait && !in_flight.Empty() && in_flight.Intersects(page, WriteBitmapPage)) {
 					cached_keep = true; // written by a write still running: downloaded as is
 					continue;
 				}

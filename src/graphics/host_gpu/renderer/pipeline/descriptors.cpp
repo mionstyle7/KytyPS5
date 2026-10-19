@@ -2396,7 +2396,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	};
 	std::vector<WrittenRange> written_ranges;
 	bool                      written_gathered = false;
-	for (const auto* reader: prepared_bindings) {
+	// KYTY_SRT_OVERLAP_CHECK_EVERY=<n> (default 8; 1 checks every command): the check never changes a
+	// binding (it warns, or stops on overlaps this title has not shown), and run for every draw it was ~2-3% of the GPU thread in
+	// gameplay (sampled capture, 2026-10-19); one command in n keeps the warnings coming.
+	static const uint32_t check_every = [] {
+		const char* value = std::getenv("KYTY_SRT_OVERLAP_CHECK_EVERY");
+		const auto  every = value != nullptr ? std::strtoul(value, nullptr, 10) : 8ul;
+		return static_cast<uint32_t>(std::max(every, 1ul));
+	}();
+	static uint32_t check_counter = 0;
+	const bool      check_now     = check_every == 1 || (++check_counter % check_every) == 0;
+	for (const auto* reader: check_now ? prepared_bindings : decltype(prepared_bindings) {}) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
 		if (!written_gathered) {

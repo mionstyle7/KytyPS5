@@ -593,6 +593,49 @@ void Store::Start() {
 	for (uint32_t i = 0; i < threads; i++) {
 		m_threads.emplace_back([this] { Worker(); });
 	}
+	// KYTY_PIPELINE_WARMUP_KEEP_S (default 120; 0 keeps them all): prebuilt pipelines no draw took
+	// within this many seconds are destroyed. Building them already filled the driver's cache, so
+	// one needed later is created from it in about a millisecond; kept, ~1,300 pipelines of a
+	// session held video memory the late gameplay needed (3-5 fps against ~14 without them,
+	// 2026-10-19).
+	static const uint64_t keep_s = [] {
+		const char* keep = std::getenv("KYTY_PIPELINE_WARMUP_KEEP_S");
+		return keep != nullptr ? std::strtoull(keep, nullptr, 10) : uint64_t {120};
+	}();
+	if (keep_s != 0) {
+		m_threads.emplace_back([this] {
+			std::unique_lock lock(m_mutex);
+			const auto deadline = m_begin + std::chrono::seconds(keep_s);
+			m_changed.wait_until(lock, deadline, [this] { return m_stop.load(); });
+			if (m_stop.load()) {
+				return;
+			}
+			// Nothing more is started; builds still running finish first.
+			for (auto& [hash, recipe]: m_recipes) {
+				(void)hash;
+				if (recipe.state == State::Queued) {
+					recipe.state = State::Taken;
+				}
+			}
+			m_changed.wait(lock, [this] { return m_stop.load() || m_active == 0; });
+			if (m_stop.load()) {
+				return;
+			}
+			uint64_t dropped = 0;
+			for (auto& [hash, recipe]: m_recipes) {
+				(void)hash;
+				if (recipe.state == State::Built && recipe.pipeline != nullptr) {
+					m_graphics.device.destroyPipeline(recipe.pipeline, nullptr);
+					recipe.pipeline = nullptr;
+					recipe.state    = State::Taken;
+					dropped++;
+				}
+			}
+			LOGF("Pipeline warmup: %" PRIu64 " prebuilt pipelines unused after %" PRIu64
+			     " s destroyed (%" PRIu64 " were taken by draws)\n",
+			     dropped, keep_s, m_taken);
+		});
+	}
 }
 
 void Store::Worker() {
