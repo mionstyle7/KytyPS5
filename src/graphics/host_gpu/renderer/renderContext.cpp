@@ -38,6 +38,10 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
 		m_bindless_table.OnImageUnregistered(id);
 	};
+	m_texture_cache.on_views_replaced =
+	    [this](std::span<const std::pair<vk::ImageView, vk::ImageView>> views) {
+		    m_bindless_table.ReplaceViews(views);
+	    };
 	m_texture_cache.on_image_release = [this](const Image& image) {
 		if (!m_bindless_table.Enabled()) {
 			return false;

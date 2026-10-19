@@ -1879,7 +1879,7 @@ void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_
 	// 16 frames had run, and the buffer collector's emergency sweep took over.
 	// 65 since 2026-10-19 (GraphicContext::BindlessEvictPercent).
 	const uint32_t arm_percent = GraphicContext::BindlessEvictPercent();
-	if (frame >= m_bindless_next_probe && m_context.GetGraphics().DeviceMemoryAtLeast(arm_percent)) {
+	if (frame >= m_bindless_next_probe && m_context.GetGraphics().DeviceMemoryInUseAtLeast(arm_percent)) {
 		table.ArmUsageProbe();
 		m_bindless_probe_frame = frame;
 	}

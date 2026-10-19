@@ -194,6 +194,31 @@ struct GraphicContext {
 	// points under the mark. The texture cache then frees them a few at a time, and they are
 	// created anew in video memory when next used.
 	[[nodiscard]] bool RoomForHostPlacedImages() const;
+	// Video memory use without the free space inside VMA's blocks (memory freed images left in
+	// blocks other allocations keep alive): what is really in use.
+	[[nodiscard]] uint64_t GetDeviceMemoryInUse() const;
+	// DeviceMemoryAtLeast by the memory really in use (GetDeviceMemoryInUse).
+	[[nodiscard]] bool DeviceMemoryInUseAtLeast(uint32_t percent) const;
+
+	// Texture defragmentation (KYTY_IMAGE_DEFRAG, default on). Textures that may move
+	// (VulkanImage::movable) are allocated from a pool of their own; when its blocks hold much more
+	// than is allocated in them, VMA lists moves that pack the allocations into fewer blocks, a
+	// pass at a time. For each move the texture cache creates the image again at the destination,
+	// copies it on the GPU and repoints its views; once the GPU is done the pass ends and the
+	// emptied blocks are freed.
+	struct TextureDefragMove {
+		VmaAllocation destination = nullptr; // bind the new image here
+		uint64_t      owner       = 0;       // SetImageOwner's value; 0 = not a cache image
+		bool          copy        = false;   // set by the caller: moved (else left in place)
+	};
+	// Starts or continues a defragmentation: the moves of the next pass, or false when there is
+	// nothing to do. The source allocations of the moves must not be freed until the pass ends.
+	[[nodiscard]] bool BeginTextureDefragPass(std::vector<TextureDefragMove>& moves);
+	// Ends the pass begun last, once the GPU has finished the copies and the old images are
+	// destroyed: the moved allocations then point at their new place.
+	void               EndTextureDefragPass(const std::vector<TextureDefragMove>& moves);
+	[[nodiscard]] bool BindImageMemory(vk::Image image, VmaAllocation allocation) const;
+	void               SetImageOwner(const VulkanImage& image, uint64_t owner) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 
@@ -235,6 +260,11 @@ struct VulkanImage {
 	// Its memory is not device-local: a texture placed in system memory while video memory was
 	// short (CreateImage). The texture cache moves such images back once there is room.
 	bool                         host_placed = false;
+	// Set by the caller before CreateImage: the image may be moved to another place in video
+	// memory (a texture cache image that is only sampled), so it can go to the texture pool.
+	bool                         movable = false;
+	// Its memory is in the texture pool, which the texture cache defragments.
+	bool                         in_texture_pool = false;
 };
 
 

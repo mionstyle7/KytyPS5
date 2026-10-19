@@ -41,6 +41,8 @@ public:
 	// Called right before an image is destroyed; true keeps it one more GPU tick (a bindless slot
 	// still held one of its views and was repointed).
 	std::function<bool(const Image&)> on_image_release;
+	// Texture defragmentation moved images: (old view, new view) pairs, for the bindless slots.
+	std::function<void(std::span<const std::pair<vk::ImageView, vk::ImageView>>)> on_views_replaced;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -102,6 +104,9 @@ public:
 	// Frees unsampled heap textures and textures placed in system memory by device use, not by the
 	// cache's own thresholds (RunGarbageCollector, once a frame).
 	void RelieveDeviceMemory(uint64_t clock);
+	// One step of the texture defragmentation (RunGarbageCollector): begins a pass and moves its
+	// images, repoints their views once the copies are done, ends the pass a tick later.
+	void DefragmentStep(uint64_t clock);
 	// Whether the cache's images are above the collector's pressure threshold.
 	// All images, pinned ones included, against the bound: eager settling pauses on it. Settling
 	// ahead while the collector freed other images under the bound lost the device at ~57 s into
@@ -249,6 +254,18 @@ private:
 	uint64_t                                          m_pinned_bytes = 0;
 	uint64_t                                          m_pinned_frame = UINT64_MAX;
 	std::vector<ImageId>                              m_guest_dropped;
+	// DefragmentStep: the pass in progress.
+	struct Relocation {
+		ImageId                      id;
+		std::vector<CachedImageView> old_views;
+		vk::Image                    old_image = nullptr;
+	};
+	std::vector<GraphicContext::TextureDefragMove> m_defrag_moves;
+	std::vector<Relocation>                         m_relocations;
+	std::vector<ImageId>                            m_defrag_guarded; // relocating set on them
+	uint32_t                                        m_defrag_phase = 0;
+	uint64_t                                        m_defrag_tick  = 0;
+	uint64_t                                        m_defrag_clock = UINT64_MAX;
 	// RelieveDeviceMemory: the frame it last ran in, and what it freed.
 	uint64_t                                          m_relief_clock           = UINT64_MAX;
 	uint64_t                                          m_relief_log_frame       = 0;

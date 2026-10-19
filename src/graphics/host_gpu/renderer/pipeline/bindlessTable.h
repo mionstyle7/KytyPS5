@@ -219,6 +219,9 @@ public:
 	// placeholder and the keys that use it are pending again. True when one did, so the caller
 	// keeps the image until the GPU has finished the work recorded with that slot.
 	[[nodiscard]] bool ReleaseViews(std::span<const vk::ImageView> views);
+	// Texture defragmentation moved an image: each slot holding one of its old views now holds the
+	// matching new view (pairs of old, new). The keys keep their slots.
+	void ReplaceViews(std::span<const std::pair<vk::ImageView, vk::ImageView>> views);
 
 private:
 	[[nodiscard]] bool AllocateRegion(Heap& heap, uint32_t entries);

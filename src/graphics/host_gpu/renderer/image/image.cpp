@@ -459,6 +459,67 @@ void Image::CopyImage(Image& source) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
+bool Image::Relocate(vk::Image destination, std::vector<CachedImageView>& old_views,
+                     vk::Image& old_image) {
+	if (backing.image == nullptr || destination == nullptr || !backing.subresource_states.empty() ||
+	    backing.samples != 1) {
+		return false;
+	}
+	const auto layout = backing.state.layout;
+	const auto aspect = FullAspectMask(backing.format);
+	if (layout == vk::ImageLayout::eUndefined || aspect != vk::ImageAspectFlagBits::eColor) {
+		return false;
+	}
+	auto access = backing.state.access_mask;
+	if (!access) {
+		access = vk::AccessFlagBits2::eShaderRead;
+	}
+	std::vector<vk::ImageCopy> copies;
+	copies.reserve(backing.mip_levels);
+	for (uint32_t level = 0; level < backing.mip_levels; level++) {
+		vk::ImageCopy copy {};
+		copy.srcSubresource = {aspect, level, 0, backing.layers};
+		copy.dstSubresource = copy.srcSubresource;
+		copy.extent         = {std::max(backing.extent.width >> level, 1u),
+		                       std::max(backing.extent.height >> level, 1u),
+		                       std::max(backing.extent.depth >> level, 1u)};
+		copies.push_back(copy);
+	}
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Recorder();
+	Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, command);
+	const vk::Image source = backing.image;
+	backing.image          = destination;
+	backing.state          = {};
+	backing.subresource_states.clear();
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	command.copyImage(source, vk::ImageLayout::eTransferSrcOptimal, destination,
+	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
+	                  copies.data());
+	// The old image back in its layout: draws prepared before the move may still sample it.
+	vk::ImageMemoryBarrier2 back {};
+	back.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	back.srcAccessMask       = vk::AccessFlagBits2::eTransferRead;
+	back.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	back.dstAccessMask       = vk::AccessFlagBits2::eShaderRead;
+	back.oldLayout           = vk::ImageLayout::eTransferSrcOptimal;
+	back.newLayout           = layout;
+	back.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	back.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	back.image               = source;
+	back.subresourceRange    = {aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &back;
+	command.pipelineBarrier2(dependency);
+	Transit(layout, access, {}, command);
+	old_views = std::move(views);
+	views.clear();
+	old_image = source;
+	NoteBindlessStateChange(*this);
+	return true;
+}
+
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
                     const ImageSubresourceRange& destination_range) {
 	EXIT_IF(backing.samples != 1 || source.backing.image_type != vk::ImageType::e2D ||
@@ -789,6 +850,12 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
+	// A texture (no attachment use, one sample, colour) may be moved by the texture
+	// defragmentation, so its memory comes from the texture pool.
+	backing.movable = !(create.usage & (vk::ImageUsageFlagBits::eColorAttachment |
+	                                    vk::ImageUsageFlagBits::eDepthStencilAttachment)) &&
+	                  create.samples == vk::SampleCountFlagBits::e1 &&
+	                  FullAspectMask(create.format) == vk::ImageAspectFlagBits::eColor;
 	if (!graphics.CreateImage(create, backing)) {
 		EXIT("Out of memory: an image fits neither in video memory nor in system memory (the VMA "
 		     "heap lines above give usage and budget). Close other programs; on a card with little "

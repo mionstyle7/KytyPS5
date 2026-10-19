@@ -39,6 +39,33 @@ std::atomic<uint64_t> g_host_placed_bytes {0};
 std::atomic<uint64_t> g_host_placed_images {0};
 std::atomic<uint64_t> g_host_placed_total {0};
 
+// Texture defragmentation state (GraphicContext::BeginTextureDefragPass). The pool and the
+// context are used from the GPU thread; g_defrag_open is read by DeleteImage on any thread.
+VmaPool                        g_texture_pool       = nullptr;
+uint32_t                       g_texture_pool_type  = UINT32_MAX;
+VmaDefragmentationContext      g_defrag_context     = nullptr;
+VmaDefragmentationPassMoveInfo g_defrag_pass {};
+bool                           g_defrag_pass_open   = false;
+uint32_t                       g_defrag_passes      = 0;
+int64_t                        g_defrag_next_ms     = 0;
+uint64_t                       g_defrag_moved_bytes  = 0; // whole run
+uint64_t                       g_defrag_moved_images = 0;
+uint64_t                       g_defrag_freed_bytes  = 0;
+std::atomic<bool>              g_defrag_open {false};
+
+int64_t NowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+bool DefragEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_DEFRAG");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 } // namespace
 
 bool GraphicContext::CreateAllocator() {
@@ -92,6 +119,40 @@ bool GraphicContext::CreateAllocator() {
 		return false;
 	}
 
+	// The texture pool: the video memory type a sampled texture takes, in 64 MB blocks (small
+	// blocks empty, and are freed, sooner than VMA's 256 MB ones).
+	if (DefragEnabled() &&
+	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+		VkImageCreateInfo sample {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		sample.imageType   = VK_IMAGE_TYPE_2D;
+		sample.format      = VK_FORMAT_R8G8B8A8_UNORM;
+		sample.extent      = {256, 256, 1};
+		sample.mipLevels   = 1;
+		sample.arrayLayers = 1;
+		sample.samples     = VK_SAMPLE_COUNT_1_BIT;
+		sample.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		sample.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+		               VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo sample_alloc {};
+		sample_alloc.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		uint32_t type              = UINT32_MAX;
+		if (vmaFindMemoryTypeIndexForImageInfo(allocator, &sample, &sample_alloc, &type) ==
+		    VK_SUCCESS) {
+			VmaPoolCreateInfo pool {};
+			pool.memoryTypeIndex = type;
+			pool.blockSize       = 64ull << 20u;
+			if (vmaCreatePool(allocator, &pool, &g_texture_pool) == VK_SUCCESS) {
+				g_texture_pool_type = type;
+				vmaSetPoolName(allocator, g_texture_pool, "Kyty texture pool");
+				LOGF("Texture pool: memory type %u, 64 MB blocks (defragmented when they hold much "
+				     "more than is allocated)\n",
+				     type);
+			} else {
+				g_texture_pool = nullptr;
+			}
+		}
+	}
+
 	// A system whose commit limit is nearly used up stops the session later with "Out of memory"
 	// (ISSUES #21); say so at start. KYTY_COMMIT_WARN_MB sets the threshold (default 16 GB).
 	uint64_t commit_limit = 0;
@@ -125,6 +186,29 @@ void GraphicContext::DestroyAllocator() {
 	}
 	DestroyImagePool(allocator);
 	FlushBufferReclaimer();
+	if (g_defrag_context != nullptr) {
+		if (g_defrag_pass_open) {
+			for (uint32_t i = 0; i < g_defrag_pass.moveCount; i++) {
+				g_defrag_pass.pMoves[i].operation = VMA_DEFRAGMENTATION_MOVE_OPERATION_IGNORE;
+			}
+			(void)vmaEndDefragmentationPass(allocator, g_defrag_context, &g_defrag_pass);
+			g_defrag_pass_open = false;
+		}
+		vmaEndDefragmentation(allocator, g_defrag_context, nullptr);
+		g_defrag_context = nullptr;
+		g_defrag_open    = false;
+	}
+	if (g_texture_pool != nullptr) {
+		VmaStatistics stats {};
+		vmaGetPoolStatistics(allocator, g_texture_pool, &stats);
+		if (stats.allocationCount == 0) {
+			vmaDestroyPool(allocator, g_texture_pool);
+			g_texture_pool = nullptr;
+		} else {
+			LOGF("Texture pool: %u allocations still alive at shutdown; pool kept\n",
+			     stats.allocationCount);
+		}
+	}
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -218,6 +302,20 @@ uint64_t GraphicContext::MemoryShortfall() const {
 				              b.statistics.blockCount,
 				              static_cast<uint64_t>(b.statistics.allocationBytes >> 20u),
 				              b.statistics.allocationCount);
+				heaps += line;
+			}
+			if (g_texture_pool != nullptr) {
+				VmaStatistics pool {};
+				vmaGetPoolStatistics(allocator, g_texture_pool, &pool);
+				char line[256];
+				std::snprintf(line, sizeof(line),
+				              " texture pool: blocks=%" PRIu64 "MB allocated=%" PRIu64
+				              "MB/%u, defragmentation moved %" PRIu64 " MB (%" PRIu64
+				              " images) and freed %" PRIu64 " MB so far;",
+				              static_cast<uint64_t>(pool.blockBytes >> 20u),
+				              static_cast<uint64_t>(pool.allocationBytes >> 20u),
+				              pool.allocationCount, g_defrag_moved_bytes >> 20u,
+				              g_defrag_moved_images, g_defrag_freed_bytes >> 20u);
 				heaps += line;
 			}
 			LOGF("VRAM (10 s): device %" PRIu64 " MB of %" PRIu64 " MB budget (%" PRIu64
@@ -348,6 +446,7 @@ struct PooledImage {
 	VkImage                  image      = VK_NULL_HANDLE;
 	VmaAllocation            allocation = nullptr;
 	uint64_t                 bytes      = 0;
+	bool                     in_texture_pool = false;
 };
 std::mutex               g_image_pool_mutex;
 std::vector<PooledImage> g_image_pool;
@@ -423,7 +522,7 @@ bool GraphicContext::RoomForHostPlacedImages() const {
 	}
 	const auto mark   = TextureHostMarkPercent();
 	const auto budget = GetTotalMemoryBudget();
-	return mark > 15 && budget != 0 && GetDeviceMemoryUsage() < budget / 100 * (mark - 15);
+	return mark > 15 && budget != 0 && GetDeviceMemoryInUse() < budget / 100 * (mark - 15);
 }
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
@@ -437,12 +536,15 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		                              static_cast<uint32_t>(image_info.samples), image_info.usage);
 		std::scoped_lock lock(g_image_pool_mutex);
 		for (auto it = g_image_pool.begin(); it != g_image_pool.end(); ++it) {
-			if (it->key != key) {
+			// Only a movable image may take memory of the texture pool, whose owners the
+			// defragmentation must know.
+			if (it->key != key || (it->in_texture_pool && !image.movable)) {
 				continue;
 			}
-			image.image       = it->image;
-			image.allocation  = it->allocation;
-			image.host_placed = false; // the pool keeps only video-memory images
+			image.image           = it->image;
+			image.allocation      = it->allocation;
+			image.host_placed     = false; // the pool keeps only video-memory images
+			image.in_texture_pool = it->in_texture_pool;
 			g_image_pool_bytes -= it->bytes;
 			g_image_pool.erase(it);
 			if (++g_image_pool_hits % 1024u == 1u) {
@@ -463,16 +565,25 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		}
 	}
 
+	// The image's memory requirements, for the dedicated and texture pool choices.
+	uint64_t required_size = 0;
+	uint32_t required_bits = 0;
+	if (image_info.pNext == nullptr) {
+		vk::DeviceImageMemoryRequirements requirements_info {};
+		requirements_info.pCreateInfo = &image_info;
+		const auto requirements = device.getImageMemoryRequirements(requirements_info);
+		required_size = requirements.memoryRequirements.size;
+		required_bits = requirements.memoryRequirements.memoryTypeBits;
+	}
+
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 	// From the Demon's Souls fork (small_video_memory): on a card whose budget cannot hold the
 	// game's working set with the driver's own share (12 GB cards: ~11.5 GB budget, ~3.4 GB of it
 	// the driver's), an image that is only sampled and copied -- a texture, not a render target,
-	// depth or storage image -- goes to the memory type without flags once half the budget is in
-	// use. The driver keeps it in video memory while there is room and in system memory after, so
-	// the targets the GPU writes every frame keep video memory, and running short no longer makes
-	// the caches evict and recreate the working set (the frame rate fell from 20 to 3-7 fps at
-	// that point in every run). KYTY_TEXTURE_HOST_PLACEMENT=0 keeps every image device-local.
+	// depth or storage image -- goes to system memory once video memory use passes a mark
+	// (TextureHostMarkPercent), so the targets the GPU writes every frame keep video memory.
+	// KYTY_TEXTURE_HOST_PLACEMENT=0 keeps every image device-local.
 	static const bool host_placement = [] {
 		const char* value = std::getenv("KYTY_TEXTURE_HOST_PLACEMENT");
 		return value == nullptr || value[0] != '0';
@@ -487,59 +598,89 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	    !(image_info.usage & (vk::ImageUsageFlagBits::eColorAttachment |
 	                          vk::ImageUsageFlagBits::eDepthStencilAttachment)) &&
 	    (block || !(image_info.usage & vk::ImageUsageFlagBits::eStorage));
-	const uint64_t host_mark_pct = TextureHostMarkPercent();
+	bool past_mark = false;
 	if (host_placement && texture && CanReportMemoryUsage()) {
 		const auto budget = GetTotalMemoryBudget();
-		if (budget < (uint64_t {12} << 30u) &&
-		    GetDeviceMemoryUsage() >= budget / 100 * host_mark_pct) {
-			alloc_info.requiredFlags = 0;
-			alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		past_mark         = budget < (uint64_t {12} << 30u) &&
+		            GetDeviceMemoryUsage() >= budget / 100 * TextureHostMarkPercent();
+	}
+
+	// KYTY_IMAGE_DEDICATED_MB (default 16; 0 = off): an image of at least this size gets its own
+	// memory allocation instead of a share of a VMA block, so freeing it returns the memory.
+	static const uint64_t dedicated_bytes = [] {
+		const char* value = std::getenv("KYTY_IMAGE_DEDICATED_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {16}) << 20u;
+	}();
+	const bool dedicated = dedicated_bytes != 0 && required_size >= dedicated_bytes;
+	const bool pooled    = g_texture_pool != nullptr && image.movable && !dedicated &&
+	                    required_size != 0 && image_info.samples == vk::SampleCountFlagBits::e1 &&
+	                    (required_bits & (1u << g_texture_pool_type)) != 0;
+
+	const auto create = [&](const VmaAllocationCreateInfo& info) {
+		vk::Image::CType native_image = VK_NULL_HANDLE;
+		const auto       created      = static_cast<vk::Result>(vmaCreateImage(
+            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &info,
+            &native_image, &image.allocation, nullptr));
+		if (created == vk::Result::eSuccess) {
+			image.image           = native_image;
+			image.in_texture_pool = info.pool != nullptr && info.pool == g_texture_pool;
+		}
+		return created;
+	};
+	auto device_info = alloc_info;
+	if (dedicated) {
+		device_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+	}
+	if (pooled) {
+		device_info.pool = g_texture_pool;
+	}
+	auto result = vk::Result::eErrorOutOfDeviceMemory;
+	if (past_mark) {
+		// Past the mark a texture still goes to video memory when it fits in memory already
+		// allocated (the space freed images left in blocks other images keep alive), without
+		// allocating more; otherwise to system memory. Measured by the blocks alone, video memory
+		// read 81 % with 2.2 GB of it free inside them, and the textures went to system memory.
+		auto existing = device_info;
+		existing.flags &= ~static_cast<VmaAllocationCreateFlags>(
+		    VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT);
+		existing.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+		result = create(existing);
+		if (result != vk::Result::eSuccess && pooled) {
+			existing.pool = nullptr;
+			result        = create(existing);
+		}
+		if (result != vk::Result::eSuccess) {
+			auto host          = alloc_info;
+			host.requiredFlags = 0;
+			host.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			result             = create(host);
 			static std::atomic<uint64_t> placed {0};
 			if (placed.fetch_add(1, std::memory_order_relaxed) % 1024u == 0u) {
 				LOGF("Textures placed by the driver (video or system memory): %" PRIu64 "\n",
 				     placed.load(std::memory_order_relaxed));
 			}
 		}
-	}
-
-	// KYTY_IMAGE_DEDICATED_MB (default 16; 0 = off): an image of at least this size gets its own
-	// memory allocation instead of a share of a VMA block. Freed images left their blocks alive
-	// while any other image in them lived: after a return to the title menu the cache had
-	// dropped 3 GB of textures and video memory use fell by 0.36 GB.
-	static const uint64_t dedicated_bytes = [] {
-		const char* value = std::getenv("KYTY_IMAGE_DEDICATED_MB");
-		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {16}) << 20u;
-	}();
-	if (dedicated_bytes != 0 && image_info.pNext == nullptr) {
-		vk::DeviceImageMemoryRequirements requirements_info {};
-		requirements_info.pCreateInfo = &image_info;
-		const auto requirements = device.getImageMemoryRequirements(requirements_info);
-		if (requirements.memoryRequirements.size >= dedicated_bytes) {
-			alloc_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+	} else {
+		result = create(device_info);
+		if (result != vk::Result::eSuccess && pooled) {
+			device_info.pool = nullptr;
+			result           = create(device_info);
 		}
-	}
-
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	auto             result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	if (result != vk::Result::eSuccess && ImagePoolEnabled()) {
-		{
-			std::scoped_lock lock(g_image_pool_mutex);
-			TrimImagePoolLocked(allocator, 0);
+		if (result != vk::Result::eSuccess && ImagePoolEnabled()) {
+			{
+				std::scoped_lock lock(g_image_pool_mutex);
+				TrimImagePoolLocked(allocator, 0);
+			}
+			result = create(device_info);
 		}
-		result = static_cast<vk::Result>(
-		    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-		                   &alloc_info, &native_image, &image.allocation, nullptr));
 	}
 	if (result != vk::Result::eSuccess) {
 		// The device heap is full. The guest has a unified 16 GB pool, so the image is
 		// real; place it in host memory and pay in bandwidth rather than fail.
-		alloc_info.requiredFlags  = 0;
-		alloc_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-		result                    = static_cast<vk::Result>(vmaCreateImage(
-            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-            &alloc_info, &native_image, &image.allocation, nullptr));
+		auto host           = alloc_info;
+		host.requiredFlags  = 0;
+		host.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+		result              = create(host);
 		static std::atomic<uint32_t> spill_count {0};
 		if (const auto seen = spill_count.fetch_add(1, std::memory_order_relaxed); seen < 32) {
 			LOGF("Image spilled to host memory (%u): %ux%ux%u layers=%u levels=%u format=%d -> %s\n",
@@ -548,8 +689,9 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			     static_cast<int>(image_info.format), vk::to_string(result).c_str());
 		}
 	}
-	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
+		image.image      = nullptr;
+		image.allocation = nullptr;
 		LogMemoryBudget();
 		return false;
 	}
@@ -582,6 +724,167 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	return true;
 }
 
+uint64_t GraphicContext::GetDeviceMemoryInUse() const {
+	const auto usage = GetDeviceMemoryUsage();
+	if (allocator == nullptr || usage == 0) {
+		return usage;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	uint64_t free = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		if (physical_device_memory_properties.memoryHeaps[heap].flags &
+		    vk::MemoryHeapFlagBits::eDeviceLocal) {
+			const auto& stats = budgets[heap].statistics;
+			free += stats.blockBytes > stats.allocationBytes ? stats.blockBytes - stats.allocationBytes
+			                                                 : 0;
+		}
+	}
+	return usage - std::min(usage, free);
+}
+
+bool GraphicContext::DeviceMemoryInUseAtLeast(uint32_t percent) const {
+	if (MemoryShortfall() != 0) {
+		return true;
+	}
+	if (!CanReportMemoryUsage()) {
+		return false;
+	}
+	const auto budget = GetTotalMemoryBudget();
+	return budget != 0 && GetDeviceMemoryInUse() / 100 >= budget / 100 * percent / 100;
+}
+
+bool GraphicContext::BindImageMemory(vk::Image image, VmaAllocation allocation) const {
+	return vmaBindImageMemory(allocator, allocation, image) == VK_SUCCESS;
+}
+
+void GraphicContext::SetImageOwner(const VulkanImage& image, uint64_t owner) const {
+	if (allocator != nullptr && image.allocation != nullptr && image.in_texture_pool) {
+		vmaSetAllocationUserData(allocator, image.allocation,
+		                         reinterpret_cast<void*>(static_cast<uintptr_t>(owner)));
+	}
+}
+
+static void FinishTextureDefrag(VmaAllocator allocator) {
+	VmaDefragmentationStats stats {};
+	vmaEndDefragmentation(allocator, g_defrag_context, &stats);
+	g_defrag_context   = nullptr;
+	g_defrag_pass_open = false;
+	g_defrag_open      = false;
+	g_defrag_next_ms   = NowMs() + 5000;
+	g_defrag_moved_bytes += stats.bytesMoved;
+	g_defrag_moved_images += stats.allocationsMoved;
+	g_defrag_freed_bytes += stats.bytesFreed;
+	VmaStatistics pool {};
+	vmaGetPoolStatistics(allocator, g_texture_pool, &pool);
+	LOGF("Texture defragmentation: %" PRIu64 " MB moved (%u images) in %u passes, %" PRIu64
+	     " MB of blocks freed; texture pool now %" PRIu64 " MB of blocks, %" PRIu64
+	     " MB allocated\n",
+	     static_cast<uint64_t>(stats.bytesMoved >> 20u), stats.allocationsMoved, g_defrag_passes,
+	     static_cast<uint64_t>(stats.bytesFreed >> 20u), static_cast<uint64_t>(pool.blockBytes >> 20u),
+	     static_cast<uint64_t>(pool.allocationBytes >> 20u));
+}
+
+bool GraphicContext::BeginTextureDefragPass(std::vector<TextureDefragMove>& moves) {
+	moves.clear();
+	if (g_texture_pool == nullptr || allocator == nullptr || g_defrag_pass_open) {
+		return false;
+	}
+	if (g_defrag_context == nullptr) {
+		const auto now = NowMs();
+		if (now < g_defrag_next_ms) {
+			return false;
+		}
+		g_defrag_next_ms = now + 1000;
+		// KYTY_IMAGE_DEFRAG_MB (default 128): free space inside the texture pool's blocks, at least
+		// 15 % of them, that starts a defragmentation.
+		static const uint64_t min_free = [] {
+			const char* value = std::getenv("KYTY_IMAGE_DEFRAG_MB");
+			return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {128}) << 20u;
+		}();
+		VmaStatistics pool {};
+		vmaGetPoolStatistics(allocator, g_texture_pool, &pool);
+		const uint64_t free =
+		    pool.blockBytes > pool.allocationBytes ? pool.blockBytes - pool.allocationBytes : 0;
+		if (free < min_free || free * 100 < pool.blockBytes * 15) {
+			return false;
+		}
+		VmaDefragmentationInfo info {};
+		info.flags                 = VMA_DEFRAGMENTATION_FLAG_ALGORITHM_BALANCED_BIT;
+		info.pool                  = g_texture_pool;
+		info.maxBytesPerPass       = 128ull << 20u;
+		info.maxAllocationsPerPass = 128;
+		if (vmaBeginDefragmentation(allocator, &info, &g_defrag_context) != VK_SUCCESS) {
+			g_defrag_context = nullptr;
+			return false;
+		}
+		g_defrag_open   = true;
+		g_defrag_passes = 0;
+		{
+			// Recycled images of the pool have no owner and could be in a pass's moves; while a
+			// defragmentation runs none are kept (DeleteImage destroys them).
+			std::scoped_lock lock(g_image_pool_mutex);
+			for (auto it = g_image_pool.begin(); it != g_image_pool.end();) {
+				if (it->in_texture_pool) {
+					vmaDestroyImage(allocator, it->image, it->allocation);
+					g_image_pool_bytes -= it->bytes;
+					it = g_image_pool.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+		LOGF("Texture defragmentation: begins, %" PRIu64 " MB free in %" PRIu64
+		     " MB of texture pool blocks\n",
+		     free >> 20u, static_cast<uint64_t>(pool.blockBytes >> 20u));
+	}
+	g_defrag_pass       = {};
+	const auto begun    = vmaBeginDefragmentationPass(allocator, g_defrag_context, &g_defrag_pass);
+	if (begun == VK_SUCCESS) {
+		FinishTextureDefrag(allocator);
+		return false;
+	}
+	if (begun != VK_INCOMPLETE || g_defrag_pass.moveCount == 0 || ++g_defrag_passes > 512) {
+		if (begun == VK_INCOMPLETE) {
+			for (uint32_t i = 0; i < g_defrag_pass.moveCount; i++) {
+				g_defrag_pass.pMoves[i].operation = VMA_DEFRAGMENTATION_MOVE_OPERATION_IGNORE;
+			}
+			if (vmaEndDefragmentationPass(allocator, g_defrag_context, &g_defrag_pass) ==
+			        VK_INCOMPLETE &&
+			    g_defrag_passes <= 512) {
+				return false; // the next frame asks for the next pass
+			}
+		}
+		FinishTextureDefrag(allocator);
+		return false;
+	}
+	g_defrag_pass_open = true;
+	moves.resize(g_defrag_pass.moveCount);
+	for (uint32_t i = 0; i < g_defrag_pass.moveCount; i++) {
+		VmaAllocationInfo info {};
+		vmaGetAllocationInfo(allocator, g_defrag_pass.pMoves[i].srcAllocation, &info);
+		moves[i].destination = g_defrag_pass.pMoves[i].dstTmpAllocation;
+		moves[i].owner       = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(info.pUserData));
+		moves[i].copy        = false;
+	}
+	return true;
+}
+
+void GraphicContext::EndTextureDefragPass(const std::vector<TextureDefragMove>& moves) {
+	if (g_defrag_context == nullptr || !g_defrag_pass_open) {
+		return;
+	}
+	for (uint32_t i = 0; i < g_defrag_pass.moveCount; i++) {
+		g_defrag_pass.pMoves[i].operation = i < moves.size() && moves[i].copy
+		                                        ? VMA_DEFRAGMENTATION_MOVE_OPERATION_COPY
+		                                        : VMA_DEFRAGMENTATION_MOVE_OPERATION_IGNORE;
+	}
+	g_defrag_pass_open = false;
+	if (vmaEndDefragmentationPass(allocator, g_defrag_context, &g_defrag_pass) != VK_INCOMPLETE) {
+		FinishTextureDefrag(allocator);
+	}
+}
+
 void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
@@ -600,7 +903,13 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		image.host_placed = false;
 		return;
 	}
-	if (ImagePoolEnabled()) {
+	const bool in_texture_pool = image.in_texture_pool;
+	image.in_texture_pool      = false;
+	if (in_texture_pool) {
+		// No owner any more: a defragmentation leaves it in place.
+		vmaSetAllocationUserData(allocator, image.allocation, nullptr);
+	}
+	if (ImagePoolEnabled() && !(in_texture_pool && g_defrag_open.load())) {
 		const uint64_t limit =
 		    MemoryShortfall() != 0 ? 0 : std::min<uint64_t>(512ull << 20u, GetTotalMemoryBudget() / 32);
 		VmaAllocationInfo allocation_info {};
@@ -609,7 +918,8 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 			std::scoped_lock lock(g_image_pool_mutex);
 			g_image_pool.push_back({ImagePoolKey(image.flags, image.image_type, image.format, image.extent,
 			                                     image.mip_levels, image.layers, image.samples, image.usage),
-			                        image.image, image.allocation, allocation_info.size});
+			                        image.image, image.allocation, allocation_info.size,
+			                        in_texture_pool});
 			g_image_pool_bytes += allocation_info.size;
 			TrimImagePoolLocked(allocator, limit);
 			image.image      = nullptr;

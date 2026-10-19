@@ -75,6 +75,13 @@ public:
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	// Texture defragmentation: records a copy of the whole image into destination (created like
+	// the backing image and bound to its new memory) and makes it the backing image. The previous
+	// image and its views are handed back; they stay valid (and in their layout) for work recorded
+	// before, and the caller destroys them once the GPU is done. False (nothing recorded) when the
+	// image cannot be moved this way.
+	[[nodiscard]] bool Relocate(vk::Image destination, std::vector<CachedImageView>& old_views,
+	                            vk::Image& old_image);
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
@@ -201,6 +208,8 @@ public:
 	// Referenced by a bindless table slot: the collector keeps it, and unregistering it tells the
 	// table (TextureCache::on_bindless_unregister) to repoint the slot.
 	bool             bindless_pinned = false;
+	// In a texture defragmentation pass: its destruction waits for the pass to end.
+	bool             relocating      = false;
 	ImageId          self_id {}; // set by TextureCache::InsertImage
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;

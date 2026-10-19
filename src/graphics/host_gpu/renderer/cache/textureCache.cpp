@@ -315,6 +315,9 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	m_slot_images[id].self_id = id;
+	// The texture defragmentation finds the image of a moved allocation by this.
+	m_graphics.SetImageOwner(m_slot_images[id].backing,
+	                         (static_cast<uint64_t>(id.generation) << 32u) | id.index);
 	Profiler::Add(Profiler::Counter::ImagesCreated);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
@@ -424,6 +427,11 @@ void TextureCache::DeleteImage(ImageId id) {
 
 void TextureCache::ReleaseImage(ImageId id) {
 	const auto* image = m_slot_images.try_get(id);
+	if (image != nullptr && image->relocating) {
+		// Its memory is in a defragmentation pass, which must end before it is freed.
+		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
+		return;
+	}
 	if (image != nullptr && on_image_release && on_image_release(*image)) {
 		// Work recorded with the repointed slot runs until the current tick is done.
 		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
@@ -2684,6 +2692,7 @@ void TextureCache::RunGarbageCollector() {
 		});
 	}
 	RelieveDeviceMemory(clock);
+	DefragmentStep(clock);
 	if (CollectableMemory() < m_trigger_gc_memory) {
 		return;
 	}
@@ -2944,13 +2953,13 @@ void TextureCache::RelieveDeviceMemory(uint64_t clock) {
 	// exist only on the GPU, one being written back, or a small render target (glyphs, cached UI).
 	const auto can_free = [&](ImageId id, const Image& image) {
 		return image.registered && !image.depth_id && !image.IsGpuModified() &&
-		       !m_evicting.contains(id) && !image.binding.is_target &&
+		       !image.relocating && !m_evicting.contains(id) && !image.binding.is_target &&
 		       !(image.usage.render_target && image.info.extent.width <= 1024 &&
 		         image.info.extent.height <= 1024) &&
 		       image.frame_accessed_last + 4 <= frame;
 	};
 	if (!m_bindless_evictable.empty() &&
-	    m_graphics.DeviceMemoryAtLeast(GraphicContext::BindlessEvictPercent())) {
+	    m_graphics.DeviceMemoryInUseAtLeast(GraphicContext::BindlessEvictPercent())) {
 		uint64_t freed  = 0;
 		uint64_t images = 0;
 		for (auto it = m_bindless_evictable.begin();
@@ -2990,6 +2999,135 @@ void TextureCache::RelieveDeviceMemory(uint64_t clock) {
 		     " MB), %" PRIu64 " textures moved back from system memory (%" PRIu64 " MB) so far\n",
 		     m_relief_bindless_images, m_relief_bindless_bytes >> 20u, m_relief_moved_images,
 		     m_relief_moved_bytes >> 20u);
+	}
+}
+
+// Texture defragmentation (GraphicContext::BeginTextureDefragPass). Textures live in a pool of
+// their own; when its blocks hold much more than is allocated in them (the space freed textures
+// left: 2.2 GB of 7.8 GB in a run, 2026-10-19, and textures went to system memory with it), VMA
+// lists moves that pack them into fewer blocks. A pass, over a few frames:
+// 0. each moved texture is created again at its destination, copied there on the GPU and made the
+//    backing image (Image::Relocate); work recorded before keeps the old image and views. Images
+//    that cannot move now stay where they are.
+// 1. once the copies are done, the bindless slots holding old views get the new ones;
+// 2. a tick later nothing samples the old ones: they are destroyed and the pass ends, which
+//    frees the blocks it emptied.
+// Every image of the pass, moved or not, is kept alive until then (VMA requires it).
+void TextureCache::DefragmentStep(uint64_t clock) {
+	switch (m_defrag_phase) {
+		case 0: {
+			if (m_defrag_clock == clock) {
+				return; // a pass at most per frame
+			}
+			m_defrag_clock = clock;
+			if (!m_graphics.BeginTextureDefragPass(m_defrag_moves)) {
+				return;
+			}
+			for (auto& move: m_defrag_moves) {
+				if (move.owner == 0) {
+					continue;
+				}
+				const ImageId id {static_cast<uint32_t>(move.owner),
+				                  static_cast<uint32_t>(move.owner >> 32u)};
+				auto* image = m_slot_images.try_get(id);
+				if (image == nullptr || image->relocating) {
+					continue;
+				}
+				image->relocating = true;
+				m_defrag_guarded.push_back(id);
+				// Only a texture at rest: not a target, not bound to the draw being prepared, not
+				// being written back or downloaded.
+				if (!image->registered || image->binding.is_target || image->binding.is_bound ||
+				    image->usage.render_target || image->usage.depth_target ||
+				    image->usage.video_out || image->info.IsDepth() || m_evicting.contains(id) ||
+				    m_download_images.contains(id) || image->backing.host_placed) {
+					continue;
+				}
+				const auto&         backing = image->backing;
+				vk::ImageCreateInfo create {};
+				create.flags         = backing.flags;
+				create.imageType     = backing.image_type;
+				create.format        = backing.format;
+				create.extent        = backing.extent;
+				create.mipLevels     = backing.mip_levels;
+				create.arrayLayers   = backing.layers;
+				create.samples       = static_cast<vk::SampleCountFlagBits>(backing.samples);
+				create.tiling        = vk::ImageTiling::eOptimal;
+				create.usage         = backing.usage;
+				create.initialLayout = vk::ImageLayout::eUndefined;
+				vk::Image destination = nullptr;
+				if (m_graphics.device.createImage(&create, nullptr, &destination) !=
+				    vk::Result::eSuccess) {
+					continue;
+				}
+				Relocation relocation {id};
+				if (!m_graphics.BindImageMemory(destination, move.destination) ||
+				    !image->Relocate(destination, relocation.old_views, relocation.old_image)) {
+					m_graphics.device.destroyImage(destination, nullptr);
+					continue;
+				}
+				move.copy = true;
+				m_relocations.push_back(std::move(relocation));
+			}
+			if (m_relocations.empty()) {
+				m_graphics.EndTextureDefragPass(m_defrag_moves);
+				for (const auto id: m_defrag_guarded) {
+					if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+						image->relocating = false;
+					}
+				}
+				m_defrag_guarded.clear();
+				return;
+			}
+			m_defrag_tick  = m_scheduler.CurrentTick();
+			m_defrag_phase = 1;
+			return;
+		}
+		case 1: {
+			if (!m_scheduler.IsFree(m_defrag_tick)) {
+				return;
+			}
+			std::vector<std::pair<vk::ImageView, vk::ImageView>> views;
+			for (const auto& relocation: m_relocations) {
+				auto* image = m_slot_images.try_get(relocation.id);
+				if (image == nullptr) {
+					continue;
+				}
+				for (const auto& old_view: relocation.old_views) {
+					views.emplace_back(old_view.view, image->FindView(old_view.info));
+				}
+			}
+			if (on_views_replaced && !views.empty()) {
+				on_views_replaced(views);
+			}
+			m_defrag_tick  = m_scheduler.CurrentTick();
+			m_defrag_phase = 2;
+			return;
+		}
+		default: {
+			if (!m_scheduler.IsFree(m_defrag_tick)) {
+				return;
+			}
+			for (auto& relocation: m_relocations) {
+				for (const auto& old_view: relocation.old_views) {
+					if (old_view.view != nullptr) {
+						m_graphics.device.destroyImageView(old_view.view, nullptr);
+					}
+				}
+				m_graphics.device.destroyImage(relocation.old_image, nullptr);
+			}
+			m_relocations.clear();
+			m_graphics.EndTextureDefragPass(m_defrag_moves);
+			m_defrag_moves.clear();
+			for (const auto id: m_defrag_guarded) {
+				if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+					image->relocating = false;
+				}
+			}
+			m_defrag_guarded.clear();
+			m_defrag_phase = 0;
+			return;
+		}
 	}
 }
 

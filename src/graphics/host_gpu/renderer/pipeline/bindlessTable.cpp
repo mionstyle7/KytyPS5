@@ -679,6 +679,19 @@ bool BindlessTable::ReleaseViews(std::span<const vk::ImageView> views) {
 	return held;
 }
 
+void BindlessTable::ReplaceViews(std::span<const std::pair<vk::ImageView, vk::ImageView>> views) {
+	for (const auto& [old_view, new_view]: views) {
+		const auto found = m_view_slots.find(static_cast<VkImageView>(old_view));
+		if (found == m_view_slots.end() || new_view == nullptr) {
+			continue;
+		}
+		const auto slots = found->second;
+		for (const auto& [binding, slot]: slots) {
+			WriteSlot(binding, slot, new_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+		}
+	}
+}
+
 void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot) {
 	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
 	translation[heap.region + key] = slot;
