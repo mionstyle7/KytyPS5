@@ -2450,12 +2450,29 @@ struct PipelineCache::ProgramCache {
 	                           uint32_t wave_size, const std::vector<uint32_t>*& expanded,
 	                           uint64_t& expanded_hash) {
 		std::string reason;
+		// Page by page through the clean-page cache: a call table or callee spanning pages took
+		// the guarded backing read, a kernel call each, for every dispatch.
+		GuestPageReadCache page_cache;
+		const auto         read_words = [&page_cache](uint64_t address, std::span<uint32_t> words) {
+			size_t done = 0;
+			while (done < words.size()) {
+				const uint64_t at       = address + done * sizeof(uint32_t);
+				const uint64_t page_end = Common::AlignDown(at, TRACKER_PAGE_SIZE) + TRACKER_PAGE_SIZE;
+				size_t         count    = static_cast<size_t>((page_end - at) / sizeof(uint32_t));
+				count = std::clamp<size_t>(count, 1, words.size() - done);
+				if (!ReadShaderGuestMemoryRaw(&page_cache, at, words.subspan(done, count))) {
+					return false;
+				}
+				done += count;
+			}
+			return true;
+		};
 		// A stage record being stored keeps every word the expansion read (its proof covers the
 		// callee code and the call tables as well as the SRT).
 		if (!function_expander.ExpandKept(
 		        params.code, params.Base(), user_data,
-		        [this](uint64_t address, std::span<uint32_t> words) {
-			        const bool ok = ReadShaderGuestMemoryRaw(nullptr, address, words);
+		        [this, &read_words](uint64_t address, std::span<uint32_t> words) {
+			        const bool ok = read_words(address, words);
 			        if (expansion_log != nullptr) {
 				        if (ok) {
 					        expansion_log->Add(address, words.data(),

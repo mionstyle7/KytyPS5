@@ -654,11 +654,23 @@ struct ShaderFunctionExpander::Impl {
 		uint64_t              hash = 0; // HashExpansion(code)
 		uint64_t              reads_epoch = 0; // the epoch `reads` were last found unchanged in
 	};
+	// The call sites resolved in an epoch, for the user-data registers they depended on: within
+	// the epoch the call tables and loaded pointers are taken as unchanged, as the callee code is.
+	struct Resolved {
+		uint64_t                                  epoch           = 0;
+		uint64_t                                  base            = 0;
+		uint32_t                                  wave_size       = 0;
+		size_t                                    user_data_count = 0;
+		std::vector<std::pair<uint32_t, uint32_t>> dependencies; // (register, value)
+		std::vector<CallSite>                     sites;
+	};
 	struct Shader {
 		ShaderAnalysis         analysis;
 		std::vector<Expansion> expansions; // most recent last
 		uint64_t               code_epoch = 0; // the epoch the code was last compared in
+		std::vector<Resolved>  resolved;   // most recent last
 	};
+	static constexpr size_t MaxResolved = 16;
 	static constexpr size_t MaxExpansions = 8;
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
@@ -737,8 +749,47 @@ bool ShaderFunctionExpander::ExpandKept(std::span<const uint32_t> code, uint64_t
 	auto&                  sites = m_impl->sites;
 	std::set<uint32_t>     dependencies;
 	sites.clear();
-	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
-		return false;
+	// Call resolution read every call table again for each dispatch (~8% of the GPU thread in
+	// gameplay, 2026-10-19, most of it guest reads through the kernel): within an epoch the
+	// sites resolved for the same values of the user-data registers they depend on are reused.
+	const Impl::Resolved* memo = nullptr;
+	if (epoch != 0) {
+		for (auto it = shader.resolved.rbegin(); it != shader.resolved.rend(); ++it) {
+			if (it->epoch == epoch && it->base == base && it->wave_size == wave_size &&
+			    it->user_data_count == user_data.size() &&
+			    std::all_of(it->dependencies.begin(), it->dependencies.end(), [&](const auto& dep) {
+				    return dep.first < user_data.size() && user_data[dep.first] == dep.second;
+			    })) {
+				memo = &*it;
+				break;
+			}
+		}
+	}
+	if (memo != nullptr) {
+		sites = memo->sites;
+		for (const auto& dep: memo->dependencies) {
+			dependencies.insert(dep.first);
+		}
+	} else {
+		if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
+			return false;
+		}
+		if (epoch != 0) {
+			std::erase_if(shader.resolved, [&](const Impl::Resolved& old) { return old.epoch != epoch; });
+			if (shader.resolved.size() >= Impl::MaxResolved) {
+				shader.resolved.erase(shader.resolved.begin());
+			}
+			Impl::Resolved entry;
+			entry.epoch           = epoch;
+			entry.base            = base;
+			entry.wave_size       = wave_size;
+			entry.user_data_count = user_data.size();
+			for (const auto reg: dependencies) {
+				entry.dependencies.emplace_back(reg, reg < user_data.size() ? user_data[reg] : 0u);
+			}
+			entry.sites = sites;
+			shader.resolved.push_back(std::move(entry));
+		}
 	}
 	for (auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
