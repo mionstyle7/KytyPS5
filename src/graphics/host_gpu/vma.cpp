@@ -393,9 +393,21 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	    !(image_info.usage & (vk::ImageUsageFlagBits::eColorAttachment |
 	                          vk::ImageUsageFlagBits::eDepthStencilAttachment)) &&
 	    (block || !(image_info.usage & vk::ImageUsageFlagBits::eStorage));
+	// KYTY_TEXTURE_HOST_MARK_PCT (default 80): the share of the budget in use from which textures
+	// go to system memory. It was half the budget: on a 12 GB card (10.1 GB budget) every texture
+	// past 5 GB went to system memory while ~4.5 GB of video memory stayed unused, and an area
+	// sampling those textures over PCIe took ~350 ms a frame on the GPU (Wolverine, 15 -> 3 fps
+	// for over a minute, 2026-10-19). 80 % leaves ~2 GB for render targets and the driver; the
+	// caches start collecting at 90 % (MemoryShortfall).
+	static const uint64_t host_mark_pct = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_HOST_MARK_PCT");
+		const auto  pct   = value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {80};
+		return std::clamp<uint64_t>(pct, 10, 100);
+	}();
 	if (host_placement && texture && CanReportMemoryUsage()) {
 		const auto budget = GetTotalMemoryBudget();
-		if (budget < (uint64_t {12} << 30u) && GetDeviceMemoryUsage() >= budget / 2) {
+		if (budget < (uint64_t {12} << 30u) &&
+		    GetDeviceMemoryUsage() >= budget / 100 * host_mark_pct) {
 			alloc_info.requiredFlags = 0;
 			alloc_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 			static std::atomic<uint64_t> placed {0};
