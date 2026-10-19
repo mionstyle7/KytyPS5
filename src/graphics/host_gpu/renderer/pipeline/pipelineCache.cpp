@@ -3574,7 +3574,8 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs, bool may_defer) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool may_defer,
+    bool mesh_task) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -3598,6 +3599,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		key.vertex_shader_ids[i] = programs.vertex[i].id;
 	}
 	key.ps_shader_id            = ps_id;
+	if (mesh_task) {
+		// The task-shader variant of a mesh pipeline (meshArgsTask.h): a mesh pipeline has no
+		// second or third vertex-pipeline program, so the last slot tells the two apart.
+		EXIT_IF(key.vertex_shader_ids[2] != 0);
+		key.vertex_shader_ids[2] = 0x7a51000000000001ull;
+	}
 	auto& static_params         = key.static_params;
 	auto& rendering             = key.rendering;
 	rendering.color_count       = 0;
@@ -3803,7 +3810,8 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	auto build = PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input,
-	                                     vertex_info, ps_input_info, programs, static_params);
+	                                     vertex_info, ps_input_info, programs, static_params,
+	                                     mesh_task);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 	if (m_warmup != nullptr) {
 		// Pipeline warmup: built before play from an earlier session's record, or recorded now.

@@ -242,7 +242,8 @@ public:
 	                                 CommandBuffer&                         command,
 	                                 const ShaderPixelInputInfo*            ps_input_info,
 	                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                                 const GraphicsPrograms& programs, bool may_defer);
+	                                 const GraphicsPrograms& programs, bool may_defer,
+	                                 bool mesh_task = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -338,7 +339,8 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
                         std::span<const ShaderVertexInputInfo> vertex_info,
                         const ShaderPixelInputInfo*            ps_input_info,
                         const PipelineCache::GraphicsPrograms& programs,
-                        const PipelineStaticParameters&        static_params);
+                        const PipelineStaticParameters&        static_params,
+                        bool                                   mesh_task = false);
 // False for an embedded-fetch attribute whose components the shader only replaces by constants:
 // it gets no native vertex attribute, and its buffer is not bound for it.
 [[nodiscard]] bool VertexAttributeFetched(const ShaderVertexInputInfo& info, int attribute);

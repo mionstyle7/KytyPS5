@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/meshArgsTask.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -284,7 +285,8 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
                         std::span<const ShaderVertexInputInfo> vertex_info,
                         const ShaderPixelInputInfo*            ps_input_info,
                         const PipelineCache::GraphicsPrograms& programs,
-                        const PipelineStaticParameters&        static_params) {
+                        const PipelineStaticParameters&        static_params,
+                        bool                                   mesh_task) {
 	auto  owner     = std::make_unique<GraphicsPipelineBuild>();
 	auto& build     = *owner;
 	build.device    = graphics.device;
@@ -329,6 +331,14 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		build.stages[shader_stage_count++] = {.stage  = NativeShaderStage(vertex_info[i].logical_stage),
 		                                      .module = programs.vertex[i].module,
+		                                      .pName  = "main"};
+	}
+	if (mesh_task) {
+		// Mesh draws whose counts the GPU wrote: a task shader reads them (meshArgsTask.h).
+		const auto task = MeshArgsTaskModule(graphics);
+		EXIT_IF(!mesh || task == nullptr);
+		build.stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eTaskEXT,
+		                                      .module = task,
 		                                      .pName  = "main"};
 	}
 	if (rect_list) {
@@ -536,6 +546,9 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
 		pipeline.uses_bindless |= UsesBindless(*ps_input_info->stage.program);
+	}
+	if (mesh_task) {
+		graphics_stages |= vk::ShaderStageFlagBits::eTaskEXT;
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	const vk::PushConstantRange push_constants {graphics_stages, 0,

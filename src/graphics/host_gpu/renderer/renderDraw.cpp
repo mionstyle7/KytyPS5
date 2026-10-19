@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/meshArgsTask.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1302,10 +1303,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	// Glyphs and cached layers: drawn once into small targets (SmallColorTargetDraw).
 	may_defer = may_defer && !SmallColorTargetDraw(buffer.GetRegisters());
+	// GPU-written mesh counts: a task shader reads them in the render pass (meshArgsTask.h)
+	// instead of a copy into an indirect entry that ended the pass for every such draw.
+	const bool mesh_task = mesh_active && emit.gpu_args_address != 0 &&
+	                       MeshArgsTaskModule(m_context.GetGraphics()) != nullptr;
 	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs, may_defer);
+	    state.programs, may_defer, mesh_task);
 	if (deferred_pipeline == nullptr) {
 		return;
 	}
@@ -1327,25 +1332,45 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	// The task-shader variant's range includes the task stage, so every push names it too.
+	const auto mesh_push_stages = vk::ShaderStageFlagBits::eMeshEXT |
+	                              vk::ShaderStageFlagBits::eFragment |
+	                              (pipeline.push_constant_stages & vk::ShaderStageFlagBits::eTaskEXT);
 	if (mesh_active) {
 		// GPU arguments: dword 3 = 0xFFFFFFFF tells the fast-launch entry to read the start vertex
 		// at dwords 4-5's address + 8 (the shader's other draw dwords are unused then).
 		const bool     gpu_args = emit.gpu_args_address != 0;
+		// With the task shader, dwords 0-1 (unused by the mesh shader with GPU arguments) hold
+		// the host address of the arguments, which the task shader reads.
+		uint64_t args_host = 0;
+		if (mesh_task) {
+			auto& cache = m_context.GetBufferCache();
+			auto& args  = cache.GetBuffer(cache.FindBuffer(emit.gpu_args_address, 16u));
+			if (!args.HasDeviceAddress()) {
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1) < 8) {
+					LOGF("Mesh draw with GPU counts skipped: their buffer has no device address\n");
+				}
+				return;
+			}
+			args_host = args.BufferDeviceAddress() + args.Offset(emit.gpu_args_address);
+		}
 		const uint32_t draw_data[] {
-		    gpu_args ? 0u : draw.index_count,
-		    gpu_args ? 0u
-		             : draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
-		                                : emit.first_vertex,
+		    mesh_task ? static_cast<uint32_t>(args_host)
+		    : gpu_args ? 0u
+		               : draw.index_count,
+		    mesh_task ? static_cast<uint32_t>(args_host >> 32u)
+		    : gpu_args ? 0u
+		    : draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
+		                       : emit.first_vertex,
 		    gpu_args ? 0u : emit.first_instance,
 		    gpu_args ? 0xFFFFFFFFu : index_source.guest_element_size,
 		    static_cast<uint32_t>(gpu_args ? emit.gpu_args_address : index_source.address),
 		    static_cast<uint32_t>((gpu_args ? emit.gpu_args_address : index_source.address) >> 32u),
 		    0u};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-		vk_buffer.pushConstants(pipeline.pipeline_layout,
-		                        vk::ShaderStageFlagBits::eMeshEXT |
-		                            vk::ShaderStageFlagBits::eFragment,
-		                        0, sizeof(draw_data), draw_data);
+		vk_buffer.pushConstants(pipeline.pipeline_layout, mesh_push_stages, 0, sizeof(draw_data),
+		                        draw_data);
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1360,7 +1385,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	vk::Buffer     mesh_indirect_buffer = nullptr;
 	vk::DeviceSize mesh_indirect_offset = 0;
 	constexpr uint32_t MeshIndirectEntries = 4096;
-	if (mesh_active && emit.gpu_args_address != 0) {
+	if (mesh_active && emit.gpu_args_address != 0 && !mesh_task) {
 		auto&              cache = m_context.GetBufferCache();
 		auto&              args  = cache.GetBuffer(cache.FindBuffer(emit.gpu_args_address, 16u));
 		if (m_mesh_indirect == nullptr) {
@@ -1472,7 +1497,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		Profiler::CommandZone::Annotate("%s", name);
 	}
 	if (mesh_active) {
-		if (mesh_indirect_buffer) {
+		if (mesh_task) {
+			// One task workgroup launches the draw's mesh groups from the arguments.
+			vk_buffer.drawMeshTasksEXT(1, 1, 1);
+		} else if (mesh_indirect_buffer) {
 			vk_buffer.drawMeshTasksIndirectEXT(mesh_indirect_buffer, mesh_indirect_offset, 1, 16u);
 		} else {
 			// A draw with more groups than the host allows in one dispatch (RADV: 65,535 in x) is
@@ -1490,9 +1518,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				    static_cast<uint32_t>(std::min<uint64_t>(mesh_groups - groups_done, per_draw));
 				if (groups_done != 0) {
 					// The same stages as the draw dwords' push above (the layout's range).
-					vk_buffer.pushConstants(pipeline.pipeline_layout,
-					                        vk::ShaderStageFlagBits::eMeshEXT |
-					                            vk::ShaderStageFlagBits::eFragment,
+					vk_buffer.pushConstants(pipeline.pipeline_layout, mesh_push_stages,
 					                        base_offset, sizeof(groups_done), &groups_done);
 				}
 				vk_buffer.drawMeshTasksEXT(groups, draw.instance_count, 1);

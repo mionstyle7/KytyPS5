@@ -72,6 +72,9 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// Task shaders (VK_EXT_mesh_shader taskShader): mesh draws whose counts the GPU wrote launch
+	// through a task shader that reads them (MeshArgsTaskModule), inside the render pass.
+	bool                                      task_shader_enabled                   = false;
 	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
 	// bound and updated after bind.
 	bool                               bindless_enabled                      = false;

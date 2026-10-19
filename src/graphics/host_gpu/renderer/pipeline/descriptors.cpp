@@ -2728,6 +2728,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	if (has_push_data) {
+		// A mesh pipeline's task-shader variant has the task stage in its range (meshArgsTask.h).
+		push_stages |= pipeline.push_constant_stages & vk::ShaderStageFlagBits::eTaskEXT;
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
 	}
