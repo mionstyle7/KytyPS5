@@ -344,6 +344,9 @@ private:
 	// bit and the download registering its range, the bit alone would call the page unwritten:
 	// IsBitmapCleanForConcurrentRead declines while any step runs.
 	std::atomic<uint32_t>                              m_readback_steps {0};
+	// The window of the step in progress (set before m_readback_steps is raised).
+	std::atomic<uint64_t>                              m_readback_step_begin {0};
+	std::atomic<uint64_t>                              m_readback_step_end {0};
 	// Odd while an Obtain* call may protect pages before recording them GPU-written (MarkEpochScope).
 	std::atomic<uint64_t>                              m_gpu_mark_epoch {0};
 	void ApplyCleanWrite(uint64_t vaddr, uint64_t size);

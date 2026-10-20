@@ -1621,13 +1621,29 @@ void BufferCache::PrefetchReadbacks() {
 uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
                                      bool from_gpu_thread, bool async) {
 	// IsBitmapCleanForConcurrentRead declines while a step may clear bits or download.
-	struct StepScope {
-		std::atomic<uint32_t>& steps;
-		explicit StepScope(std::atomic<uint32_t>& counter): steps(counter) {
-			steps.fetch_add(1, std::memory_order_seq_cst);
+	// The pages a step can touch: its readback window (unclamped to the buffer: a superset).
+	{
+		const auto window = std::max<uint64_t>(ReadbackWindow(), TRACKER_PAGE_SIZE);
+		const auto begin  = Common::AlignDown(vaddr, window);
+		const auto end    = std::max(begin + window,
+		                             Common::AlignUp(vaddr + std::max<uint64_t>(size, 1), TRACKER_PAGE_SIZE));
+		// Only the GPU thread runs steps, so the count read here is exact. A nested step widens
+		// the window to everything until the next outermost step sets it again.
+		if (m_readback_steps.load(std::memory_order_seq_cst) == 0) {
+			m_readback_step_begin.store(begin, std::memory_order_seq_cst);
+			m_readback_step_end.store(end, std::memory_order_seq_cst);
 		}
-		~StepScope() { steps.fetch_sub(1, std::memory_order_release); }
-	} step_scope(m_readback_steps);
+	}
+	struct StepScope {
+		BufferCache& cache;
+		explicit StepScope(BufferCache& owner): cache(owner) {
+			if (cache.m_readback_steps.fetch_add(1, std::memory_order_seq_cst) != 0) {
+				cache.m_readback_step_begin.store(0, std::memory_order_seq_cst);
+				cache.m_readback_step_end.store(UINT64_MAX, std::memory_order_seq_cst);
+			}
+		}
+		~StepScope() { cache.m_readback_steps.fetch_sub(1, std::memory_order_release); }
+	} step_scope(*this);
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return 0;
 	}
@@ -2734,9 +2750,16 @@ bool BufferCache::IsBitmapCleanForConcurrentRead(uint64_t vaddr, uint64_t size) 
 		}
 		// After the lock: a step's bit clearing happens under the exclusive lock, after its
 		// counter increment, so a step that cleared bits not yet covered by a download is seen.
-		if (m_readback_steps.load(std::memory_order_seq_cst) != 0) {
-			g_bitmap_clean_reads.declined_steps.fetch_add(1, std::memory_order_relaxed);
-			return false;
+		// One step at a time runs (GPU thread); it touches only its window. A nested one (or a
+		// window read while it changes) declines.
+		if (const auto steps = m_readback_steps.load(std::memory_order_seq_cst); steps != 0) {
+			const auto begin = m_readback_step_begin.load(std::memory_order_seq_cst);
+			const auto end   = m_readback_step_end.load(std::memory_order_seq_cst);
+			if (steps != 1 || m_readback_steps.load(std::memory_order_seq_cst) != 1 ||
+			    (first < end && begin < last)) {
+				g_bitmap_clean_reads.declined_steps.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
 		}
 		if (!m_gpu_modified_ranges.Intersects(vaddr, size) ||
 		    !m_bitmap_tracked.Contains(first, last - first) ||
