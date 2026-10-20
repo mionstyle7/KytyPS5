@@ -2126,10 +2126,24 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+// Odd while a binding may protect pages as GPU-written (SynchronizeBuffer) before MarkGpuWritten
+// records them: a game thread that lifted a page meanwhile protects it again
+// (IsBitmapCleanForConcurrentRead).
+struct MarkEpochScope {
+	std::atomic<uint64_t>& epoch;
+	explicit MarkEpochScope(std::atomic<uint64_t>& value): epoch(value) {
+		epoch.fetch_add(1, std::memory_order_seq_cst);
+	}
+	~MarkEpochScope() { epoch.fetch_add(1, std::memory_order_seq_cst); }
+	MarkEpochScope(const MarkEpochScope&)            = delete;
+	MarkEpochScope& operator=(const MarkEpochScope&) = delete;
+};
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id, bool needs_device_address) {
 	KYTY_FRAME_BUDGET(Buffers);
+	const MarkEpochScope mark_epoch(m_gpu_mark_epoch);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -2169,6 +2183,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
                                                               uint64_t written_vaddr,
                                                               uint64_t written_size, BufferId id) {
 	KYTY_FRAME_BUDGET(Buffers);
+	const MarkEpochScope mark_epoch(m_gpu_mark_epoch);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid() ||
 	    written_vaddr < vaddr || written_size > size || written_vaddr - vaddr > size - written_size) {
@@ -2237,6 +2252,7 @@ vk::DeviceAddress BufferCache::WriteBitmapAddress() {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, uint64_t size,
                                                               BufferId id) {
 	KYTY_FRAME_BUDGET(Buffers);
+	const MarkEpochScope mark_epoch(m_gpu_mark_epoch);
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
@@ -2259,7 +2275,7 @@ static bool BitmapNoWait() {
 }
 
 bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, uint64_t size,
-                                        bool async, uint64_t& wait_tick, bool clear_written) {
+                                        bool async, uint64_t& wait_tick) {
 	if (m_write_bitmap == nullptr) {
 		return false;
 	}
@@ -2366,7 +2382,7 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 						unwritten.emplace_back(page, page + WriteBitmapPage);
 					}
 					dropped++;
-				} else if (clear_written) {
+				} else {
 					cached_word &= ~bit; // downloaded with the window now
 					cached_dirty = true;
 					m_bitmap_written_pages++;
@@ -2696,17 +2712,16 @@ static bool BitmapCleanReadEnabled() {
 }
 
 static struct {
-	std::atomic<uint64_t> served {0}, lifts_asked {0}, lifts_done {0}, declined_steps {0};
+	std::atomic<uint64_t> served {0}, lifted {0}, reprotected {0}, declined_steps {0};
 	std::atomic<int64_t>  next_log {0};
 } g_bitmap_clean_reads;
-
-// Pages whose lift was asked and not yet done: one request per page in the GPU thread's queue.
-static std::array<std::atomic<uint64_t>, 1024> g_bitmap_lift_pending {};
 
 bool BufferCache::IsBitmapCleanForConcurrentRead(uint64_t vaddr, uint64_t size) {
 	if (!BitmapCleanReadEnabled() || size == 0 || GuestGpu::IsGpuThread()) {
 		return false;
 	}
+	// Read before the checks: a binding that protects these pages after it is seen below.
+	const auto epoch = m_gpu_mark_epoch.load(std::memory_order_seq_cst);
 	const auto first = Common::AlignDown(vaddr, WriteBitmapPage);
 	const auto last  = Common::AlignUp(vaddr + size, WriteBitmapPage);
 	if (last > WriteBitmapLimit || last <= first) {
@@ -2756,16 +2771,18 @@ bool BufferCache::IsBitmapCleanForConcurrentRead(uint64_t vaddr, uint64_t size) 
 		}
 	}
 	g_bitmap_clean_reads.served.fetch_add(1, std::memory_order_relaxed);
-	// The page stays protected until the GPU thread lifts it; ask once, without waiting.
-	auto& pending = g_bitmap_lift_pending[(first >> WriteBitmapPageBits) & 1023u];
-	if (pending.exchange(first, std::memory_order_acq_rel) != first) {
-		g_bitmap_clean_reads.lifts_asked.fetch_add(1, std::memory_order_relaxed);
-		(void)m_scheduler.Context().GetGpu().TrySendCommand([this, first] {
-			LiftUnwrittenPage(first);
-			auto&    slot     = g_bitmap_lift_pending[(first >> WriteBitmapPageBits) & 1023u];
-			uint64_t expected = first;
-			slot.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
-		});
+	// Lift the pages here: asking the GPU thread queued tens of thousands of lifts each 10 s ahead
+	// of the readbacks that do need it (2026-10-20). A binding protecting them meanwhile (the epoch
+	// moved, or was odd) gets them protected again: an extra fault is harmless, a missed one is not.
+	if ((epoch & 1u) == 0) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(first, last - first);
+		if (m_gpu_mark_epoch.load(std::memory_order_seq_cst) != epoch) {
+			m_memory_tracker.MarkRegionAsGpuModified(first, last - first);
+			g_bitmap_clean_reads.reprotected.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			g_bitmap_clean_reads.lifted.fetch_add((last - first) / WriteBitmapPage,
+			                                      std::memory_order_relaxed);
+		}
 	}
 	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
 	auto       next = g_bitmap_clean_reads.next_log.load(std::memory_order_relaxed);
@@ -2775,46 +2792,15 @@ bool BufferCache::IsBitmapCleanForConcurrentRead(uint64_t vaddr, uint64_t size) 
 	                                       .count())) {
 		if (next != 0) {
 			LOGF("Bitmap clean reads (10 s): %" PRIu64 " served without the GPU thread, %" PRIu64
-			     " lifts asked, %" PRIu64 " pages lifted, %" PRIu64 " declined during readbacks\n",
-			     g_bitmap_clean_reads.served.exchange(0), g_bitmap_clean_reads.lifts_asked.exchange(0),
-			     g_bitmap_clean_reads.lifts_done.exchange(0),
+			     " pages lifted, %" PRIu64 " protected again, %" PRIu64 " declined during readbacks\n",
+			     g_bitmap_clean_reads.served.exchange(0), g_bitmap_clean_reads.lifted.exchange(0),
+			     g_bitmap_clean_reads.reprotected.exchange(0),
 			     g_bitmap_clean_reads.declined_steps.exchange(0));
 		}
 	}
 	return true;
 }
 
-void BufferCache::LiftUnwrittenPage(uint64_t page) {
-	KYTY_FRAME_BUDGET(Readback);
-	// The buffer holding the whole page (bitmap-tracked bytes belong to a cached buffer).
-	const auto candidate = m_buffers.upper_bound(page);
-	if (candidate == m_buffers.begin()) {
-		return;
-	}
-	const auto& [address, id] = *std::prev(candidate);
-	auto& buffer              = m_slot_buffers[id];
-	if (address > page || address + buffer.Size() < page + TRACKER_PAGE_SIZE) {
-		return;
-	}
-	uint64_t wait_tick = 0;
-	if (RefineWithWriteBitmap(buffer, page, TRACKER_PAGE_SIZE, true, wait_tick, false)) {
-		return; // a tracked write still running: the next read asks again
-	}
-	auto begin = page;
-	auto end   = page + TRACKER_PAGE_SIZE;
-	if (const auto window = ReadbackWindow(); window != 0) {
-		begin = std::max(Common::AlignDown(page, window), buffer.CpuAddress());
-		end   = std::min(begin + window, buffer.CpuAddress() + buffer.Size());
-	}
-	{
-		std::shared_lock lock(m_dirty_ranges_mutex);
-		if (!m_side_ranges.Empty() && m_side_ranges.Intersects(begin, end - begin)) {
-			return;
-		}
-	}
-	g_bitmap_clean_reads.lifts_done.fetch_add(LiftCurrentPages(begin, end),
-	                                          std::memory_order_relaxed);
-}
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
