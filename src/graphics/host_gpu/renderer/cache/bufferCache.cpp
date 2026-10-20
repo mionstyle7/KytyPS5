@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/frameBudget.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -621,6 +622,7 @@ static uint64_t DirectReadWindow() {
 }
 
 bool BufferCache::TryDirectRead(uint64_t vaddr, void* data, uint64_t size) {
+	KYTY_FRAME_BUDGET(Readback);
 	if (!DirectReadEnabled() || m_side == nullptr || size == 0 || size > 4096 ||
 	    GuestGpu::IsGpuThread() || !GuestRange {vaddr, size}.Valid()) {
 		return false;
@@ -908,6 +910,7 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	KYTY_FRAME_BUDGET(Buffers);
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
@@ -945,6 +948,7 @@ static bool OverwriteDrop() {
 }
 
 void BufferCache::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
+	KYTY_FRAME_BUDGET(Buffers);
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
@@ -996,6 +1000,7 @@ void BufferCache::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::InvalidateMemoryNoDownload(uint64_t vaddr, uint64_t size) {
+	KYTY_FRAME_BUDGET(Buffers);
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return;
 	}
@@ -1084,6 +1089,7 @@ bool BufferCache::WriteCleanSync(uint64_t vaddr, const void* data, uint64_t size
 // GPU thread: the GPU copy of bytes an emulated store wrote to guest memory (PostCleanWrite).
 // Commands run before later submissions, so the work the guest submits after its store sees it.
 void BufferCache::ApplyCleanWrite(uint64_t vaddr, uint64_t size) {
+	KYTY_FRAME_BUDGET(Buffers);
 	KYTY_PROFILER_FUNCTION();
 	std::array<uint8_t, 32> data {};
 	if (size > data.size() || !Libs::LibKernel::Memory::TryReadBacking(vaddr, data.data(), size)) {
@@ -1183,6 +1189,7 @@ static bool LocalDownloadWait() {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	KYTY_FRAME_BUDGET(Readback);
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -1791,6 +1798,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+	KYTY_FRAME_BUDGET(Buffers);
 	KYTY_PROFILER_FUNCTION();
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
@@ -2113,6 +2121,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id, bool needs_device_address) {
+	KYTY_FRAME_BUDGET(Buffers);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -2151,6 +2160,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, uint64_t size,
                                                               uint64_t written_vaddr,
                                                               uint64_t written_size, BufferId id) {
+	KYTY_FRAME_BUDGET(Buffers);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid() ||
 	    written_vaddr < vaddr || written_size > size || written_vaddr - vaddr > size - written_size) {
@@ -2218,6 +2228,7 @@ vk::DeviceAddress BufferCache::WriteBitmapAddress() {
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, uint64_t size,
                                                               BufferId id) {
+	KYTY_FRAME_BUDGET(Buffers);
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
@@ -2508,6 +2519,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+	KYTY_FRAME_BUDGET(Buffers);
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
@@ -2536,6 +2548,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+	KYTY_FRAME_BUDGET(Buffers);
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
 	}
@@ -2568,6 +2581,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
+	KYTY_FRAME_BUDGET(Buffers);
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
@@ -3000,6 +3014,7 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size) {
+	KYTY_FRAME_BUDGET(Buffers);
 	m_memory_tracker.ForEachMaybeCpuDirtyRegion(
 	    vaddr, size, [this](uint64_t address, uint64_t bytes) {
 		    SynchronizeBuffersInRange(address, bytes);
@@ -3007,6 +3022,7 @@ void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t siz
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	KYTY_FRAME_BUDGET(Buffers);
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {

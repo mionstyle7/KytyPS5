@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/frameBudget.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -1562,6 +1563,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	KYTY_FRAME_BUDGET(Draw);
 	KYTY_PROFILER_FUNCTION();
 	const DrawCensus::Scope census_scope(DrawCensus::Kind::Draw);
 
@@ -1678,6 +1680,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+	KYTY_FRAME_BUDGET(Draw);
 	KYTY_PROFILER_FUNCTION();
 	const DrawCensus::Scope census_scope(DrawCensus::Kind::Draw);
 

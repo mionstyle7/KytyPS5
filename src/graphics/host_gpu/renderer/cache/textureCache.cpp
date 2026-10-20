@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/frameBudget.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1606,6 +1607,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 }
 
 void TextureCache::RefreshImage(ImageId id) {
+	KYTY_FRAME_BUDGET(Textures);
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -1665,6 +1667,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	KYTY_FRAME_BUDGET(Textures);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1790,6 +1793,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 }
 
 void TextureCache::UpdateImage(ImageId id) {
+	KYTY_FRAME_BUDGET(Textures);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1797,6 +1801,7 @@ void TextureCache::UpdateImage(ImageId id) {
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
+	KYTY_FRAME_BUDGET(Textures);
 	if (!GuestRange {address, size}.Valid()) {
 		return {};
 	}
@@ -1839,6 +1844,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	KYTY_FRAME_BUDGET(Textures);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1880,6 +1886,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
+	KYTY_FRAME_BUDGET(Textures);
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
 	}
@@ -1898,6 +1905,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
+	KYTY_FRAME_BUDGET(Textures);
 	if (desc.type != BindingType::DepthTarget) {
 		EXIT("TextureCache: invalid depth-target binding\n");
 	}
@@ -2187,6 +2195,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+	KYTY_FRAME_BUDGET(Textures);
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
@@ -2355,6 +2364,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 
 bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
                                        std::shared_ptr<std::atomic<bool>>* landed) {
+	KYTY_FRAME_BUDGET(Textures);
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -2445,6 +2455,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+	KYTY_FRAME_BUDGET(Textures);
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
@@ -3138,6 +3149,7 @@ void TextureCache::SetBindlessEvictable(std::span<const ImageId> ids) {
 }
 
 void TextureCache::ProcessDownloadImages() {
+	KYTY_FRAME_BUDGET(Textures);
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);

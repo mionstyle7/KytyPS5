@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/frameBudget.h"
 
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
@@ -295,6 +296,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		KYTY_FRAME_BUDGET(Requests);
 		command();
 	}
 }
@@ -309,6 +311,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	// Waking a sleeping caller cost the GPU thread a system call each; guest readbacks make
 	// ~2 000 of these requests a second in gameplay. 0 waiting, 1 done, 2 the caller sleeps.
 	constexpr uint32_t    Spins = 500;
+	KYTY_FRAME_BUDGET(GuestWait);
 	std::atomic<uint32_t> state {0};
 	SendCommand([operation = std::move(command), &state]() mutable {
 		operation();
@@ -744,6 +747,7 @@ void GuestGpu::Enqueue(Submission submission) {
 }
 
 void GuestGpu::WaitForIdle() {
+	KYTY_FRAME_BUDGET(GuestWait);
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
@@ -758,6 +762,7 @@ void GuestGpu::ThreadRun(void* data) {
 	Common::PreferPerformanceCores("GPU thread");
 	Common::RaiseAboveGameThreads("GPU thread");
 	Profiler::t_gpu_thread = true;
+	FrameBudget::NameThread("gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
@@ -772,6 +777,7 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				Timeline::Mark("gpu-idle");
+				KYTY_FRAME_BUDGET(Idle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 				Timeline::Mark("gpu-wake");
 			}
@@ -796,7 +802,10 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					Timeline::Mark("gpu-blocked");
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					{
+						KYTY_FRAME_BUDGET(Blocked);
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					Timeline::Mark("gpu-unblocked");
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -823,6 +832,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			KYTY_FRAME_BUDGET(Requests);
 			command();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -966,6 +976,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
                                            std::span<const uint32_t> commands) {
+	KYTY_FRAME_BUDGET(Pm4);
 	KYTY_PROFILER_BLOCK("CommandProcessor::Process");
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
@@ -2017,6 +2028,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
+	KYTY_FRAME_BUDGET(Flip);
 	auto& command = CurrentBuffer();
 	if (g_current_processor != nullptr) {
 		EXIT("invalid graphics-thread CPU flip preparation\n");

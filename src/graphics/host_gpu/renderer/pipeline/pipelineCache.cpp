@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/frameBudget.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -3345,6 +3346,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	KYTY_FRAME_BUDGET(Shaders);
 	std::array<ShaderParams, 3> vertex_params;
 	ShaderParams                pixel_params;
 	if (!DescribeGraphicsStages(vertex_regs, pixel_regs, sh, context, user_config,
@@ -3433,6 +3435,7 @@ bool PipelineCache::IsSkipListed(uint64_t shader_addr) {
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
+	KYTY_FRAME_BUDGET(Shaders);
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
@@ -3473,6 +3476,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs) {
+	KYTY_FRAME_BUDGET(Shaders);
 	auto* pipeline = TryGetGraphicsPipeline(colors, depth, vertex_info, command, ps_input_info,
 	                                        topology, primitive_restart_enable, programs, false);
 	EXIT_IF(pipeline == nullptr);
@@ -3576,6 +3580,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs, bool may_defer,
     bool mesh_task) {
+	KYTY_FRAME_BUDGET(Shaders);
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -3963,6 +3968,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 PipelineCache::Pipeline&
 PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
                                   const ShaderProgram&          compute_program) {
+	KYTY_FRAME_BUDGET(Shaders);
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);

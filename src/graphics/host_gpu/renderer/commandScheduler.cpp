@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/frameBudget.h"
 
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
@@ -498,6 +499,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 }
 
 void CommandScheduler::DrainPriorityOperations() {
+	KYTY_FRAME_BUDGET(WaitGpu);
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(
@@ -505,6 +507,7 @@ void CommandScheduler::DrainPriorityOperations() {
 }
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
+	KYTY_FRAME_BUDGET(WaitGpu);
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
@@ -676,6 +679,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 }
 
 void CommandScheduler::QueueSubmit(SubmitJob& job) {
+	KYTY_FRAME_BUDGET(Submit);
 	auto&      graphics = m_graphics;
 	vk::Result result;
 	// The read protection of pages this work writes is in place before it can run
@@ -734,9 +738,11 @@ void CommandScheduler::EnableAsyncSubmit() {
 
 void CommandScheduler::SubmitThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuQueueSubmit");
+	FrameBudget::NameThread("submit");
 	for (;;) {
 		SubmitJob job;
 		{
+			KYTY_FRAME_BUDGET(Idle);
 			std::unique_lock lock(m_submit_mutex);
 			// A stop request still submits the queued jobs: their ticks may already be waited on.
 			if (!m_submit_available.wait(lock, stop, [this] { return !m_submit_jobs.empty(); })) {
@@ -810,6 +816,7 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 		return m_command.m_buffer;
 	}
 	KYTY_PROFILER_FUNCTION();
+	KYTY_FRAME_BUDGET(WaitRecord);
 	DispatchChunk();
 	std::unique_lock lock(m_record_mutex);
 	m_drains++;
@@ -828,12 +835,14 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 void CommandScheduler::RecordingThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuRecord");
 	Common::PreferPerformanceCores("Vulkan recording thread");
+	FrameBudget::NameThread("record");
 	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
 	// recycled only after the next two have run.
 	std::deque<std::unique_ptr<Chunk>> retained;
 	for (;;) {
 		std::unique_ptr<Chunk> chunk;
 		{
+			KYTY_FRAME_BUDGET(Idle);
 			std::unique_lock lock(m_record_mutex);
 			// A stop request still runs the queued chunks: their ticks may already be waited on.
 			if (!m_record_available.wait(lock, stop, [this] { return !m_record_queue.empty(); })) {
@@ -842,6 +851,7 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 			chunk = std::move(m_record_queue.front());
 			m_record_queue.pop_front();
 		}
+		KYTY_FRAME_BUDGET(Record);
 		for (auto* command = chunk->first; command != nullptr;) {
 			auto* next = command->next;
 			command->Execute(m_worker_buffer);

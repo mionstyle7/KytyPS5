@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/frameBudget.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -424,6 +425,7 @@ static void DumpGuestMemory(GraphicContext& graphics, BufferCache& cache) {
 }
 
 void RenderContext::RunGarbageCollector() {
+	KYTY_FRAME_BUDGET(Collect);
 	DumpGuestMemory(GetGraphics(), m_buffer_cache);
 	LogWatchedRereads(m_buffer_cache, GetGraphics().presented_frames.load(std::memory_order_relaxed));
 	if (m_fault_process_pending) {

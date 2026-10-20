@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/frameBudget.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -1147,6 +1148,8 @@ void Presenter::Present(std::span<const Layer> layers) {
 	    m_impl->window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed) + 1;
 	Timeline::Present(presented);
 	GpuTiming::Present(presented);
+	FrameBudget::Present();
+	KYTY_FRAME_BUDGET(Present);
 	m_impl->Present();
 }
 

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/frameBudget.h"
 
 #include <algorithm>
 #include <atomic>
@@ -95,6 +96,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	// point is a fast non-blocking check; only reaching here means the GPU genuinely hasn't
 	// caught up yet.
 	KYTY_PROFILER_BLOCK("MasterSemaphore::Wait (blocked on GPU)");
+	KYTY_FRAME_BUDGET(WaitGpu);
 
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;

@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/frameBudget.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -511,6 +512,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	KYTY_FRAME_BUDGET(Dispatch);
 	const DrawCensus::Scope census_scope(DrawCensus::Kind::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -768,6 +770,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
                                       uint32_t mode) {
+	KYTY_FRAME_BUDGET(Dispatch);
 	const DrawCensus::Scope census_scope(DrawCensus::Kind::Dispatch);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
 	// The arguments are thread counts: IndirectDispatchGroups converts them on the GPU, and the
