@@ -374,12 +374,14 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (++m_image_granule_releases > 4096) {
 		// Released images leave their bits; rebuild from the images still registered (this one
 		// is still marked registered here, which only keeps its bits: a superset).
+		m_granule_seq.fetch_add(1, std::memory_order_seq_cst); // odd: being rebuilt
 		std::fill(m_image_granules.begin(), m_image_granules.end(), 0);
 		m_slot_images.ForEach([&](ImageId other, const Image& registered) {
 			if (other != id && registered.registered) {
 				MarkImageGranules(registered.info.data.address, registered.info.data.size);
 			}
 		});
+		m_granule_seq.fetch_add(1, std::memory_order_seq_cst);
 		m_image_granule_releases = 0;
 	}
 	const auto accounted = image.AccountedSize();
@@ -641,6 +643,7 @@ void TextureCache::MarkImageGranules(uint64_t address, uint64_t size) {
 	}
 	if (m_image_granules.empty()) {
 		m_image_granules.assign((ImageGranuleSpace >> ImageGranuleBits) / 64, 0);
+		m_granules_published.store(m_image_granules.data(), std::memory_order_release);
 	}
 	const uint64_t last = (std::min(address + size, ImageGranuleSpace) - 1) >> ImageGranuleBits;
 	for (uint64_t g = address >> ImageGranuleBits; g <= last; ++g) {
@@ -664,6 +667,28 @@ bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const {
 		g += span;
 	}
 	return false;
+}
+
+// A game thread's write fault: false only when no registered image can cover the range. An image
+// whose pages a write fault can hit was registered (its bits set) before its pages were protected.
+bool TextureCache::MayHaveImagesConcurrent(uint64_t address, uint64_t size) const {
+	const auto* words = m_granules_published.load(std::memory_order_acquire);
+	if (!ImageGranulesEnabled() || words == nullptr || size == 0 || address >= ImageGranuleSpace ||
+	    size > ImageGranuleSpace - address) {
+		return true;
+	}
+	const auto seq = m_granule_seq.load(std::memory_order_seq_cst);
+	if ((seq & 1u) != 0) {
+		return true;
+	}
+	const auto* volatile_words = static_cast<const volatile uint64_t*>(words);
+	const uint64_t       last  = (address + size - 1) >> ImageGranuleBits;
+	for (uint64_t g = address >> ImageGranuleBits; g <= last; ++g) {
+		if ((volatile_words[g >> 6] & (uint64_t {1} << (g & 63))) != 0) {
+			return true;
+		}
+	}
+	return m_granule_seq.load(std::memory_order_seq_cst) != seq;
 }
 
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
@@ -2198,6 +2223,11 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	KYTY_FRAME_BUDGET(Textures);
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
+	}
+	// Every game write fault came here and waited for m_lock, which the GPU thread holds while it
+	// binds textures: most of those writes are nowhere near an image (KYTY_IMAGE_GRANULES=0 off).
+	if (!MayHaveImagesConcurrent(address, size)) {
+		return;
 	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);

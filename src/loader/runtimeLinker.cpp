@@ -34,6 +34,7 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -675,6 +676,9 @@ struct FaultStats {
 	};
 	std::mutex             mutex;
 	std::vector<Site>      sites;
+	// Site address -> index in `sites`: a linear search over ~1,500 sites under the mutex cost
+	// every faulting game thread (~150 K faults each 10 s in gameplay, 2026-10-20).
+	std::unordered_map<uint64_t, size_t> index;
 	uint64_t               total    = 0;
 	uint64_t               reported = 0;
 	// The last 10 s, by kind (0: write, 1: read) and outcome (emulated or not): count and time.
@@ -707,12 +711,11 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	std::scoped_lock lock(g_fault_stats.mutex);
 	auto&            stats = g_fault_stats;
 	stats.total++;
-	auto it = std::find_if(stats.sites.begin(), stats.sites.end(),
-	                       [host_pc](const FaultStats::Site& site) { return site.address == host_pc; });
-	if (it == stats.sites.end()) {
+	auto [found, inserted] = stats.index.try_emplace(host_pc, stats.sites.size());
+	if (inserted) {
 		stats.sites.push_back({host_pc, 0, 0, 0, 0, 0, 0});
-		it = std::prev(stats.sites.end());
 	}
+	auto it = stats.sites.begin() + static_cast<std::ptrdiff_t>(found->second);
 	it->count++;
 	it->reads += is_read ? 1 : 0;
 	it->gpu += gpu_thread ? 1 : 0;
@@ -745,7 +748,9 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 			w.next_ms = now + 10000;
 		}
 	}
-	if (stats.total - stats.reported < 5000) {
+	// The site report sorts every site three times under the mutex: every 100,000 faults (was
+	// every 5,000, several times a second in gameplay).
+	if (stats.total - stats.reported < 100000) {
 		return;
 	}
 	stats.reported = stats.total;
@@ -777,6 +782,10 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 		     " emulated=%" PRIu64 " gpu_thread=%" PRIu64 " last_vaddr=0x%016" PRIx64 "\n",
 		     site.address, site.micros / 1000, site.count, site.reads, site.emulated, site.gpu,
 		     site.vaddr);
+	}
+	stats.index.clear();
+	for (size_t i = 0; i < stats.sites.size(); i++) {
+		stats.index.emplace(stats.sites[i].address, i);
 	}
 }
 } // namespace

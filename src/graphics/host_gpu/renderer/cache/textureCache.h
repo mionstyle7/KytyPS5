@@ -306,6 +306,11 @@ private:
 	uint32_t              m_image_granule_releases = 0;
 	void                  MarkImageGranules(uint64_t address, uint64_t size);
 	[[nodiscard]] bool    MayHaveImages(uint64_t address, uint64_t size) const;
+	// Game threads (InvalidateMemory, without m_lock): the granules once allocated, and a
+	// sequence that is odd while a rebuild clears them.
+	std::atomic<const uint64_t*> m_granules_published {nullptr};
+	std::atomic<uint64_t>        m_granule_seq {0};
+	[[nodiscard]] bool           MayHaveImagesConcurrent(uint64_t address, uint64_t size) const;
 	bool             m_readback_linear_images = false;
 	// FindImage's exact-backing result per request, valid while no image is registered or
 	// unregistered (m_image_set_epoch). From Revi's Wolverine fork (KYTY_FIND_IMAGE_MEMO).
