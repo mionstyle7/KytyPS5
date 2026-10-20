@@ -160,10 +160,10 @@ bool RenderContext::TryDirectRead(uint64_t fault_vaddr, uint64_t vaddr, void* da
 	       m_buffer_cache.TryDirectRead(vaddr, data, size);
 }
 
-bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
-                                      uint64_t size) const noexcept {
+bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr, uint64_t size) {
 	return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&
-	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
+	       (m_buffer_cache.IsCleanForConcurrentRead(vaddr, size) ||
+	        m_buffer_cache.IsBitmapCleanForConcurrentRead(vaddr, size));
 }
 
 // KYTY_CLEAN_WRITE_EMULATION: 1 (default) stores to GPU-clean bytes of GPU-written pages

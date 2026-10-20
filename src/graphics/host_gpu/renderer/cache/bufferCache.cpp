@@ -1620,6 +1620,14 @@ void BufferCache::PrefetchReadbacks() {
 
 uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
                                      bool from_gpu_thread, bool async) {
+	// IsBitmapCleanForConcurrentRead declines while a step may clear bits or download.
+	struct StepScope {
+		std::atomic<uint32_t>& steps;
+		explicit StepScope(std::atomic<uint32_t>& counter): steps(counter) {
+			steps.fetch_add(1, std::memory_order_seq_cst);
+		}
+		~StepScope() { steps.fetch_sub(1, std::memory_order_release); }
+	} step_scope(m_readback_steps);
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return 0;
 	}
@@ -2251,7 +2259,7 @@ static bool BitmapNoWait() {
 }
 
 bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, uint64_t size,
-                                        bool async, uint64_t& wait_tick) {
+                                        bool async, uint64_t& wait_tick, bool clear_written) {
 	if (m_write_bitmap == nullptr) {
 		return false;
 	}
@@ -2358,7 +2366,7 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 						unwritten.emplace_back(page, page + WriteBitmapPage);
 					}
 					dropped++;
-				} else {
+				} else if (clear_written) {
 					cached_word &= ~bit; // downloaded with the window now
 					cached_dirty = true;
 					m_bitmap_written_pages++;
@@ -2673,6 +2681,139 @@ bool BufferCache::IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const 
 	std::shared_lock lock(m_dirty_ranges_mutex);
 	return !m_gpu_modified_ranges.Intersects(vaddr, size) &&
 	       !m_downloading_ranges.Intersects(vaddr, size);
+}
+
+// Gameplay logs (2026-10-20): 15-50 K guest readbacks each 10 s went through the GPU thread, ~78%
+// of them of bytes a tracked binding had marked GPU-written that the write bitmap showed the GPU
+// never wrote. The GPU thread only dropped them and lifted the page, ~9 ms of its time a frame,
+// while the game thread waited its turn (~0.25 ms a read, ~50 ms of game-thread time a frame).
+static bool BitmapCleanReadEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BITMAP_CLEAN_READ");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+static struct {
+	std::atomic<uint64_t> served {0}, lifts_asked {0}, lifts_done {0}, declined_steps {0};
+	std::atomic<int64_t>  next_log {0};
+} g_bitmap_clean_reads;
+
+// Pages whose lift was asked and not yet done: one request per page in the GPU thread's queue.
+static std::array<std::atomic<uint64_t>, 1024> g_bitmap_lift_pending {};
+
+bool BufferCache::IsBitmapCleanForConcurrentRead(uint64_t vaddr, uint64_t size) {
+	if (!BitmapCleanReadEnabled() || size == 0 || GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	const auto first = Common::AlignDown(vaddr, WriteBitmapPage);
+	const auto last  = Common::AlignUp(vaddr + size, WriteBitmapPage);
+	if (last > WriteBitmapLimit || last <= first) {
+		return false;
+	}
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (m_write_bitmap == nullptr) {
+			return false;
+		}
+		// After the lock: a step's bit clearing happens under the exclusive lock, after its
+		// counter increment, so a step that cleared bits not yet covered by a download is seen.
+		if (m_readback_steps.load(std::memory_order_seq_cst) != 0) {
+			g_bitmap_clean_reads.declined_steps.fetch_add(1, std::memory_order_relaxed);
+			return false;
+		}
+		if (!m_gpu_modified_ranges.Intersects(vaddr, size) ||
+		    !m_bitmap_tracked.Contains(first, last - first) ||
+		    m_downloading_ranges.Intersects(first, last - first) ||
+		    (!m_side_ranges.Empty() && m_side_ranges.Intersects(first, last - first))) {
+			return false;
+		}
+		auto& master = m_scheduler.GetMasterSemaphore();
+		if (BitmapNoWait()) {
+			// Tracked writes the GPU may still be running OR their bits in later.
+			for (auto it = m_bitmap_inflight.begin();
+			     it != m_bitmap_inflight.end() && it->first < last; ++it) {
+				if (it->second.first > first && !master.IsFree(it->second.second)) {
+					return false;
+				}
+			}
+		} else {
+			for (auto region = first >> WriteBitmapRegionBits;
+			     region <= (last - 1) >> WriteBitmapRegionBits; region++) {
+				if (const auto found = m_bitmap_ticks.find(region);
+				    found != m_bitmap_ticks.end() && !master.IsFree(found->second)) {
+					return false;
+				}
+			}
+		}
+		const auto* words = reinterpret_cast<const uint32_t*>(m_write_bitmap->Mapped().data());
+		for (auto page = first; page < last; page += WriteBitmapPage) {
+			const auto index = page >> WriteBitmapPageBits;
+			if ((words[index >> 5u] & (uint32_t {1} << (index & 31u))) != 0) {
+				return false; // written: the ordinary readback downloads it
+			}
+		}
+	}
+	g_bitmap_clean_reads.served.fetch_add(1, std::memory_order_relaxed);
+	// The page stays protected until the GPU thread lifts it; ask once, without waiting.
+	auto& pending = g_bitmap_lift_pending[(first >> WriteBitmapPageBits) & 1023u];
+	if (pending.exchange(first, std::memory_order_acq_rel) != first) {
+		g_bitmap_clean_reads.lifts_asked.fetch_add(1, std::memory_order_relaxed);
+		(void)m_scheduler.Context().GetGpu().TrySendCommand([this, first] {
+			LiftUnwrittenPage(first);
+			auto&    slot     = g_bitmap_lift_pending[(first >> WriteBitmapPageBits) & 1023u];
+			uint64_t expected = first;
+			slot.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+		});
+	}
+	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+	auto       next = g_bitmap_clean_reads.next_log.load(std::memory_order_relaxed);
+	if (now >= next && g_bitmap_clean_reads.next_log.compare_exchange_strong(
+	                       next, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+	                                       std::chrono::seconds(10))
+	                                       .count())) {
+		if (next != 0) {
+			LOGF("Bitmap clean reads (10 s): %" PRIu64 " served without the GPU thread, %" PRIu64
+			     " lifts asked, %" PRIu64 " pages lifted, %" PRIu64 " declined during readbacks\n",
+			     g_bitmap_clean_reads.served.exchange(0), g_bitmap_clean_reads.lifts_asked.exchange(0),
+			     g_bitmap_clean_reads.lifts_done.exchange(0),
+			     g_bitmap_clean_reads.declined_steps.exchange(0));
+		}
+	}
+	return true;
+}
+
+void BufferCache::LiftUnwrittenPage(uint64_t page) {
+	KYTY_FRAME_BUDGET(Readback);
+	// The buffer holding the whole page (bitmap-tracked bytes belong to a cached buffer).
+	const auto candidate = m_buffers.upper_bound(page);
+	if (candidate == m_buffers.begin()) {
+		return;
+	}
+	const auto& [address, id] = *std::prev(candidate);
+	auto& buffer              = m_slot_buffers[id];
+	if (address > page || address + buffer.Size() < page + TRACKER_PAGE_SIZE) {
+		return;
+	}
+	uint64_t wait_tick = 0;
+	if (RefineWithWriteBitmap(buffer, page, TRACKER_PAGE_SIZE, true, wait_tick, false)) {
+		return; // a tracked write still running: the next read asks again
+	}
+	auto begin = page;
+	auto end   = page + TRACKER_PAGE_SIZE;
+	if (const auto window = ReadbackWindow(); window != 0) {
+		begin = std::max(Common::AlignDown(page, window), buffer.CpuAddress());
+		end   = std::min(begin + window, buffer.CpuAddress() + buffer.Size());
+	}
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (!m_side_ranges.Empty() && m_side_ranges.Intersects(begin, end - begin)) {
+			return;
+		}
+	}
+	g_bitmap_clean_reads.lifts_done.fetch_add(LiftCurrentPages(begin, end),
+	                                          std::memory_order_relaxed);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

@@ -136,6 +136,12 @@ public:
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
 	// memory holds their current value even when their page is protected.
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
+	// Any thread (KYTY_BITMAP_CLEAN_READ, default on): the bytes are GPU-written only by the
+	// conservative bookkeeping of a tracked binding, and the write bitmap shows the GPU wrote none
+	// of their pages (no tracked write in flight, no readback refining or downloading them), so
+	// guest memory holds their current value. The page keeps its protection; the GPU thread is
+	// asked, without waiting, to drop the unwritten pages and lift it (LiftUnwrittenPage).
+	[[nodiscard]] bool              IsBitmapCleanForConcurrentRead(uint64_t vaddr, uint64_t size);
 	// Guest threads (KYTY_DIRECT_READBACK, default on): reads [vaddr, vaddr + size) of GPU-written
 	// bytes whose writers were all submitted, without the GPU thread: the window around them is
 	// copied on the side queue after a wait for the newest writer only, put in guest memory, and
@@ -213,8 +219,13 @@ private:
 	void MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked = false);
 	// ReadMemoryStep: drops the pages of the readback window the bitmap shows the GPU did not
 	// write. True with wait_tick set when an asynchronous caller must first wait for that tick.
+	// clear_written=false (LiftUnwrittenPage): only drops unwritten pages; the bits of written ones
+	// stay set, for the readback that downloads them.
 	bool RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, uint64_t size, bool async,
-	                           uint64_t& wait_tick);
+	                           uint64_t& wait_tick, bool clear_written = true);
+	// GPU thread, asked by IsBitmapCleanForConcurrentRead: drops the bitmap-unwritten pages around
+	// `page` and lifts the protection of pages left without GPU-written bytes.
+	void LiftUnwrittenPage(uint64_t page);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -335,6 +346,10 @@ private:
 	std::map<uint64_t, std::pair<uint64_t, uint64_t>>  m_bitmap_inflight;
 	uint64_t                                           m_bitmap_dropped_pages = 0;
 	uint64_t                                           m_bitmap_written_pages = 0;
+	// ReadMemorySteps in progress (GPU thread). Between the refinement clearing a written page's
+	// bit and the download registering its range, the bit alone would call the page unwritten:
+	// IsBitmapCleanForConcurrentRead declines while any step runs.
+	std::atomic<uint32_t>                              m_readback_steps {0};
 	void ApplyCleanWrite(uint64_t vaddr, uint64_t size);
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	// Written on the GPU thread, always for a submitted tick; game threads read it to wait for

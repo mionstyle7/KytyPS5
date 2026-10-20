@@ -55,9 +55,9 @@ public:
 	[[nodiscard]] bool TryDirectRead(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 	                                 uint64_t size);
 	// Any thread: a read of these bytes faulted on a page protected because the GPU wrote to it,
-	// but none of them is GPU-written, so guest memory already holds their value.
-	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
-	                                     uint64_t size) const noexcept;
+	// but none of them is GPU-written (or the write bitmap shows the GPU wrote none of their
+	// pages: BufferCache::IsBitmapCleanForConcurrentRead), so guest memory holds their value.
+	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr, uint64_t size);
 	// Any thread, for a store that faulted on a page protected because the GPU wrote other bytes
 	// of it (KYTY_CLEAN_WRITE_EMULATION=1): when none of the stored bytes is GPU-written or on its
 	// way back, writes them to guest memory now and to the GPU copy in the GPU thread's order,
