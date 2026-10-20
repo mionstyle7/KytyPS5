@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/frameBudget.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -684,6 +685,7 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::PipelineCache driver_cache,
                                   vk::Pipeline* pipeline) {
 	const auto create_begin = std::chrono::steady_clock::now();
+	KYTY_FRAME_BUDGET(PipelineBuild);
 	const auto result =
 	    build.device.createGraphicsPipelines(driver_cache, 1, &build.pipeline_info, nullptr, pipeline);
 	if (result == vk::Result::eSuccess && driver_cache != nullptr &&
@@ -783,6 +785,7 @@ vk::Result CreateComputePipelineHandle(GraphicContext& graphics, vk::PipelineLay
 	}
 	*pipeline               = nullptr;
 	const auto create_begin = std::chrono::steady_clock::now();
+	KYTY_FRAME_BUDGET(PipelineBuild);
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, pipeline);
 	if (result == vk::Result::eSuccess && driver_cache != nullptr &&

@@ -19,7 +19,11 @@ enum class Phase : uint8_t {
 	Pm4,        // reading the game's command buffers (packets, registers)
 	Draw,       // draw state: render targets, descriptors, Vulkan commands
 	Dispatch,   // compute dispatch state
-	Shaders,    // shader programs and pipelines (translation, compilation, lookup)
+	Shaders,    // shader and pipeline state of a draw outside the phases below
+	ShaderGet,  // finding a draw's shader program and walking its resource table (SRT)
+	ShaderCompile, // translating a new shader (or permutation) to SPIR-V
+	PipelineBuild, // the driver building a pipeline (vkCreate*Pipelines)
+	PipelineWait,  // waiting for a pipeline being built on a worker
 	Buffers,    // finding and synchronizing buffers (memory checks, uploads)
 	Textures,   // finding, uploading and validating images
 	Readback,   // the game reading memory the GPU wrote (downloads)

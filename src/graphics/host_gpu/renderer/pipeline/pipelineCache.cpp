@@ -866,6 +866,7 @@ public:
 	// Waits up to the budget; true when the job is done.
 	bool Wait(const PendingGraphicsPipeline& job, std::chrono::milliseconds budget) {
 		KYTY_PROFILER_BLOCK("PipelineCompiler::Wait");
+		KYTY_FRAME_BUDGET(PipelineWait);
 		std::unique_lock lock(m_mutex);
 		return m_done.wait_for(lock, budget,
 		                       [&job] { return job.done.load(std::memory_order_acquire); });
@@ -1863,6 +1864,7 @@ struct PipelineCache::ProgramCache {
 			return GetNormal(params, input_info, push_data_cursor);
 		}
 		KYTY_PROFILER_BLOCK("StageRecords::Get");
+		KYTY_FRAME_BUDGET(ShaderGet);
 		SweepRecords();
 		const auto stage = StageOf(input_info);
 		BuildRecordKey(stage, params, input_info, push_data_cursor);
@@ -1993,6 +1995,7 @@ struct PipelineCache::ProgramCache {
 			return ShaderProgram {};
 		}
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
+		KYTY_FRAME_BUDGET(ShaderGet);
 		auto                                         entry = programs.find(lookup_key);
 		// Scoped to this call only: see GuestPageReadCache.
 		GuestPageReadCache                           clean_read_cache;
@@ -2245,6 +2248,7 @@ struct PipelineCache::ProgramCache {
 		compile_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
 		KYTY_PROFILER_PHASE(compile_zone, "Shader compile", profiler::colors::DeepOrangeA200);
 		const auto compile_begin = std::chrono::steady_clock::now();
+		KYTY_FRAME_BUDGET(ShaderCompile);
 		ShaderRecompiler::TranslateResult translated;
 		if (const auto job = translating.find(lookup_key); job != translating.end()) {
 			// Done (the check above returned while it was not): take the worker's translation.
@@ -2619,6 +2623,7 @@ struct PipelineCache::ProgramCache {
 			bool                ok;
 		} job {vs, &vs_params, false};
 		KYTY_PROFILER_BLOCK("StagePrep::Window");
+		KYTY_FRAME_BUDGET(ShaderGet);
 		if (!stage_prep->Post(
 		        [](void* context) {
 			        auto& job = *static_cast<Context*>(context);

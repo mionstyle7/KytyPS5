@@ -33,7 +33,7 @@ constexpr size_t PhaseCount = static_cast<size_t>(Phase::Count);
 
 constexpr std::array<const char*, PhaseCount> PhaseNames = {
     "other",  "idle",     "blocked",  "requests",  "pm4",     "draw",    "dispatch",
-    "shaders", "buffers", "textures", "readback",  "wait-gpu", "wait-rec", "collect",
+    "shaders", "shader-get", "shader-compile", "pipeline-build", "pipeline-wait", "buffers", "textures", "readback",  "wait-gpu", "wait-rec", "collect",
     "flip",   "present",  "record",   "submit",    "guest-wait"};
 
 // Ticks: the time stamp counter where there is one (a few ns a read, against the clock's ~20),
