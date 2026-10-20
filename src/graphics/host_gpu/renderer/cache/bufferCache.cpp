@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 #include <chrono>
+#include <optional>
 #include <map>
 #include <unordered_map>
 
@@ -2159,7 +2160,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id, bool needs_device_address) {
 	KYTY_FRAME_BUDGET(Buffers);
-	const MarkEpochScope mark_epoch(m_gpu_mark_epoch);
+	std::optional<MarkEpochScope> mark_epoch;
+	if (is_written) {
+		mark_epoch.emplace(m_gpu_mark_epoch);
+	}
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -2732,6 +2736,25 @@ static struct {
 	std::atomic<int64_t>  next_log {0};
 } g_bitmap_clean_reads;
 
+// GPU thread (RunGarbageCollector): never from the fault handler, whose thread may hold the log's
+// lock while it formats guest memory.
+static void LogBitmapCleanReads() {
+	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+	auto       next = g_bitmap_clean_reads.next_log.load(std::memory_order_relaxed);
+	if (now >= next && g_bitmap_clean_reads.next_log.compare_exchange_strong(
+	                       next, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+	                                       std::chrono::seconds(10))
+	                                       .count())) {
+		if (next != 0) {
+			LOGF("Bitmap clean reads (10 s): %" PRIu64 " served without the GPU thread, %" PRIu64
+			     " pages lifted, %" PRIu64 " protected again, %" PRIu64 " declined during readbacks\n",
+			     g_bitmap_clean_reads.served.exchange(0), g_bitmap_clean_reads.lifted.exchange(0),
+			     g_bitmap_clean_reads.reprotected.exchange(0),
+			     g_bitmap_clean_reads.declined_steps.exchange(0));
+		}
+	}
+}
+
 bool BufferCache::IsBitmapCleanForConcurrentRead(uint64_t vaddr, uint64_t size) {
 	if (!BitmapCleanReadEnabled() || size == 0 || GuestGpu::IsGpuThread()) {
 		return false;
@@ -2743,15 +2766,15 @@ bool BufferCache::IsBitmapCleanForConcurrentRead(uint64_t vaddr, uint64_t size) 
 	if (last > WriteBitmapLimit || last <= first) {
 		return false;
 	}
-	{
-		std::shared_lock lock(m_dirty_ranges_mutex);
+	// Under either lock: the pages hold GPU-written bytes only by the bookkeeping, and the GPU
+	// wrote none of them.
+	const auto unwritten = [&] {
 		if (m_write_bitmap == nullptr) {
 			return false;
 		}
-		// After the lock: a step's bit clearing happens under the exclusive lock, after its
-		// counter increment, so a step that cleared bits not yet covered by a download is seen.
-		// One step at a time runs (GPU thread); it touches only its window. A nested one (or a
-		// window read while it changes) declines.
+		// A step's bit clearing happens under the exclusive lock, after its window is published
+		// and its count raised, so a step that cleared bits not yet covered by a download is seen.
+		// One step at a time runs (GPU thread); a nested one widens the window to everything.
 		if (const auto steps = m_readback_steps.load(std::memory_order_seq_cst); steps != 0) {
 			const auto begin = m_readback_step_begin.load(std::memory_order_seq_cst);
 			const auto end   = m_readback_step_end.load(std::memory_order_seq_cst);
@@ -2792,6 +2815,22 @@ bool BufferCache::IsBitmapCleanForConcurrentRead(uint64_t vaddr, uint64_t size) 
 				return false; // written: the ordinary readback downloads it
 			}
 		}
+		return true;
+	};
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (!unwritten()) {
+			return false;
+		}
+	}
+	{
+		// The pages leave the GPU-written set, as RefineWithWriteBitmap drops them: a lifted page
+		// left in it was later downloaded by bulk write-backs over the game's own newer stores.
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		if (!unwritten()) {
+			return false;
+		}
+		m_gpu_modified_ranges.Subtract(first, last - first);
 	}
 	g_bitmap_clean_reads.served.fetch_add(1, std::memory_order_relaxed);
 	// Lift the pages here: asking the GPU thread queued tens of thousands of lifts each 10 s ahead
@@ -2805,20 +2844,6 @@ bool BufferCache::IsBitmapCleanForConcurrentRead(uint64_t vaddr, uint64_t size) 
 		} else {
 			g_bitmap_clean_reads.lifted.fetch_add((last - first) / WriteBitmapPage,
 			                                      std::memory_order_relaxed);
-		}
-	}
-	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-	auto       next = g_bitmap_clean_reads.next_log.load(std::memory_order_relaxed);
-	if (now >= next && g_bitmap_clean_reads.next_log.compare_exchange_strong(
-	                       next, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-	                                       std::chrono::seconds(10))
-	                                       .count())) {
-		if (next != 0) {
-			LOGF("Bitmap clean reads (10 s): %" PRIu64 " served without the GPU thread, %" PRIu64
-			     " pages lifted, %" PRIu64 " protected again, %" PRIu64 " declined during readbacks\n",
-			     g_bitmap_clean_reads.served.exchange(0), g_bitmap_clean_reads.lifted.exchange(0),
-			     g_bitmap_clean_reads.reprotected.exchange(0),
-			     g_bitmap_clean_reads.declined_steps.exchange(0));
 		}
 	}
 	return true;
@@ -2851,6 +2876,7 @@ bool KeptOutOfCollection(const Buffer& buffer) {
 } // namespace
 
 void BufferCache::RunGarbageCollector() {
+	LogBitmapCleanReads();
 	KYTY_PROFILER_FUNCTION();
 	m_gc_tick++;
 	const auto clock = LruClock();
